@@ -201,9 +201,11 @@ class MegatronTrainRayActor(TrainRayActor):
             # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [
                 (
-                    {key: tensor.to(device=torch.cuda.current_device()) for key, tensor in mm_dict.items()}
-                    if mm_dict is not None
-                    else None
+                    {key: (
+                        tensor.detach().clone() if torch.is_tensor(tensor) else torch.tensor(tensor)
+                        ).to(device=torch.cuda.current_device())
+                         for key, tensor in mm_dict.items()
+                    }
                 )
                 for mm_dict in rollout_data["multimodal_train_inputs"]
             ]
