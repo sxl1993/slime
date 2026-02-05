@@ -113,12 +113,17 @@ def main():
 
     model = get_model(get_model_provider_func(args), ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
-    breakpoint()
     # Load model
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
-    bridge.load_weights(model, hf_model_path, memory_efficient=True)
-    print(f"Model loaded: {hf_model_path}")
+    if args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        bridge.load_hf_weights(model, hf_model_path)
+        print(f"Model loaded: {hf_model_path}")
+    else:
+        bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+        bridge.load_weights(model, hf_model_path, memory_efficient=True)
+        print(f"Model loaded: {hf_model_path}")
 
     if args.use_cpu_initialization:
         model[0] = model[0].cpu()
