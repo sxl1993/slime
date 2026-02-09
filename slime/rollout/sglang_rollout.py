@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import torch
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -112,8 +113,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ), f"Sample status is {sample.status}"
 
     if state.processor:
+        if "kimi" in args.model_name.lower() or "k25" in args.model_name.lower():
+           sample.to_medias()
         processor_output = state.processor(text=sample.prompt, **sample.multimodal_inputs)
+
         prompt_ids = processor_output["input_ids"][0]
+        if isinstance(prompt_ids, torch.Tensor):
+           prompt_ids = prompt_ids.cpu().tolist()
+
         sample.multimodal_train_inputs = {
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
         } or None

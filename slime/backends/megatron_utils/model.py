@@ -223,6 +223,15 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+
+        # 如果存在多模态输入（如图像），则禁用 packed_seq_params
+        # 因为图像 token 的插入会改变序列长度，使原始的 packed_seq_params 无效
+        multimodal_inputs = batch["multimodal_train_inputs"]
+        if multimodal_inputs is not None:
+            image_keys = {"pixel_values", "grid_thws", "image_grid_thw", "image_grid_thws"}
+            if any(key in multimodal_inputs for key in image_keys):
+                packed_seq_params = None
+
         output_tensor = model(
             input_ids=tokens,
             position_ids=None,
@@ -230,7 +239,8 @@ def forward_only(
             labels=None,
             packed_seq_params=packed_seq_params,
             loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            # **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            **(multimodal_inputs if multimodal_inputs is not None else {}),
         )
 
         return output_tensor, partial(

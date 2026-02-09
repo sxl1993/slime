@@ -32,12 +32,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     hf_param_name,
                     postprocess_hf_param(
                         args=self.args,
-                        megatron_param_name=megatron_param_name,
+                        # megatron_param_name=megatron_param_name,
                         hf_param_name=hf_param_name,
                         param=weight,
                     ),
                 )
-                for hf_param_name, weight, megatron_param_name in named_weights
+                # for hf_param_name, weight, megatron_param_name in named_weights
+                for hf_param_name, weight in named_weights
             )
 
             yield from chunk_named_params_by_size(named_weights, chunk_size=self.args.update_weight_buffer_size)

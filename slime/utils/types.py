@@ -47,6 +47,17 @@ class Sample:
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
 
+    def to_medias(self) -> list[dict]:
+       medias = []
+       if self.multimodal_inputs:
+           if imgs := self.multimodal_inputs.get("images"):
+               medias.extend([{"type": "image", "image": img} for img in imgs])
+           if vids := self.multimodal_inputs.get("videos"):
+               medias.extend([{"type": "video", "video": vid} for vid in vids])
+       self.multimodal_inputs = self.multimodal_inputs or {}
+       self.multimodal_inputs["medias"] = medias
+       return medias
+
     @dataclass
     class SpecInfo:
         spec_accept_token_num: int = 0

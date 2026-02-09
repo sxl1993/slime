@@ -60,8 +60,20 @@ def get_responses(
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
-        assert logits.size(0) == 1, f"{logits.shape}"
-        logits = logits.squeeze(0)
+        # assert logits.size(0) == 1, f"{logits.shape}"
+        # logits = logits.squeeze(0)
+        # 处理两种可能的形状：[1, T, V] 或 [T, 1, V]
+        if logits.dim() == 3:
+            if logits.size(0) == 1:
+                # 形状正确：[1, T, V]
+                logits = logits.squeeze(0)
+            elif logits.size(1) == 1:
+                # 形状为 [T, 1, V]，需要转置为 [1, T, V]
+                logits = logits.permute(1, 0, 2).squeeze(0)
+            else:
+                raise AssertionError(f"Unexpected logits shape for thd format: {logits.shape}")
+        else:
+            raise AssertionError(f"Expected 3D tensor for thd format, got {logits.dim()}D")
     else:
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
