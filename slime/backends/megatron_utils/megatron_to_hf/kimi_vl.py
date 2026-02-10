@@ -2,25 +2,6 @@ import re
 
 import torch
 
-
-# def convert_kimivl_to_hf(args, name, param):
-#     return _convert_kimivl_base(args, name, param, "multi_modal_projector")
-
-
-# def convert_kimi_k25_to_hf(args, name, param):
-#     return _convert_kimivl_base(args, name, param, "mm_projector")
-
-
-# def _convert_kimivl_base(args, name, param, projector_mapping_name):
-#     if name.startswith("module.module.vision_model."):
-#         hf_name = "vision_tower." + name[len("module.module.vision_model.") :]
-#         return [(hf_name, param)]
-
-#     if name.startswith("module.module.multi_modal_projector."):
-#         hf_name = f"{projector_mapping_name}." + name[len("module.module.multi_modal_projector.") :]
-#         return [(hf_name, param)]
-
-#     return convert_language_model_to_hf(args, name, param)
 def convert_kimivl_to_hf(args, name, param):
     if name.startswith("module.module.vision_model."):
         hf_name = "vision_tower." + name[len("module.module.vision_model.") :]
@@ -58,7 +39,8 @@ def convert_language_model_to_hf(args, name, param):
         head_dim = args.hidden_size // args.num_attention_heads
     value_num_per_group = args.num_attention_heads // args.num_query_groups
 
-    decoder_layers_pattern = r"module\.module\.language_model\.decoder\.layers\.(\d+)\.(.+)"
+    # decoder_layers_pattern = r"module\.module\.language_model\.decoder\.layers\.(\d+)\.(.+)"
+    decoder_layers_pattern = r"module\.module\.(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, name)
     if match:
         layer_idx, rest = match.groups()
@@ -90,7 +72,8 @@ def convert_language_model_to_hf(args, name, param):
         shared_expert_pattern = r"mlp.shared_experts\.(.+)"
         match = re.match(shared_expert_pattern, rest)
         if match:
-            rest = match.groups()[0]
+            # rest = match.groups()[0]
+            rest = match.group(1) 
             if rest == "linear_fc1.weight":
                 gate_weight, up_weight = param.chunk(2, dim=0)
                 return [
