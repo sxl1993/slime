@@ -143,3 +143,22 @@ async def test_cleanup_removes_workspace(workspace_root):
         assert not ws.exists(), f"workspace {ws} should have been cleaned up"
     finally:
         os.environ.pop("LOCAL_SANDBOX_CLEANUP_ON_EXIT", None)
+
+
+@pytest.mark.skipif(not _unshare_available, reason="unshare --mount not available")
+@pytest.mark.asyncio
+async def test_no_cleanup_preserves_workspace(workspace_root):
+    """Without CLEANUP_ON_EXIT, __aexit__ must not remove the workspace."""
+    from slime.agent.local_sandbox import LocalSandbox
+
+    os.environ.pop("LOCAL_SANDBOX_CLEANUP_ON_EXIT", None)
+    sb = LocalSandbox(image="test", instance_id="no_cleanup_test")
+    async with sb:
+        ws = sb.workspace_root
+
+    # Workspace must still exist after __aexit__
+    assert ws.exists(), f"workspace {ws} should survive without CLEANUP_ON_EXIT"
+
+    # Clean up manually to avoid leaking temp dirs
+    import shutil
+    shutil.rmtree(ws, ignore_errors=True)
