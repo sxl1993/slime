@@ -423,11 +423,18 @@ def test_mid_list_system_folds_into_user():
 # ===========================================================================
 
 
-def test_replace_system_prompt_swaps_long_system():
+def test_replace_system_prompt_swaps_long_system(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_SYSTEM_PROMPT", "1")
     body = {"system": "A" * 70_000, "messages": [{"role": "user", "content": "hi"}]}
     common._replace_system_prompt(body)
     assert body["system"] == common._COMPACT_SYSTEM_PROMPT
     assert len(body["system"]) < 1_000
+
+
+def test_replace_system_prompt_passthrough_when_unset():
+    body = {"system": "original", "messages": []}
+    common._replace_system_prompt(body)
+    assert body["system"] == "original"
 
 
 def test_replace_system_prompt_passthrough_when_env_empty(monkeypatch):
@@ -444,7 +451,8 @@ def test_replace_system_prompt_uses_custom_env(monkeypatch):
     assert body["system"] == "custom prompt"
 
 
-def test_filter_tools_keeps_whitelist_only():
+def test_filter_tools_keeps_whitelist_only(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_TOOL_WHITELIST", "Bash,Read,Edit,Write")
     body = {
         "tools": [
             {"name": "Bash", "input_schema": {}},
@@ -457,6 +465,15 @@ def test_filter_tools_keeps_whitelist_only():
     }
     common._filter_tools(body)
     assert [t["name"] for t in body["tools"]] == ["Bash", "Read", "Edit"]
+
+
+def test_filter_tools_passthrough_when_unset():
+    body = {
+        "tools": [{"name": "Bash"}, {"name": "Agent"}],
+        "messages": [],
+    }
+    common._filter_tools(body)
+    assert len(body["tools"]) == 2
 
 
 def test_filter_tools_passthrough_when_env_empty(monkeypatch):
@@ -484,7 +501,8 @@ def test_filter_tools_no_tools_key_is_noop():
     common._filter_tools(body)  # no crash
 
 
-def test_truncate_tool_results_clips_long_content():
+def test_truncate_tool_results_clips_long_content(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "10000")
     long_text = "x" * 20_000
     body = {
         "messages": [
@@ -503,7 +521,24 @@ def test_truncate_tool_results_clips_long_content():
     assert "10,000 chars" in result
 
 
-def test_truncate_tool_results_short_content_untouched():
+def test_truncate_tool_results_passthrough_when_unset():
+    long_text = "x" * 20_000
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": long_text},
+                ],
+            },
+        ]
+    }
+    common._truncate_tool_results(body)
+    assert len(body["messages"][0]["content"][0]["content"]) == 20_000
+
+
+def test_truncate_tool_results_short_content_untouched(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "10000")
     short_text = "hello"
     body = {
         "messages": [
@@ -554,7 +589,8 @@ def test_truncate_tool_results_custom_limit(monkeypatch):
     assert "100 chars" in result
 
 
-def test_truncate_tool_results_non_user_messages_untouched():
+def test_truncate_tool_results_non_user_messages_untouched(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "10000")
     body = {
         "messages": [
             {"role": "assistant", "content": "some very long content " * 1000},
@@ -562,6 +598,76 @@ def test_truncate_tool_results_non_user_messages_untouched():
     }
     common._truncate_tool_results(body)
     assert len(body["messages"][0]["content"]) > 10_000
+
+
+def test_anthropic_preprocess_body_compresses_context(monkeypatch):
+    """Full integration: _preprocess_body applies all three compression steps."""
+    monkeypatch.setenv("SLIME_ADAPTER_SYSTEM_PROMPT", "1")
+    monkeypatch.setenv("SLIME_ADAPTER_TOOL_WHITELIST", "Bash,Read,Edit,Write")
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "10000")
+    long_system = "S" * 70_000
+    long_result = "R" * 20_000
+    body = {
+        "system": long_system,
+        "tools": [
+            {"name": "Bash", "input_schema": {}},
+            {"name": "Read", "input_schema": {}},
+            {"name": "Agent", "input_schema": {}},
+            {"name": "Workflow", "input_schema": {}},
+        ],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": long_result}],
+            },
+        ],
+    }
+    adapter = anthropic.AnthropicAdapter.__new__(anthropic.AnthropicAdapter)
+    adapter._preprocess_body(body)
+
+    # System prompt replaced with compact version
+    assert len(body["system"]) < 1_000
+    # Only whitelist tools remain
+    assert [t["name"] for t in body["tools"]] == ["Bash", "Read"]
+    # Long tool_result truncated
+    result_text = body["messages"][-1]["content"][0]["content"]
+    assert len(result_text) < 15_000
+    assert "<response clipped" in result_text
+
+
+def test_preprocess_body_passthrough_no_mutation():
+    """When all env vars are unset (default), no compression is applied —
+    verifying the opt-in / zero-risk rollback path."""
+    long_system = "S" * 70_000
+    long_result = "R" * 20_000
+
+    body = {
+        "system": long_system,
+        "tools": [
+            {"name": "Bash", "input_schema": {}},
+            {"name": "Agent", "input_schema": {}},
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": long_result},
+                ],
+            },
+        ],
+    }
+    common._replace_system_prompt(body)
+    common._filter_tools(body)
+    common._truncate_tool_results(body)
+
+    assert body["system"] == long_system
+    assert len(body["tools"]) == 2
+    assert body["messages"][0]["content"][0]["content"] == long_result
 
 
 # ===========================================================================

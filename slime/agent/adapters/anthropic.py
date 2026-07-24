@@ -30,6 +30,9 @@ from slime.agent.adapters.common import (
     manager_finish_reason,
     sid_from_bearer,
     tool_call_dict,
+    _filter_tools,
+    _replace_system_prompt,
+    _truncate_tool_results,
 )
 from slime.agent.parsing import ParsedModelOutput
 
@@ -54,6 +57,9 @@ class AnthropicAdapter(BaseAdapter):
 
     def _preprocess_body(self, body: dict) -> None:
         _fold_mid_list_system_into_user(body)
+        _replace_system_prompt(body)
+        _filter_tools(body)
+        _truncate_tool_results(body)
 
     def _translate(self, body: dict) -> tuple[list[dict], list[dict] | None]:
         translated = _translate_messages(body.get("messages") or [], body.get("system"))
@@ -91,7 +97,10 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
             blocks = content if isinstance(content, list) else [{"type": "text", "text": flatten_content(content)}]
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    translated.append({"role": "tool", "content": flatten_content(b.get("content"))})
+                    msg = {"role": "tool", "content": flatten_content(b.get("content"))}
+                    if b.get("is_error"):
+                        msg["is_error"] = True
+                    translated.append(msg)
                 elif isinstance(b, dict) and b.get("type") == "text":
                     translated.append({"role": "user", "content": b.get("text", "")})
                 else:

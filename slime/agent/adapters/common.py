@@ -148,15 +148,24 @@ CONSTRAINTS:
 
 
 def _replace_system_prompt(body: dict) -> None:
-    """Replace body['system'] with a compact prompt unless the
-    SLIME_ADAPTER_SYSTEM_PROMPT env var is set to '' (passthrough).
+    """Replace body['system'] with a compact prompt when the
+    SLIME_ADAPTER_SYSTEM_PROMPT env var is set.
+
+    - Set to "1" or any non-empty string: use the compact system prompt.
+    - Set to a custom string: use that string as the system prompt.
+    - Unset (default): passthrough, do not modify body['system'].
 
     Mutates body in place.
     """
     env_val = os.environ.get("SLIME_ADAPTER_SYSTEM_PROMPT")
-    if env_val is not None and env_val == "":
-        return  # explicit passthrough
-    replacement = env_val if env_val else _COMPACT_SYSTEM_PROMPT
+    if env_val is None:
+        return  # opt-in: passthrough when unset
+    if env_val == "1":
+        replacement = _COMPACT_SYSTEM_PROMPT
+    elif env_val == "":
+        return  # explicit no-op
+    else:
+        replacement = env_val
     if "system" in body:
         body["system"] = replacement
 
@@ -168,16 +177,14 @@ def _filter_tools(body: dict) -> None:
     """Filter body['tools'] to keep only whitelisted tool names.
 
     Controlled by SLIME_ADAPTER_TOOL_WHITELIST env var (comma-separated
-    names). Default: Bash,Read,Edit,Write. Empty string: passthrough all.
+    names). Unset (default): passthrough all tools. Empty string: also
+    passthrough all tools.
     Mutates body in place.
     """
     env_val = os.environ.get("SLIME_ADAPTER_TOOL_WHITELIST")
-    if env_val is not None and env_val == "":
-        return  # explicit passthrough
-    if env_val:
-        whitelist = frozenset(n.strip() for n in env_val.split(",") if n.strip())
-    else:
-        whitelist = _DEFAULT_TOOL_WHITELIST
+    if env_val is None or env_val == "":
+        return  # opt-in: passthrough when unset or empty
+    whitelist = frozenset(n.strip() for n in env_val.split(",") if n.strip())
     tools = body.get("tools")
     if isinstance(tools, list):
         body["tools"] = [t for t in tools if isinstance(t, dict) and t.get("name") in whitelist]
@@ -189,16 +196,17 @@ _DEFAULT_MAX_TOOL_RESULT_CHARS = 10_000
 def _truncate_tool_results(body: dict) -> None:
     """Truncate tool_result content in messages that exceeds the char limit.
 
-    Controlled by SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS env var. Default:
-    10,000. Set to 0 to disable truncation. Mutates body in place.
+    Controlled by SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS env var. Unset
+    (default): passthrough, no truncation. Set to a positive integer to
+    enable truncation. Set to 0 to explicitly disable.
+    Mutates body in place.
     """
     env_val = os.environ.get("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS")
-    if env_val is not None:
-        max_chars = int(env_val)
-        if max_chars <= 0:
-            return  # explicit passthrough / disabled
-    else:
-        max_chars = _DEFAULT_MAX_TOOL_RESULT_CHARS
+    if env_val is None:
+        return  # opt-in: passthrough when unset
+    max_chars = int(env_val)
+    if max_chars <= 0:
+        return
 
     for msg in body.get("messages", []):
         if msg.get("role") != "user":
@@ -599,7 +607,6 @@ async def call_sglang_generate(
                 session.max_context_tokens,
                 _SGLANG_CONTEXT_RESERVE,
             )
-            _dump_overflow_prompt(adapter, session_id, prompt_ids)
             return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
         sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
@@ -675,27 +682,3 @@ async def call_sglang_generate(
 async def _health(request: web.Request) -> web.Response:
     """Handler for /healthz and /v1/models readiness probes."""
     return web.json_response({"ok": True})
-
-
-# One-shot dump of an overflow prompt, gated by SLIME_DUMP_OVERFLOW_PROMPT and a
-# per-sid set so we don't spam disk on the infinite-loop retries. Diagnostic only.
-_OVERFLOW_DUMPED_SIDS: set[str] = set()
-
-
-def _dump_overflow_prompt(adapter: BaseAdapter, session_id: str, prompt_ids: list[int]) -> None:
-    dump_dir = os.environ.get("SLIME_DUMP_OVERFLOW_PROMPT")
-    if not dump_dir:
-        return
-    sid = session_id or "default"
-    if sid in _OVERFLOW_DUMPED_SIDS:
-        return
-    _OVERFLOW_DUMPED_SIDS.add(sid)
-    try:
-        os.makedirs(dump_dir, exist_ok=True)
-        text = adapter.tokenizer.decode(prompt_ids, skip_special_tokens=False) if prompt_ids else ""
-        path = os.path.join(dump_dir, f"overflow_{sid}.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# sid={sid} len={len(prompt_ids)}\n{text}")
-        adapter.logger.info("[%s] dumped overflow prompt for sid=%s to %s", adapter.log_prefix, sid, path)
-    except Exception:
-        adapter.logger.exception("[%s] failed to dump overflow prompt", adapter.log_prefix)
