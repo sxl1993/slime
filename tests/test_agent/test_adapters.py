@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer  # noqa: E402
 
-from slime.agent.adapters import anthropic, openai  # noqa: E402
+from slime.agent.adapters import anthropic, common, openai  # noqa: E402
 from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
@@ -419,6 +419,152 @@ def test_mid_list_system_folds_into_user():
 
 
 # ===========================================================================
+# §6b adapter context compression
+# ===========================================================================
+
+
+def test_replace_system_prompt_swaps_long_system():
+    body = {"system": "A" * 70_000, "messages": [{"role": "user", "content": "hi"}]}
+    common._replace_system_prompt(body)
+    assert body["system"] == common._COMPACT_SYSTEM_PROMPT
+    assert len(body["system"]) < 1_000
+
+
+def test_replace_system_prompt_passthrough_when_env_empty(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_SYSTEM_PROMPT", "")
+    body = {"system": "original", "messages": []}
+    common._replace_system_prompt(body)
+    assert body["system"] == "original"
+
+
+def test_replace_system_prompt_uses_custom_env(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_SYSTEM_PROMPT", "custom prompt")
+    body = {"system": "original", "messages": []}
+    common._replace_system_prompt(body)
+    assert body["system"] == "custom prompt"
+
+
+def test_filter_tools_keeps_whitelist_only():
+    body = {
+        "tools": [
+            {"name": "Bash", "input_schema": {}},
+            {"name": "Read", "input_schema": {}},
+            {"name": "Agent", "input_schema": {}},
+            {"name": "Workflow", "input_schema": {}},
+            {"name": "Edit", "input_schema": {}},
+        ],
+        "messages": [],
+    }
+    common._filter_tools(body)
+    assert [t["name"] for t in body["tools"]] == ["Bash", "Read", "Edit"]
+
+
+def test_filter_tools_passthrough_when_env_empty(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_TOOL_WHITELIST", "")
+    body = {
+        "tools": [{"name": "Bash"}, {"name": "Agent"}],
+        "messages": [],
+    }
+    common._filter_tools(body)
+    assert len(body["tools"]) == 2
+
+
+def test_filter_tools_custom_whitelist(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_TOOL_WHITELIST", "Bash,Read,Grep")
+    body = {
+        "tools": [{"name": "Bash"}, {"name": "Edit"}, {"name": "Grep"}],
+        "messages": [],
+    }
+    common._filter_tools(body)
+    assert [t["name"] for t in body["tools"]] == ["Bash", "Grep"]
+
+
+def test_filter_tools_no_tools_key_is_noop():
+    body = {"messages": []}
+    common._filter_tools(body)  # no crash
+
+
+def test_truncate_tool_results_clips_long_content():
+    long_text = "x" * 20_000
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": long_text},
+                ],
+            },
+        ]
+    }
+    common._truncate_tool_results(body)
+    result = body["messages"][0]["content"][0]["content"]
+    assert len(result) < 15_000  # 10k + clipping message
+    assert "<response clipped" in result
+    assert "10,000 chars" in result
+
+
+def test_truncate_tool_results_short_content_untouched():
+    short_text = "hello"
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": short_text},
+                ],
+            },
+        ]
+    }
+    common._truncate_tool_results(body)
+    assert body["messages"][0]["content"][0]["content"] == short_text
+
+
+def test_truncate_tool_results_passthrough_when_env_zero(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "0")
+    long_text = "y" * 20_000
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": long_text},
+                ],
+            },
+        ]
+    }
+    common._truncate_tool_results(body)
+    assert len(body["messages"][0]["content"][0]["content"]) == 20_000
+
+
+def test_truncate_tool_results_custom_limit(monkeypatch):
+    monkeypatch.setenv("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "100")
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "z" * 200},
+                ],
+            },
+        ]
+    }
+    common._truncate_tool_results(body)
+    result = body["messages"][0]["content"][0]["content"]
+    assert "<response clipped" in result
+    assert "100 chars" in result
+
+
+def test_truncate_tool_results_non_user_messages_untouched():
+    body = {
+        "messages": [
+            {"role": "assistant", "content": "some very long content " * 1000},
+        ]
+    }
+    common._truncate_tool_results(body)
+    assert len(body["messages"][0]["content"]) > 10_000
+
+
+# ===========================================================================
 # §7 parsing helpers (slime.agent.parsing)
 # ===========================================================================
 
@@ -459,6 +605,103 @@ def test_parse_xml_tool_uses_ignores_unknown_tool():
     cleaned, uses = parse_xml_tool_uses(raw, [{"function": {"name": "lookup"}}])
     assert uses == []
     assert "<tool_call>" in cleaned  # left untouched
+
+
+# ===========================================================================
+# §8 call_sglang_generate context-length guard
+# ===========================================================================
+
+
+class _StubAdapter:
+    """Minimal adapter stand-in that ``call_sglang_generate`` reads."""
+
+    log_prefix = "test"
+    max_token_keys = ["max_tokens"]
+    stop_keys = ["stop_sequences"]
+
+    def __init__(self, sglang_url: str):
+        self.sglang_url = sglang_url
+        self.logger = _StubLogger()
+        self._http: aiohttp.ClientSession | None = None
+
+    def _get_http_session(self):
+        import aiohttp as _aiohttp
+
+        if self._http is None or self._http.closed:
+            self._http = _aiohttp.ClientSession()
+        return self._http
+
+    async def close(self):
+        if self._http and not self._http.closed:
+            await self._http.close()
+
+
+class _StubLogger:
+    def __getattr__(self, name):
+        def _log(*a, **kw):
+            pass
+
+        return _log
+
+
+@pytest.mark.asyncio
+async def test_sglang_context_reserve_prevents_overlength():
+    """Adapter-side reserve should clamp prompt_ids before they reach SGLang."""
+    from slime.agent.adapters.common import Session, _SGLANG_CONTEXT_RESERVE, call_sglang_generate
+
+    adapter = _StubAdapter("http://127.0.0.1:1")  # unreachable — should not be called
+    session = Session(max_context_tokens=100)
+    # prompt_ids at exactly (max_context_tokens - reserve) should still pass
+    prompt_ids = list(range(100 - _SGLANG_CONTEXT_RESERVE))
+    # We can't actually hit SGLang in a unit test, but we can verify the
+    # remaining_context calculation: the reserve is subtracted before comparison.
+    effective_max = session.max_context_tokens - _SGLANG_CONTEXT_RESERVE
+    assert len(prompt_ids) == effective_max
+    # A prompt one token longer should trigger the length guard
+    long_prompt = list(range(effective_max + 1))
+    turn = await call_sglang_generate(long_prompt, session, {}, adapter=adapter, session_id="s1")
+    assert turn.finish_reason == "length"
+    assert turn.output_ids == []
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_sglang_400_context_length_returns_length_not_error():
+    """When SGLang returns 400 for context-length, adapter returns length-capped turn."""
+    from aiohttp import web as aio_web
+
+    from slime.agent.adapters.common import Session, call_sglang_generate
+
+    # Spin up a tiny aiohttp server that always returns 400 with the
+    # SGLang context-length error payload.
+    async def _handler(request):
+        return aio_web.Response(
+            status=400,
+            text='{"error":{"message":"Input length (31996 tokens) exceeds the maximum allowed length (31994 tokens). Use a shorter input or enable --allow-auto-truncate."}}',
+            content_type="application/json",
+        )
+
+    app = aio_web.Application()
+    app.router.add_post("/generate", _handler)
+    runner = aio_web.AppRunner(app)
+    await runner.setup()
+    site = aio_web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    adapter = _StubAdapter(f"http://127.0.0.1:{port}")
+    session = Session(max_context_tokens=0)  # 0 = no adapter-side cap, rely on SGLang 400 fallback
+    turn = await call_sglang_generate(
+        prompt_ids=list(range(10)),
+        session=session,
+        body={},
+        adapter=adapter,
+        session_id="s2",
+    )
+    assert turn.finish_reason == "length"
+    assert turn.output_ids == []
+    await runner.cleanup()
+    await adapter.close()
 
 
 if __name__ == "__main__":

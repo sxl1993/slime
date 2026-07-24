@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import aiohttp
@@ -28,6 +30,11 @@ from slime.agent.trajectory import TrajectoryManager, TurnRecord
 
 
 __all__ = ["TurnRecord"]
+
+# Tokens that SGLang subtracts from the context window internally
+# (max_req_input_len = context_len - 1 - 5 in SGLang's tp_worker.py).
+# We use 8 instead of 6 to be robust against future SGLang changes.
+_SGLANG_CONTEXT_RESERVE = 8
 
 
 @dataclasses.dataclass
@@ -107,6 +114,112 @@ def flatten_content(c: Any) -> str:
     return "\n".join(p for p in parts if p)
 
 
+# ---------------------------------------------------------------------------
+# Adapter context compression (system prompt / tools / tool_result trimming)
+# ---------------------------------------------------------------------------
+
+_COMPACT_SYSTEM_PROMPT = """\
+You are a coding agent that can interact with a computer to solve software \
+engineering tasks.
+
+You have access to the following tools: Bash, Read, Edit, Write.
+
+TOOL USAGE:
+- Bash: Run shell commands. Use for grep, find, pytest, git, pip, etc.
+  Output beyond the limit will be truncated.
+- Read: Read file contents. Returns the full file with line numbers.
+- Edit: Modify existing files. Provide exact old_string and new_string.
+  The old_string must match the file exactly, including indentation.
+- Write: Create new files with the given content.
+
+WORKFLOW:
+1. Read the PROBLEM_STATEMENT.md to understand the issue
+2. Explore relevant files using Bash (grep, find) and Read
+3. Create a script to reproduce the error and confirm it with Bash
+4. Edit source files to fix the issue
+5. Re-run the reproduction script to verify the fix
+6. Think about edge cases
+
+CONSTRAINTS:
+- Only edit source files, do NOT modify test files
+- Make minimal changes to resolve the issue
+- Do not commit changes
+"""
+
+
+def _replace_system_prompt(body: dict) -> None:
+    """Replace body['system'] with a compact prompt unless the
+    SLIME_ADAPTER_SYSTEM_PROMPT env var is set to '' (passthrough).
+
+    Mutates body in place.
+    """
+    env_val = os.environ.get("SLIME_ADAPTER_SYSTEM_PROMPT")
+    if env_val is not None and env_val == "":
+        return  # explicit passthrough
+    replacement = env_val if env_val else _COMPACT_SYSTEM_PROMPT
+    if "system" in body:
+        body["system"] = replacement
+
+
+_DEFAULT_TOOL_WHITELIST = frozenset({"Bash", "Read", "Edit", "Write"})
+
+
+def _filter_tools(body: dict) -> None:
+    """Filter body['tools'] to keep only whitelisted tool names.
+
+    Controlled by SLIME_ADAPTER_TOOL_WHITELIST env var (comma-separated
+    names). Default: Bash,Read,Edit,Write. Empty string: passthrough all.
+    Mutates body in place.
+    """
+    env_val = os.environ.get("SLIME_ADAPTER_TOOL_WHITELIST")
+    if env_val is not None and env_val == "":
+        return  # explicit passthrough
+    if env_val:
+        whitelist = frozenset(n.strip() for n in env_val.split(",") if n.strip())
+    else:
+        whitelist = _DEFAULT_TOOL_WHITELIST
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        body["tools"] = [t for t in tools if isinstance(t, dict) and t.get("name") in whitelist]
+
+
+_DEFAULT_MAX_TOOL_RESULT_CHARS = 10_000
+
+
+def _truncate_tool_results(body: dict) -> None:
+    """Truncate tool_result content in messages that exceeds the char limit.
+
+    Controlled by SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS env var. Default:
+    10,000. Set to 0 to disable truncation. Mutates body in place.
+    """
+    env_val = os.environ.get("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS")
+    if env_val is not None:
+        max_chars = int(env_val)
+        if max_chars <= 0:
+            return  # explicit passthrough / disabled
+    else:
+        max_chars = _DEFAULT_MAX_TOOL_RESULT_CHARS
+
+    for msg in body.get("messages", []):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            text = flatten_content(block.get("content"))
+            if len(text) > max_chars:
+                omitted = len(text) - max_chars
+                block["content"] = (
+                    text[:max_chars]
+                    + f"\n<response clipped at {max_chars:,} chars, "
+                    f"{omitted:,} chars omitted. "
+                    f"Use grep/head/tail to see specific parts.>"
+                )
+
+
 def tool_call_dict(name: str, arguments: dict | None) -> dict:
     """Canonical OpenAI-shape tool call stored on manager_message.
 
@@ -158,6 +271,10 @@ class BaseAdapter:
         self.closed: set[str] = set()
         self.app = web.Application(client_max_size=64 * 1024 * 1024)
 
+        # Shared aiohttp session for SGLang requests — reuses TCP connections
+        # across turns so concurrent agents don't each pay connection-setup cost.
+        self._http_session: aiohttp.ClientSession | None = None
+
         # one manager shared across all sids; per-sid trees live inside it.
         # fork_threshold_tokens left None means the manager uses its own default.
         mgr_kwargs: dict[str, int] = {}
@@ -179,6 +296,15 @@ class BaseAdapter:
     def _register_routes(self, app: web.Application) -> None:
         """Register the protocol's POST route(s) and bind self._run_turn."""
         raise NotImplementedError
+
+    def _get_http_session(self) -> aiohttp.ClientSession:
+        """Lazily create (or return) the shared aiohttp session for SGLang requests."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=900),
+                connector=aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True),
+            )
+        return self._http_session
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         raise NotImplementedError
@@ -339,11 +465,18 @@ class BaseAdapter:
         t0 = time.monotonic()
         try:
             translated, tools_schema = self._translate(body)
-            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+            loop = asyncio.get_running_loop()
+            prompt_ids = await loop.run_in_executor(
+                None, partial(_render_token_ids, translated, tok, tools=tools_schema, add_generation_prompt=True)
+            )
 
             turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
-            raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
+            raw_output = (
+                await loop.run_in_executor(None, partial(tok.decode, turn.output_ids, skip_special_tokens=False))
+                if turn.output_ids
+                else ""
+            )
             parsed = parse_model_output(
                 raw_output,
                 tools_schema=tools_schema,
@@ -455,24 +588,27 @@ async def call_sglang_generate(
     sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
 
     if session.max_context_tokens > 0:
-        remaining_context = session.max_context_tokens - len(prompt_ids)
+        effective_max = session.max_context_tokens - _SGLANG_CONTEXT_RESERVE
+        remaining_context = effective_max - len(prompt_ids)
         if remaining_context <= 0:
             logger.warning(
-                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
+                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d, reserve=%d)",
                 adapter.log_prefix,
                 session_id,
                 len(prompt_ids),
                 session.max_context_tokens,
+                _SGLANG_CONTEXT_RESERVE,
             )
+            _dump_overflow_prompt(adapter, session_id, prompt_ids)
             return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
         sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
+        sess = adapter._get_http_session()
+        async with sess.post(
             f"{sglang_url}/generate",
             json={
                 "rid": rid,
@@ -492,6 +628,19 @@ async def call_sglang_generate(
                     r.status,
                     text,
                 )
+                # SGLang returns 400 when input length exceeds its
+                # max_req_input_len.  Raising RuntimeError here causes the
+                # agent CLI to retry the same overlength request in an
+                # infinite loop.  Return a length-capped empty turn instead
+                # so the adapter gracefully truncates the session.
+                if r.status == 400 and "exceeds the maximum allowed length" in text:
+                    logger.warning(
+                        "[%s] sid=%s rid=%s SGLang context-length 400 treated as length cap",
+                        adapter.log_prefix,
+                        session_id,
+                        rid,
+                    )
+                    return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
                 raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
             data = await r.json(content_type=None)
         meta = data.get("meta_info") or {}
@@ -504,8 +653,13 @@ async def call_sglang_generate(
         # orphaned generation keeps occupying KV until its own length cap
         logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
+            s2 = adapter._get_http_session()
+            async with s2.post(
+                f"{sglang_url}/abort_request",
+                json={"rid": rid},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as _:
+                pass
         except Exception:
             pass
         raise
@@ -521,3 +675,27 @@ async def call_sglang_generate(
 async def _health(request: web.Request) -> web.Response:
     """Handler for /healthz and /v1/models readiness probes."""
     return web.json_response({"ok": True})
+
+
+# One-shot dump of an overflow prompt, gated by SLIME_DUMP_OVERFLOW_PROMPT and a
+# per-sid set so we don't spam disk on the infinite-loop retries. Diagnostic only.
+_OVERFLOW_DUMPED_SIDS: set[str] = set()
+
+
+def _dump_overflow_prompt(adapter: BaseAdapter, session_id: str, prompt_ids: list[int]) -> None:
+    dump_dir = os.environ.get("SLIME_DUMP_OVERFLOW_PROMPT")
+    if not dump_dir:
+        return
+    sid = session_id or "default"
+    if sid in _OVERFLOW_DUMPED_SIDS:
+        return
+    _OVERFLOW_DUMPED_SIDS.add(sid)
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        text = adapter.tokenizer.decode(prompt_ids, skip_special_tokens=False) if prompt_ids else ""
+        path = os.path.join(dump_dir, f"overflow_{sid}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# sid={sid} len={len(prompt_ids)}\n{text}")
+        adapter.logger.info("[%s] dumped overflow prompt for sid=%s to %s", adapter.log_prefix, sid, path)
+    except Exception:
+        adapter.logger.exception("[%s] failed to dump overflow prompt", adapter.log_prefix)
