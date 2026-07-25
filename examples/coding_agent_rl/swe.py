@@ -108,9 +108,11 @@ def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
        ``prepare_swebench_envs.py`` failed to install them silently.
        We inject ``pip install Cython extension-helpers`` before each
        ``pip install -e .`` line so the deps are present even when the
-       env was only partially provisioned.  Combined with the ``set -e``
-       added in step 2, a pip failure here will exit the script rather
-       than silently continuing with a broken environment.
+       env was only partially provisioned.  A pip failure here no longer
+       aborts the script (see step 2: we deliberately keep swebench's
+       ``set -uxo`` without ``-e``); it surfaces as ImportError in the
+       test log instead, which ``get_logs_eval`` parses into
+       ``tests_status``.
     """
     import re
 
@@ -135,12 +137,20 @@ def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
             script,
         )
 
-    # (2) Replace "set -uxo pipefail" with "set -euxo pipefail" so that
-    # pip install failures cause the eval script to exit immediately instead
-    # of silently continuing.  swebench omits -e by design (Docker cleanup
-    # needs to run), but LocalSandbox discards the whole workspace on exit
-    # so early termination is safe and preferable.
-    script = script.replace("set -uxo pipefail", "set -euxo pipefail", 1)
+    # (2) Leave swebench's ``set -uxo pipefail`` UNTOUCHED — do NOT add ``-e``.
+    # FAIL_TO_PASS tests fail on any patch that doesn't fully fix the bug, and
+    # pytest therefore commonly exits non-zero.  With ``-e`` the script aborts
+    # the instant pytest returns, which is *before* swebench's
+    # ``: '>>>>> End Test Output'`` marker runs.  ``get_logs_eval`` then can't
+    # find the End marker, returns ``found=False``, so ``patch_successfully_applied``
+    # stays False and ``tests_status`` is never filled — the reward gating then
+    # collapses every sample (even a correct patch) to reward=0, silently zeroing
+    # all gradients.  swebench omits ``-e`` by design exactly so the cleanup /
+    # marker lines after pytest still execute; we must respect that.  pip-install
+    # failures are still observable: they surface as ImportErrors in the test log
+    # (parsed into tests_status) rather than aborting outright, which is more
+    # debuggable, not less.  (This restores a previous regression that added
+    # ``-e`` here.)
 
     # (3) Inject build-dep installation before `pip install -e .` lines
     # so that --no-build-isolation can find Cython / extension-helpers.
