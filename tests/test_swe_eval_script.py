@@ -137,6 +137,26 @@ class TestShapedReward:
         swe = _import_swe()
         assert swe._swebench_shaped_reward(_info(resolved=True)) == 1.0
 
+    def test_resolved_log_still_emits_f2p_p2p(self, caplog):
+        # Guard against re-introducing an early ``resolved`` return in
+        # _log_swebench_result that would drop the F2P/P2P buckets from the
+        # log line — resolved samples should still report them (F2P/P2P all
+        # green) so the grading log is uniformly parseable.
+        swe = _import_swe()
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger=swe.logger.name):
+            swe._log_swebench_result(
+                "astropy__x-1",
+                0,
+                _info(resolved=True, f2p=(2, 2), p2p=(141, 141)),
+                "no markers here",
+            )
+        line = caplog.records[-1].getMessage()
+        assert "reward=1.000" in line
+        assert "F2P=(2/2)" in line
+        assert "P2P=(141/141)" in line
+
     def test_preserve_p2p_noop_patch_earns_beta_only(self):
         # F2P=(0/2) P2P=(68/68): patch didn't fix the bug but broke nothing —
         # the exact astropy-13398 case that printed reward=0 but was really 0.30.
