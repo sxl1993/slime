@@ -728,8 +728,19 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
 # Diff capture (agent sandbox, after harness.run)
 # ---------------------------------------------------------------------------
 async def git_diff(sb: Sandbox, workdir: str) -> str:
+    # Run as root, not the agent user. ``git add -N .`` records intent-to-add
+    # entries for untracked files so they appear in the diff -- but doing so
+    # locks the worktree index AND writes a blob object into the SHARED clone's
+    # ``.git/objects``. With LocalSandbox the clone (and its worktree metadata)
+    # is root-owned, so as the agent user both writes fail silently (the error
+    # goes to stderr which we discard): ``git add -N`` exits non-zero, the
+    # ``&&`` short-circuits, and ``git diff`` returns empty -- silently dropping
+    # the model's whole patch so eval scores reward=0 batch-wide (the real cause
+    # of the all-zero reward seen here, masked because root reads around it).
+    # Root reads the agent-owned workdir fine, so capturing the diff as root
+    # preserves untracked new files without per-worktree ownership changes.
     cmd = f"cd {workdir} && git add -N . && git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
-    _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
+    _, out, _ = await sb.exec(cmd, user="root", timeout=120)
     return out
 
 
