@@ -484,6 +484,60 @@ def _create_conda_env_sync(name: str, py_version: str, packages_str: str, pip_pa
     return env_dir.exists()
 
 
+def _run_env_clone_sync(base_env_dir: str, dest_env_dir: str) -> None:
+    """Synchronously clone a conda env (runs in executor).
+
+    Clones the read-only base env (created once by ``_ensure_conda_env``) into
+    a per-instance destination so that eval's ``pip install -e .`` writes the
+    clone's ``site-packages`` instead of the shared base. ``conda create
+    --clone`` rewrites the shebangs in ``bin/*`` to point at the new env (a
+    plain ``cp -r`` would leave them pointing at the base, so ``pip``/``python``
+    in the clone would silently use the base interpreter — see ADR-0007).
+
+    Raises on failure; callers log and skip the instance.
+    """
+    import subprocess
+
+    base = Path(base_env_dir)
+    if not base.is_dir():
+        raise FileNotFoundError(f"base env not found: {base_env_dir}")
+    dest = Path(dest_env_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # ``conda create --clone`` can clone by name or by prefix. We clone by the
+    # base env's *name* (derived from its dir) so conda registers the clone
+    # cleanly; the clone lives at an arbitrary prefix via ``-p``.
+    base_name = base.name
+    subprocess.run(
+        f"{_CONDA_BIN} create -p {dest} --clone {base_name} -y",
+        shell=True,
+        timeout=900,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+async def _clone_env_for_eval(base_env_dir: str, dest_env_dir: str) -> str:
+    """Clone the read-only base conda env into a per-instance eval env.
+
+    Returns the clone's directory. The base env stays untouched (it is the
+    shared read-only clone source across the whole rollout); each eval sample
+    writes only its own clone's ``site-packages``, so concurrent ``pip install
+    -e .`` no longer corrupt a shared env (ADR-0007 root cause).
+
+    A leftover dest from a crashed prior run is only reused if it looks like a
+    complete env (has ``bin/python`` and ``conda-meta/history``); otherwise it
+    is re-cloned so eval never silently runs against a half-written env.
+    """
+    dest = Path(dest_env_dir)
+    if dest.is_dir() and (dest / "bin" / "python").exists() and (dest / "conda-meta" / "history").exists():
+        return dest_env_dir
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_env_clone_sync, base_env_dir, dest_env_dir)
+    logger.info("[swe.swebench] cloned eval env %s <- %s", dest_env_dir, base_env_dir)
+    return dest_env_dir
+
+
 PROTOCOL_SCALESWE = "scaleswe"
 PROTOCOL_SWEBENCH = "swebench"
 
@@ -886,6 +940,8 @@ def _log_swebench_result(instance_id: str, exit_code, info: dict, log: str) -> N
 
 async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalResult:
     """reward=1.0 iff sweb's get_eval_report declares the instance ``resolved``."""
+    import subprocess
+
     from slime.agent.local_sandbox import LocalSandbox
 
     instance_id = md["instance_id"]
@@ -930,11 +986,42 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         env_dir: str | None = None
         if _is_local:
             slug = repo.replace("/", "_") if repo else ""
-            env_dir = str(_CONDA_ROOT / "envs" / f"sweb_{slug}_{version}")
-            if not os.path.isdir(env_dir):
-                env_dir = await _ensure_conda_env(repo, version)
-            if env_dir and os.path.isdir(env_dir):
-                logger.info("[swe.swebench] %s: using conda env %s", instance_id, env_dir)
+            base_env_dir = str(_CONDA_ROOT / "envs" / f"sweb_{slug}_{version}")
+            if not os.path.isdir(base_env_dir):
+                base_env_dir = await _ensure_conda_env(repo, version)
+            if base_env_dir and os.path.isdir(base_env_dir):
+                # The base env is a shared, read-only clone source (created
+                # once by _ensure_conda_env, serialized per repo/version).
+                # Every eval sample must write its OWN copy — swebench's
+                # eval_script runs ``pip install -e .`` which writes the env's
+                # site-packages, and 8 concurrent samples writing the same
+                # shared env corrupt dist-info (hypothesis METADATA deleted,
+                # numpy half-overwritten → reward=0 batch-wide). See ADR-0007.
+                clone_env_dir = str(ev.workspace_root / "env")
+                try:
+                    env_dir = await _clone_env_for_eval(base_env_dir, clone_env_dir)
+                    logger.info(
+                        "[swe.swebench] %s: using cloned eval env %s (base=%s)",
+                        instance_id,
+                        env_dir,
+                        base_env_dir,
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    # Skip THIS instance (reward=0) — do NOT fall back to the
+                    # shared base env. Falling back would route eval's
+                    # ``pip install -e .`` back onto the base, re-opening the
+                    # concurrent-write corruption this clone exists to prevent
+                    # (ADR-0007). One bad clone must not zero the batch: sibling
+                    # clones proceed independently, and this instance is dropped
+                    # just like a failed model-patch apply below.
+                    logger.error(
+                        "[swe.swebench] %s: env clone failed (%s); skipping instance (reward=0) "
+                        "rather than falling back to shared base env %s",
+                        instance_id,
+                        e,
+                        base_env_dir,
+                    )
+                    return EvalResult(0.0, False)
             else:
                 logger.warning(
                     "[swe.swebench] %s: conda env for %s@%s not found and "
