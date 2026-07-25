@@ -24,6 +24,8 @@ import subprocess
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def _import_swe():
     """Import swe.py as a module (it lives under examples/)."""
@@ -107,3 +109,59 @@ class TestNoSetEAdded:
         out = swe._patch_eval_sh_for_local(_synthetic_eval_script(), env_dir=None)
         assert f": '{END_MARKER}'" in out
         assert f": '{START_MARKER}'" in out
+
+
+def _info(*, resolved=False, applied=True, f2p=(0, 0), p2p=(0, 0)):
+    """Build a swebench eval-report ``info`` dict with the given test buckets."""
+    f2p_pass, f2p_total = f2p
+    p2p_pass, p2p_total = p2p
+    f2p_fail = f2p_total - f2p_pass
+    p2p_fail = p2p_total - p2p_pass
+    return {
+        "resolved": resolved,
+        "patch_successfully_applied": applied,
+        "tests_status": {
+            "FAIL_TO_PASS": {"success": ["t"] * f2p_pass, "failure": ["t"] * f2p_fail},
+            "PASS_TO_PASS": {"success": ["t"] * p2p_pass, "failure": ["t"] * p2p_fail},
+        },
+    }
+
+
+class TestShapedReward:
+    """``_swebench_shaped_reward`` is the single source of truth shared by the
+    grader (dispatched reward) and the log line (greped value), so they never
+    silently diverge — the bug this guards against was a hardcoded
+    ``reward=0`` log that hid actual 0.30 rewards."""
+
+    def test_resolved_is_one(self):
+        swe = _import_swe()
+        assert swe._swebench_shaped_reward(_info(resolved=True)) == 1.0
+
+    def test_preserve_p2p_noop_patch_earns_beta_only(self):
+        # F2P=(0/2) P2P=(68/68): patch didn't fix the bug but broke nothing —
+        # the exact astropy-13398 case that printed reward=0 but was really 0.30.
+        swe = _import_swe()
+        r = swe._swebench_shaped_reward(_info(f2p=(0, 2), p2p=(68, 68)))
+        assert r == pytest.approx(0.3)  # 0.7*0 + 0.3*1.0
+
+    def test_broken_patch_collects_no_tests_is_zero(self):
+        # F2P=(0/4) P2P=(0/68): patch had a syntax error, collection failed, so
+        # every test failed — genuinely zero reward (not a logging artifact).
+        swe = _import_swe()
+        assert swe._swebench_shaped_reward(_info(f2p=(0, 4), p2p=(0, 68))) == 0.0
+
+    def test_no_tests_parsed_is_zero(self):
+        # patch_applied=True but F2P=(0/0) P2P=(0/0): the pre-fix symptom (End
+        # marker missing) — no signal, reward 0.
+        swe = _import_swe()
+        assert swe._swebench_shaped_reward(_info(applied=True, f2p=(0, 0), p2p=(0, 0))) == 0.0
+
+    def test_patch_not_applied_is_zero(self):
+        swe = _import_swe()
+        assert swe._swebench_shaped_reward(_info(applied=False, f2p=(0, 2), p2p=(68, 68))) == 0.0
+
+    def test_partial_f2p_and_full_p2p(self):
+        # F2P=(1/2) P2P=(68/68): half the bug fixed, nothing broken.
+        swe = _import_swe()
+        r = swe._swebench_shaped_reward(_info(f2p=(1, 2), p2p=(68, 68)))
+        assert r == pytest.approx(0.7 * 0.5 + 0.3 * 1.0)  # 0.65

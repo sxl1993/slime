@@ -933,12 +933,41 @@ def _ratio(d: dict) -> tuple[int, int]:
     return len(passed), len(passed) + len(failed)
 
 
+def _swebench_shaped_reward(info: dict) -> float:
+    """Continuous reward that matches what training actually receives.
+
+    Single source of truth shared by ``_grade_swebench`` (dispatched reward)
+    and ``_log_swebench_result`` (logged reward), so the grep-able log value
+    never silently diverges from the reward shaping math below.
+
+    scheme: reward=1.0 iff swebench declares the instance resolved; otherwise
+    alpha*F2P_ratio + beta*P2P_ratio once a patch applied and at least one test
+    parsed (else 0 — no signal). P2P alone (a no-op patch) earns beta but not
+    alpha, so it can't dominate.
+    """
+    if info.get("resolved"):
+        return 1.0
+    ts_status = info.get("tests_status") or {}
+    f2p_pass, f2p_total = _ratio(ts_status.get("FAIL_TO_PASS", {}))
+    p2p_pass, p2p_total = _ratio(ts_status.get("PASS_TO_PASS", {}))
+    patch_applied = bool(info.get("patch_successfully_applied"))
+    if not patch_applied or (f2p_total == 0 and p2p_total == 0):
+        return 0.0
+    alpha: float = float(os.environ.get("SWE_REWARD_F2P_WEIGHT", "0.7"))
+    beta: float = float(os.environ.get("SWE_REWARD_P2P_WEIGHT", "0.3"))
+    f2p_ratio = f2p_pass / f2p_total if f2p_total else 0.0
+    p2p_ratio = p2p_pass / p2p_total if p2p_total else 1.0
+    return alpha * f2p_ratio + beta * p2p_ratio
+
+
 def _log_swebench_result(instance_id: str, exit_code, info: dict, log: str) -> None:
     """Emit the per-instance grading outcome with test-bucket ratios; always
-    surface the eval log tail so failures can be diagnosed."""
-    if info.get("resolved"):
-        logger.info("[swe.swebench] %s: reward=1 exit_code=%s", instance_id, exit_code)
-        return
+    surface the eval log tail so failures can be diagnosed.
+
+    The ``reward=`` value logged here is the *actual* shaped reward (via
+    ``_swebench_shaped_reward``), not a hardcoded 0/1 — so grepping the log
+    gives the same number training receives."""
+    reward = _swebench_shaped_reward(info)
     ts_status = info.get("tests_status") or {}
     f2p_pass, f2p_total = _ratio(ts_status.get("FAIL_TO_PASS", {}))
     p2p_pass, p2p_total = _ratio(ts_status.get("PASS_TO_PASS", {}))
@@ -952,8 +981,9 @@ def _log_swebench_result(instance_id: str, exit_code, info: dict, log: str) -> N
         test_log = log
     tail = test_log[-1200:]
     logger.info(
-        "[swe.swebench] %s: reward=0 exit_code=%s patch_applied=%s F2P=(%d/%d) P2P=(%d/%d) tail=%s",
+        "[swe.swebench] %s: reward=%.3f exit_code=%s patch_applied=%s F2P=(%d/%d) P2P=(%d/%d) tail=%s",
         instance_id,
+        reward,
         exit_code,
         bool(info.get("patch_successfully_applied")),
         f2p_pass,
@@ -1095,30 +1125,12 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
     info = report.get(instance_id, {})
     _log_swebench_result(instance_id, exit_code, info, log)
 
-    if info.get("resolved"):
-        return EvalResult(1.0, True)
-
     # Continuous reward shaping so that partial progress (passing some
     # FAIL_TO_PASS tests, preserving PASS_TO_PASS tests) produces non-zero
     # gradients even when the instance is not fully resolved.  Without this,
     # the 0/1 binary reward collapses to zero for every sample in a batch
     # (Qwen3-4B currently resolves 0/16), yielding advantage=0 and
-    # grad_norm=0 — the model cannot learn at all.
-    ts_status = info.get("tests_status") or {}
-    f2p_pass, f2p_total = _ratio(ts_status.get("FAIL_TO_PASS", {}))
-    p2p_pass, p2p_total = _ratio(ts_status.get("PASS_TO_PASS", {}))
-    patch_applied = bool(info.get("patch_successfully_applied"))
-
-    if not patch_applied or (f2p_total == 0 and p2p_total == 0):
-        # Eval never ran or no tests parsed — no signal.
-        return EvalResult(0.0, patch_applied)
-
-    # α weights F2P (fixing the target bug), β weights P2P (not breaking
-    # existing tests).  P2P alone shouldn't give high reward — a no-op
-    # patch preserves all P2P but fixes nothing.
-    alpha: float = float(os.environ.get("SWE_REWARD_F2P_WEIGHT", "0.7"))
-    beta: float = float(os.environ.get("SWE_REWARD_P2P_WEIGHT", "0.3"))
-    f2p_ratio = f2p_pass / f2p_total if f2p_total else 0.0
-    p2p_ratio = p2p_pass / p2p_total if p2p_total else 1.0
-    reward = alpha * f2p_ratio + beta * p2p_ratio
-    return EvalResult(reward, patch_applied)
+    # grad_norm=0 — the model cannot learn at all.  Same shaping as the log
+    # (see ``_swebench_shaped_reward``) — single source of truth.
+    reward = _swebench_shaped_reward(info)
+    return EvalResult(reward, bool(info.get("patch_successfully_applied")))
