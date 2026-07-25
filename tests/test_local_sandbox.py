@@ -270,6 +270,34 @@ async def test_concurrent_env_clones_isolate_writes(tmp_path, monkeypatch):
         assert f.read() == "BASE_HISTORY_CANARY", "base env conda-meta must stay read-only"
 
 
+def test_patch_eval_sh_activates_clone_by_prefix(tmp_path):
+    """_patch_eval_sh_for_local must activate a -p clone by its absolute
+    prefix, NOT by env name. Clones are `conda create -p <path>` (ADR-0007) —
+    they are not registered under a conda env name, so `conda activate <name>`
+    (which the basename "env" would produce) silently fails and falls back to
+    base, making eval run against the wrong Python. Activating by prefix works
+    for unregistered -p envs.
+    """
+    from examples.coding_agent_rl import swe
+
+    # A -p clone lives at .../workspace/env; its basename is "env", which is
+    # NOT a registered conda env name.
+    clone_env_dir = str(tmp_path / "workspace" / "env")
+    script = "set -uxo pipefail\nconda activate testbed\npip install -e .\n"
+    patched = swe._patch_eval_sh_for_local(script, env_dir=clone_env_dir)
+
+    # Must activate by the absolute prefix, not the bare basename "env".
+    assert (
+        f"conda activate {clone_env_dir}\n" in patched
+    ), f"expected `conda activate {clone_env_dir}` (by prefix), got:\n{patched}"
+    assert (
+        "conda activate env\n" not in patched
+    ), f"`conda activate env` (by basename) would fail for a -p clone; got:\n{patched}"
+    # PATH override must still be present (non-interactive activate doesn't
+    # reliably prepend bin/).
+    assert f"export PATH={clone_env_dir}/bin:$PATH\n" in patched
+
+
 @pytest.mark.skipif(not _unshare_available, reason="unshare --mount not available")
 @pytest.mark.asyncio
 async def test_concurrent_bind_mounts_isolated(tmp_path):

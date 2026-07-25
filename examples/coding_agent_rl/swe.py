@@ -114,13 +114,18 @@ def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
     """
     import re
 
-    # (1) Replace "conda activate testbed" with the real env name + PATH
-    # override so that the conda env's python/pip are found first.
+    # (1) Replace "conda activate testbed" with the real env + PATH override
+    # so the conda env's python/pip are found first. The eval env is a
+    # `conda create -p <path>` clone (ADR-0007) — it is NOT registered under a
+    # conda env name, so `conda activate <name>` would fail and silently fall
+    # back to base. Activate by prefix (absolute path) instead, which works
+    # for -p clones. The PATH override is still needed because `conda
+    # activate` in non-interactive bash does not reliably prepend the env's
+    # bin/ to PATH.
     if env_dir:
-        env_name = Path(env_dir).name  # e.g. "sweb_astropy_astropy_5.1"
         script = re.sub(
             r"conda activate testbed\n",
-            f"conda activate {env_name}\nexport PATH={env_dir}/bin:$PATH\n",
+            f"conda activate {env_dir}\nexport PATH={env_dir}/bin:$PATH\n",
             script,
         )
     else:
