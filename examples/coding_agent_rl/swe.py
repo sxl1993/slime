@@ -63,12 +63,19 @@ def _patch_pip_install_e(script: str) -> str:
     ``--no-build-isolation`` forces pip to reuse the packages already
     present in the conda env (where ``Cython``, ``setuptools<58``, and
     ``extension-helpers`` are pre-installed by ``prepare_swebench_envs.py``).
+
+    Also add ``--index-url`` / ``--trusted-host`` from
+    ``SWEBENCH_PIP_INDEX_URL`` so that pip's dependency resolution (e.g.
+    ``setup.py egg_info`` fetching ``astropy-helpers``) uses the configured
+    mirror instead of the default ``pypi.python.org``, which may be
+    unreachable from the LocalSandbox environment.
     """
     import re
 
+    idx = _pip_index_args()
     return re.sub(
         r"^([^\n]*pip[^\n]*install[^\n]*-e[^\n]*)$",
-        r"\1 --no-build-isolation",
+        rf"\1 --no-build-isolation {idx}",
         script,
         flags=re.MULTILINE,
     )
@@ -77,7 +84,7 @@ def _patch_pip_install_e(script: str) -> str:
 def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
     """Patch swebench's eval script for LocalSandbox execution.
 
-    Four problems need fixing:
+    Five problems need fixing:
 
     1. ``conda activate testbed`` references a ``testbed`` env that does
        not exist on the host — only versioned envs like
@@ -113,6 +120,17 @@ def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
        ``set -uxo`` without ``-e``); it surfaces as ImportError in the
        test log instead, which ``get_logs_eval`` parses into
        ``tests_status``.
+
+    5. ``conda create --clone -p <path>`` rewrites shebangs in ``bin/*``
+       to point at the clone's host-absolute path (e.g.
+       ``/tmp/slime_sandbox/.../testbed/.slime_env/bin/python``).  Inside
+       the mount namespace, ``/tmp`` is bind-mounted over, so the
+       shebang target is invisible and bare ``pip`` / ``pytest`` fail
+       with ``cannot execute: required file not found``.  We replace
+       bare ``pip`` and ``pytest`` invocations with
+       ``<env_dir>/bin/python -m pip`` / ``<env_dir>/bin/python -m pytest``,
+       which invoke the Python interpreter directly (ELF binary, no
+       shebang) and let it resolve the module from ``sys.path``.
     """
     import re
 
@@ -167,6 +185,21 @@ def _patch_eval_sh_for_local(script: str, env_dir: str | None = None) -> str:
 
     # (4) Add --no-build-isolation to pip install -e lines.
     script = _patch_pip_install_e(script)
+
+    # (5) Rewrite bare pip / pytest / python -m pip / python -m pytest to use
+    # the env's python interpreter directly, bypassing shebangs that point
+    # at host-absolute paths invisible inside the mount namespace.  The
+    # env's python is an ELF binary (no shebang) reachable at
+    # ``env_dir/bin/python`` via the /testbed bind mount.
+    # We also rewrite bare ``python -m pip`` / ``python -m pytest`` (which
+    # swebench generates) because the bare ``python`` resolves to the
+    # base conda or system interpreter (wrong version).
+    if env_dir:
+        env_python = f"{env_dir}/bin/python"
+        script = re.sub(r"^(\s*)pip\b", rf"\1{env_python} -m pip", script, flags=re.MULTILINE)
+        script = re.sub(r"^(\s*)python\s+-m\s+pip\b", rf"\1{env_python} -m pip", script, flags=re.MULTILINE)
+        script = re.sub(r"^(\s*)pytest\b", rf"\1{env_python} -m pytest", script, flags=re.MULTILINE)
+        script = re.sub(r"^(\s*)python\s+-m\s+pytest\b", rf"\1{env_python} -m pytest", script, flags=re.MULTILINE)
 
     return script
 
@@ -358,10 +391,22 @@ async def _ensure_conda_env(repo: str, version: str) -> str | None:
         return None
 
 
+_TSINGHUA_PIP_INDEX = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+_TSINGHUA_PIP_TRUSTED_HOST = "mirrors.tuna.tsinghua.edu"
+
+
 def _pip_index_args() -> str:
-    """Return ``--index-url ... --trusted-host ...`` if SWEBENCH_PIP_INDEX_URL is set."""
-    pip_index = os.environ.get("SWEBENCH_PIP_INDEX_URL", "")
-    pip_trusted = os.environ.get("SWEBENCH_PIP_TRUSTED_HOST", "")
+    """Return ``--index-url ... --trusted-host ...`` for pip.
+
+    Uses ``SWEBENCH_PIP_INDEX_URL`` / ``SWEBENCH_PIP_TRUSTED_HOST`` if set,
+    otherwise falls back to Tsinghua mirror so that pip works in
+    network-restricted environments where ``pypi.org`` is unreachable.
+    conda clone does not carry pip-installed packages, so eval's
+    ``pip install -e .[test]`` must be able to resolve dependencies
+    from a reachable index.
+    """
+    pip_index = os.environ.get("SWEBENCH_PIP_INDEX_URL", "") or _TSINGHUA_PIP_INDEX
+    pip_trusted = os.environ.get("SWEBENCH_PIP_TRUSTED_HOST", "") or _TSINGHUA_PIP_TRUSTED_HOST
     if pip_index:
         args = f"--index-url {pip_index}"
         if pip_trusted:
@@ -1035,10 +1080,14 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         _is_local = isinstance(ev, LocalSandbox)
 
         # Resolve the correct conda env for LocalSandbox.
-        # We cannot use ``add_bind_mount`` to map the env into the sandbox
-        # because mount --bind fails silently on overlay/containerd
-        # filesystems.  Instead, we patch the eval script to reference the
-        # real conda env name directly.
+        # The env must live INSIDE the /testbed bind mount (e.g. at
+        # /testbed/.slime_env) so it is visible inside the mount namespace.
+        # Host-side paths like /tmp/slime_sandbox/.../env are invisible
+        # because /tmp is bind-mounted over, and mount --bind to
+        # arbitrarily-created overlayfs paths fails silently — only paths
+        # under an already-mounted directory (like /testbed) are reliably
+        # visible.
+        _ENV_NS_PATH = "/testbed/.slime_env"
         env_dir: str | None = None
         if _is_local:
             slug = repo.replace("/", "_") if repo else ""
@@ -1053,13 +1102,20 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
                 # site-packages, and 8 concurrent samples writing the same
                 # shared env corrupt dist-info (hypothesis METADATA deleted,
                 # numpy half-overwritten → reward=0 batch-wide). See ADR-0007.
-                clone_env_dir = str(ev.workspace_root / "env")
+                clone_env_dir = str(ev.workspace_root / "testbed" / ".slime_env")
                 try:
                     env_dir = await _clone_env_for_eval(base_env_dir, clone_env_dir)
+                    # Use the namespace-visible path instead of the host path.
+                    # /testbed/.slime_env is visible inside the mount namespace
+                    # because /testbed is already bind-mounted; the host-side
+                    # path (e.g. /tmp/slime_sandbox/.../testbed/.slime_env) is
+                    # not directly referenceable from within the namespace.
+                    env_dir = _ENV_NS_PATH
                     logger.info(
-                        "[swe.swebench] %s: using cloned eval env %s (base=%s)",
+                        "[swe.swebench] %s: using cloned eval env (ns=%s, host=%s, base=%s)",
                         instance_id,
                         env_dir,
+                        clone_env_dir,
                         base_env_dir,
                     )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:

@@ -270,32 +270,41 @@ async def test_concurrent_env_clones_isolate_writes(tmp_path, monkeypatch):
         assert f.read() == "BASE_HISTORY_CANARY", "base env conda-meta must stay read-only"
 
 
-def test_patch_eval_sh_activates_clone_by_prefix(tmp_path):
+def test_patch_eval_sh_activates_clone_by_prefix():
     """_patch_eval_sh_for_local must activate a -p clone by its absolute
     prefix, NOT by env name. Clones are `conda create -p <path>` (ADR-0007) —
     they are not registered under a conda env name, so `conda activate <name>`
     (which the basename "env" would produce) silently fails and falls back to
     base, making eval run against the wrong Python. Activating by prefix works
     for unregistered -p envs.
+
+    In the LocalSandbox flow, env_dir is the namespace-visible path under
+    /testbed (e.g. /testbed/.slime_env), because the host-side path
+    (e.g. /tmp/slime_sandbox/.../env) is invisible inside exec()'s mount
+    namespace.
     """
     from examples.coding_agent_rl import swe
 
-    # A -p clone lives at .../workspace/env; its basename is "env", which is
-    # NOT a registered conda env name.
-    clone_env_dir = str(tmp_path / "workspace" / "env")
+    # In production, env_dir is /testbed/.slime_env (under the bind-mounted
+    # /testbed so it is visible inside the namespace).  The key property is
+    # that _patch_eval_sh_for_local uses it verbatim — activating by prefix,
+    # not by basename.
+    env_dir = "/testbed/.slime_env"
     script = "set -uxo pipefail\nconda activate testbed\npip install -e .\n"
-    patched = swe._patch_eval_sh_for_local(script, env_dir=clone_env_dir)
+    patched = swe._patch_eval_sh_for_local(script, env_dir=env_dir)
 
-    # Must activate by the absolute prefix, not the bare basename "env".
+    # Must activate by the absolute prefix, not the bare name "testbed".
     assert (
-        f"conda activate {clone_env_dir}\n" in patched
-    ), f"expected `conda activate {clone_env_dir}` (by prefix), got:\n{patched}"
+        f"conda activate {env_dir}\n" in patched
+    ), f"expected `conda activate {env_dir}` (by prefix), got:\n{patched}"
+    # The original `conda activate testbed` (by name) must be gone — it
+    # would silently fail for a -p clone and fall back to base.
     assert (
-        "conda activate env\n" not in patched
-    ), f"`conda activate env` (by basename) would fail for a -p clone; got:\n{patched}"
+        patched.count("conda activate testbed\n") == 0
+    ), f"`conda activate testbed` (by name) would fail for a -p clone; got:\n{patched}"
     # PATH override must still be present (non-interactive activate doesn't
     # reliably prepend bin/).
-    assert f"export PATH={clone_env_dir}/bin:$PATH\n" in patched
+    assert f"export PATH={env_dir}/bin:$PATH\n" in patched
 
 
 @pytest.mark.skipif(not _unshare_available, reason="unshare --mount not available")
@@ -337,11 +346,50 @@ async def test_concurrent_bind_mounts_isolated(tmp_path):
 @pytest.mark.asyncio
 async def test_add_bind_mount_before_enter_raises(workspace_root):
     """add_bind_mount called before __aenter__ must raise RuntimeError."""
-    from slime.agent.local_sandbox import LocalSandbox
     import tempfile
+
+    from slime.agent.local_sandbox import LocalSandbox
 
     sb = LocalSandbox(image="test", instance_id="pre_enter_test")
     # workspace_root doesn't exist yet — add_bind_mount must raise
     with tempfile.TemporaryDirectory() as d:
         with pytest.raises(RuntimeError, match="sandbox not entered"):
             await sb.add_bind_mount("/opt/test_env", d)
+
+
+# ---------------------------------------------------------------------------
+# Cloned conda env under /testbed: must be visible inside the mount namespace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _unshare_available, reason="unshare --mount not available")
+@pytest.mark.asyncio
+async def test_env_under_testbed_visible_in_namespace(workspace_root):
+    """When the cloned conda env is placed under /testbed/.slime_env, it must
+    be reachable inside exec()'s mount namespace at /testbed/.slime_env.
+
+    This guards the root cause: the env was originally cloned to
+    {workspace_root}/env, whose host-absolute path is invisible inside the
+    unshare namespace because /tmp is bind-mounted over and the env dir
+    has no mount entry.  Placing it under /testbed (which IS bind-mounted)
+    makes it transitively visible.
+    """
+    from slime.agent.local_sandbox import LocalSandbox
+
+    sb = LocalSandbox(image="test", instance_id="env_under_testbed")
+    async with sb:
+        ws = sb.workspace_root
+        # /testbed is created by __aenter__; put .slime_env inside it
+        # (matching swe.py's clone destination).
+        env_bin = ws / "testbed" / ".slime_env" / "bin"
+        env_bin.mkdir(parents=True)
+        # Write a fake python that reports its own path.
+        (env_bin / "python").write_text("#!/bin/bash\necho FAKE_PY36\n")
+        os.chmod(str(env_bin / "python"), 0o755)
+
+        # Inside the namespace, /testbed/.slime_env/bin/python
+        # should resolve to our fake python (transitively visible
+        # via the /testbed bind mount).
+        code, out, err = await sb.exec("/testbed/.slime_env/bin/python")
+        assert code == 0, f"exit={code}, stderr={err}"
+        assert "FAKE_PY36" in out, f"expected fake python output, got: {out!r}"
