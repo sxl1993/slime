@@ -32,7 +32,7 @@ from typing import Any
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
-from slime.agent.sandbox import E2BSandbox
+from slime.agent.sandbox import AmbiguousCreate, Sandbox, UnreleasedSandbox, create_sandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -56,6 +56,7 @@ HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
 class SweConfig:
     eval_protocol: str  # eval-path schema/grader (SWE_EVAL_PROTOCOL)
     train_protocol: str  # train-path schema/grader (SWE_TRAIN_PROTOCOL)
+    adapter_public_url: str | None
     adapter_public_host: str | None
     adapter_bind_host: str
     adapter_port: int
@@ -75,6 +76,7 @@ class SweConfig:
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
+            adapter_public_url=os.environ.get("ADAPTER_PUBLIC_URL"),
             adapter_public_host=os.environ.get("ADAPTER_PUBLIC_HOST"),
             adapter_bind_host=os.environ.get("ADAPTER_BIND_HOST", "0.0.0.0"),
             adapter_port=int(os.environ.get("ADAPTER_PORT", "18001")),
@@ -93,27 +95,40 @@ _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
 
 @asynccontextmanager
-async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BSandbox]:
-    """Boot a fresh E2B sandbox and install the selected harness toolchain.
+async def boot_agent_sandbox(image: str, instance_id: str, session_id: str) -> AsyncIterator[Sandbox]:
+    """Boot a fresh selected-backend sandbox and prepare its harness CLI.
 
-    Create the sandbox from the dataset image, install Node 22 + the harness CLI
-    from host tarballs, retry transient boot/install failures, and close the
-    sandbox when the caller leaves the context.
+    E2B images receive the existing Node/CLI install. ARCA images carry the CLI
+    already and are only verified. An ambiguous ARCA create is never retried.
     """
     sb = None
     last_err: Exception | None = None
     for attempt in range(CONFIG.boot_retries):
-        cand = E2BSandbox(image)
+        cand = create_sandbox(
+            image,
+            metadata={
+                "instance_id": instance_id,
+                "session_id": session_id,
+                "role": "agent",
+                "attempt": str(attempt + 1),
+            },
+        )
         try:
             async with _BOOT_SEM:
                 await cand.__aenter__()
                 try:
-                    await HARNESS_CLS().install_cli(cand)
+                    await HARNESS_CLS().prepare_cli(cand)
                 except BaseException:
                     await cand.__aexit__(None, None, None)
                     raise
             sb = cand
             break
+        except (AmbiguousCreate, UnreleasedSandbox):
+            logger.error(
+                "[coding_agent_rl] %s: sandbox lease requires reconciliation; automatic retry disabled",
+                instance_id,
+            )
+            raise
         except Exception as e:
             last_err = e
             logger.warning(
@@ -141,11 +156,14 @@ class _AdapterService(metaclass=SingletonMeta):
         self.tool_parser = getattr(args, "sglang_tool_call_parser", None) or None
         self.reasoning_parser = getattr(args, "sglang_reasoning_parser", None) or None
         sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        if not CONFIG.adapter_public_host:
+        if CONFIG.adapter_public_url:
+            adapter_url = CONFIG.adapter_public_url.rstrip("/")
+        elif CONFIG.adapter_public_host:
+            adapter_url = None
+        else:
             raise RuntimeError(
-                "ADAPTER_PUBLIC_HOST is not set. Export it to the host IP that "
-                "sandboxes can reach for reverse-connection to the adapter; "
-                "without it the sandbox cannot dial back and the rollout aborts."
+                "Neither ADAPTER_PUBLIC_URL nor ADAPTER_PUBLIC_HOST is set. "
+                "Export a URL or host that sandboxes can reach for reverse-connection."
             )
         self.adapter = ADAPTER_CLS(
             tokenizer=self.tokenizer,
@@ -168,7 +186,7 @@ class _AdapterService(metaclass=SingletonMeta):
                 "access_log_class": FilteredAccessLogger,
             },
         )
-        self.adapter_url = f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
+        self.adapter_url = adapter_url or f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
         logger.info(
             "[coding_agent_rl] tokenizer=%s adapter=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
             args.hf_checkpoint,
@@ -200,7 +218,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     t0 = time.time()
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
-            async with boot_agent_sandbox(md["image"], instance_id) as sb:
+            async with boot_agent_sandbox(md["image"], instance_id, session_id) as sb:
                 await swe.prepare_workspace(sb, md["workdir"], md)
                 agent_exit_code = await HARNESS_CLS().run(
                     sb,

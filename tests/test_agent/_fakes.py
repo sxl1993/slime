@@ -28,10 +28,6 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 
-from aiohttp import web
-
-from slime.agent.adapters.common import TurnRecord
-
 # ---------------------------------------------------------------------------
 # Tokenizers
 # ---------------------------------------------------------------------------
@@ -151,10 +147,12 @@ class FakeSGLangServer:
         self.finish_reason = finish_reason
         self.requests: list[dict] = []
         self.routing_keys: list[str | None] = []
-        self._server: web.Application | None = None
+        self._server = None
         self._runner = None
 
-    async def _handle(self, request: web.Request) -> web.Response:
+    async def _handle(self, request):
+        from aiohttp import web
+
         self.routing_keys.append(request.headers.get("X-SMG-Routing-Key"))
         self.requests.append(await request.json())
         assert self.turns, "unexpected /generate call (turn script exhausted)"
@@ -169,6 +167,7 @@ class FakeSGLangServer:
         )
 
     async def __aenter__(self) -> FakeSGLangServer:
+        from aiohttp import web
         from aiohttp.test_utils import TestServer
 
         app = web.Application()
@@ -194,7 +193,9 @@ def fake_call_sglang_generate(scripted: list[tuple[str, str, list[float] | None]
     """
     queue = list(scripted)
 
-    async def _fake(prompt_ids, session, body, *, adapter, session_id=None) -> TurnRecord:
+    async def _fake(prompt_ids, session, body, *, adapter, session_id=None):
+        from slime.agent.adapters.common import TurnRecord
+
         assert queue, "unexpected sglang /generate call (response script exhausted)"
         text, finish, logprobs = queue.pop(0)
         output_ids = tokenizer.encode(text)
@@ -242,6 +243,10 @@ class FakeSandbox:
     ) -> None:
         self.image = image
         self.sandbox_id = f"fake-{image}"
+        self.work_user = "agent"
+        self.privileged_user = "root"
+        self.home_dir = "/home/agent"
+        self.cli_preinstalled = False
         self.on_launch = on_launch
         # ordered (substring -> (exit, stdout, stderr)) overrides, first match wins.
         self.responses = list(responses or [])
@@ -262,6 +267,9 @@ class FakeSandbox:
 
     async def __aexit__(self, *exc) -> None:
         return None
+
+    async def destroy(self) -> bool:
+        return True
 
     async def exec(self, cmd, *, user="root", env=None, timeout=120, check=False, idempotent=True):
         self.exec_log.append((cmd, user))

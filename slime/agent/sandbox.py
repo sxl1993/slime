@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import random
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -38,6 +41,10 @@ class Sandbox(Protocol):
     """
 
     sandbox_id: str
+    work_user: str
+    privileged_user: str
+    home_dir: str
+    cli_preinstalled: bool
 
     async def __aenter__(self) -> Sandbox: ...
 
@@ -57,6 +64,8 @@ class Sandbox(Protocol):
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None: ...
 
     async def read_file(self, sandbox_path: str, *, user: str = "root") -> str: ...
+
+    async def destroy(self) -> bool: ...
 
 
 EXIT_TIME_BUDGET_EXCEEDED = -1
@@ -159,6 +168,11 @@ def _getenv(*names: str, default: str = "") -> str:
 
 class E2BSandbox:
     """Async context manager around e2b.AsyncSandbox."""
+
+    work_user = "agent"
+    privileged_user = "root"
+    home_dir = "/home/agent"
+    cli_preinstalled = False
 
     image_metadata_key_env = ("SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY", "SWE_SANDBOX_IMAGE_METADATA_KEY")
     lifetime_sec_env = ("SLIME_AGENT_SANDBOX_LIFETIME_SEC", "SWE_SANDBOX_LIFETIME_SEC")
@@ -300,11 +314,17 @@ class E2BSandbox:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.destroy()
+
+    async def destroy(self) -> bool:
         try:
             if self._sb is not None:
                 await self._sb.kill()
+                self._sb = None
+            return True
         except Exception as e:
             logger.warning("[agent.sandbox] kill %s failed: %s", self.sandbox_id[:8], e)
+            return False
 
     async def exec(
         self,
@@ -387,6 +407,328 @@ class E2BSandbox:
             return ""
 
 
+class AmbiguousCreate(RuntimeError):
+    """ARCA create may have succeeded, but no sandbox ID is available.
+
+    Retrying this state can allocate a duplicate lease, so callers must stop
+    automatic boot retries and reconcile it outside the rollout path.
+    """
+
+
+class UnreleasedSandbox(RuntimeError):
+    """A known ARCA sandbox could not be destroyed.
+
+    Callers must not allocate a replacement automatically because the existing
+    lease may still be live and requires operator-side reaping by sandbox ID.
+    """
+
+
+_ARCA_FACTORY = None
+_ARCA_FACTORY_CONFIG: tuple[str, str, str] | None = None
+_ARCA_FACTORY_LOCK = threading.Lock()
+
+
+def _load_arca_sdk():
+    """Load the optional ARCA SDK only when the ARCA backend is selected."""
+    try:
+        from arca import SandboxFactory  # type: ignore
+        from arca.model.sandbox import ResourceSpecification  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "The ARCA sandbox backend requires arca-sandbox==1.1.0. "
+            "Install it from the approved package index before selecting backend=arca."
+        ) from None
+    return SandboxFactory, ResourceSpecification
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required for the ARCA sandbox backend")
+    return value
+
+
+def _get_arca_factory():
+    """Return one process-shared SandboxFactory initialized from a short-lived YAML."""
+    global _ARCA_FACTORY, _ARCA_FACTORY_CONFIG
+
+    app_name = _required_env("SLIME_ARCA_APP_NAME")
+    base_url = _required_env("SLIME_ARCA_BASE_URL")
+    api_key = _required_env("SLIME_ARCA_API_KEY")
+    config_identity = (app_name, base_url, api_key)
+
+    with _ARCA_FACTORY_LOCK:
+        if _ARCA_FACTORY is not None:
+            if _ARCA_FACTORY_CONFIG != config_identity:
+                raise RuntimeError("ARCA SDK configuration changed after SandboxFactory initialization")
+            return _ARCA_FACTORY
+
+        factory_cls, _ = _load_arca_sdk()
+        fd, config_path = tempfile.mkstemp(prefix="slime-arca-", suffix=".yaml")
+        try:
+            os.fchmod(fd, 0o600)
+            config_text = (
+                f"app_name: {json.dumps(app_name)}\n"
+                "sandbox:\n"
+                f"  base_url: {json.dumps(base_url)}\n"
+                f"  api_key: {json.dumps(api_key)}\n"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fd = -1
+                fp.write(config_text)
+            try:
+                factory = factory_cls(config_file=config_path)
+            except Exception:
+                raise RuntimeError("Failed to initialize ARCA SandboxFactory") from None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(config_path)
+            except FileNotFoundError:
+                pass
+
+        _ARCA_FACTORY = factory
+        _ARCA_FACTORY_CONFIG = config_identity
+        return _ARCA_FACTORY
+
+
+def _reset_arca_factory_for_tests() -> None:
+    """Reset process-shared state for isolated unit tests."""
+    global _ARCA_FACTORY, _ARCA_FACTORY_CONFIG
+    _ARCA_FACTORY = None
+    _ARCA_FACTORY_CONFIG = None
+
+
+class ArcaSandbox:
+    """Async ARCA sandbox backend for prebuilt coding-agent instance images."""
+
+    work_user = "admin"
+    privileged_user = "admin"
+    home_dir = "/home/admin"
+    cli_preinstalled = True
+
+    template_id_env = "SLIME_AGENT_ARCA_TEMPLATE_ID"
+    ttl_minutes_env = "SLIME_AGENT_ARCA_TTL_MINUTES"
+    cpu_env = "SLIME_AGENT_ARCA_CPU"
+    memory_env = "SLIME_AGENT_ARCA_MEMORY"
+    disk_env = "SLIME_AGENT_ARCA_DISK"
+    create_timeout_sec_env = "SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC"
+    ready_timeout_sec_env = "SLIME_AGENT_ARCA_READY_TIMEOUT_SEC"
+    ready_poll_interval_sec_env = "SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC"
+
+    default_ttl_minutes = 40
+    default_cpu = 2
+    default_memory = 4
+    default_disk = 25
+    default_create_timeout_sec = 150.0
+    default_ready_timeout_sec = 120.0
+    default_ready_poll_interval_sec = 2.0
+
+    def __init__(
+        self,
+        image: str,
+        *,
+        metadata: dict[str, str] | None = None,
+        template_id: str | None = None,
+        ttl_in_minutes: int | None = None,
+        cpu: int | None = None,
+        memory: int | None = None,
+        disk: float | None = None,
+        create_timeout_sec: float | None = None,
+        ready_timeout_sec: float | None = None,
+        ready_poll_interval_sec: float | None = None,
+    ) -> None:
+        self.image = image
+        self.metadata = dict(metadata or {})
+        self.template_id = template_id or _required_env(self.template_id_env)
+        self.ttl_in_minutes = (
+            ttl_in_minutes
+            if ttl_in_minutes is not None
+            else int(_getenv(self.ttl_minutes_env, default=str(self.default_ttl_minutes)))
+        )
+        self.cpu = cpu if cpu is not None else int(_getenv(self.cpu_env, default=str(self.default_cpu)))
+        self.memory = memory if memory is not None else int(_getenv(self.memory_env, default=str(self.default_memory)))
+        self.disk = disk if disk is not None else float(_getenv(self.disk_env, default=str(self.default_disk)))
+        self.create_timeout_sec = (
+            create_timeout_sec
+            if create_timeout_sec is not None
+            else float(_getenv(self.create_timeout_sec_env, default=str(self.default_create_timeout_sec)))
+        )
+        self.ready_timeout_sec = (
+            ready_timeout_sec
+            if ready_timeout_sec is not None
+            else float(_getenv(self.ready_timeout_sec_env, default=str(self.default_ready_timeout_sec)))
+        )
+        self.ready_poll_interval_sec = (
+            ready_poll_interval_sec
+            if ready_poll_interval_sec is not None
+            else float(_getenv(self.ready_poll_interval_sec_env, default=str(self.default_ready_poll_interval_sec)))
+        )
+        self._sb = None
+        self.sandbox_id = ""
+
+    async def __aenter__(self) -> ArcaSandbox:
+        factory = await asyncio.to_thread(_get_arca_factory)
+        _, resource_spec_cls = _load_arca_sdk()
+        resource_spec = resource_spec_cls(cpu=self.cpu, memory=self.memory, disk=self.disk)
+        try:
+            provider_sandbox = await factory.create_async_sandbox(
+                template_id=self.template_id,
+                ttl_in_minutes=self.ttl_in_minutes,
+                resource_spec=resource_spec,
+                image=self.image,
+                timeout_in_millis=self.create_timeout_sec * 1000,
+                metadata=self.metadata,
+                ready_timeout_in_seconds=self.ready_timeout_sec,
+            )
+        except Exception:
+            raise AmbiguousCreate(
+                "ARCA create outcome is ambiguous because the request returned without a sandbox ID"
+            ) from None
+
+        sandbox_id = getattr(provider_sandbox, "id", "") or ""
+        if not sandbox_id:
+            raise AmbiguousCreate("ARCA create returned without a sandbox ID")
+        self._sb = provider_sandbox
+        self.sandbox_id = sandbox_id
+
+        try:
+            await self._wait_for_terminal()
+        except BaseException:
+            if not await self.destroy():
+                raise UnreleasedSandbox(
+                    f"ARCA sandbox {self.sandbox_id} failed readiness and could not be destroyed"
+                ) from None
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if not await self.destroy():
+            raise UnreleasedSandbox(f"ARCA sandbox {self.sandbox_id} could not be destroyed")
+
+    @staticmethod
+    def _require_admin(user: str) -> None:
+        if user != "admin":
+            raise ValueError(f"ARCA sandbox operations must explicitly use admin, got {user!r}")
+
+    async def _wait_for_terminal(self) -> None:
+        deadline = time.monotonic() + self.ready_timeout_sec
+        last_error = "terminal did not respond"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            probe_timeout = min(10.0, remaining)
+            try:
+                result = await asyncio.wait_for(
+                    self._sb.terminal.exec_command(
+                        "echo ready",
+                        shell="bash",
+                        user="admin",
+                        timeout_in_millis=probe_timeout * 1000,
+                    ),
+                    timeout=probe_timeout,
+                )
+                if result.exit_code == 0 and "ready" in (result.stdout or ""):
+                    return
+                last_error = f"exit={result.exit_code}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(self.ready_poll_interval_sec, remaining))
+        raise RuntimeError(f"ARCA terminal readiness timed out for sandbox {self.sandbox_id}: {last_error[:160]}")
+
+    async def destroy(self) -> bool:
+        if self._sb is None:
+            return True
+        provider_sandbox = self._sb
+        self._sb = None
+        try:
+            result = await provider_sandbox.destroy()
+            success = bool(getattr(result, "success", False))
+        except Exception as e:
+            logger.warning(
+                "[agent.sandbox] ARCA destroy failed sandbox_id=%s error=%s: %s",
+                self.sandbox_id,
+                type(e).__name__,
+                str(e)[:160],
+            )
+            return False
+        if not success:
+            logger.warning("[agent.sandbox] ARCA destroy reported failure sandbox_id=%s", self.sandbox_id)
+        return success
+
+    async def exec(
+        self,
+        cmd: str,
+        *,
+        user: str = "admin",
+        env: dict[str, str] | None = None,
+        timeout: int = 120,
+        check: bool = False,
+        idempotent: bool = True,
+    ) -> ExecResult:
+        del idempotent  # ARCA SDK 1.1.0 has no client-side RPC retry knob.
+        self._require_admin(user)
+        result = await self._sb.terminal.exec_command(
+            cmd,
+            shell="bash",
+            envs=env,
+            user=user,
+            timeout_in_millis=timeout * 1000,
+        )
+        exit_code = int(result.exit_code)
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        if check and exit_code != 0:
+            raise RuntimeError(f"ARCA exec failed (exit={exit_code}): {cmd[:120]}\n{stderr[:400]}")
+        return exit_code, stdout, stderr
+
+    async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "admin") -> None:
+        self._require_admin(user)
+        if isinstance(content, str):
+            await self._sb.filesystem.write(sandbox_path, content)
+            return
+
+        temp_path = None
+        source_path = content
+        if isinstance(content, bytes):
+            fd, temp_path = tempfile.mkstemp(prefix="slime-arca-upload-")
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as fp:
+                fp.write(content)
+            source_path = Path(temp_path)
+        try:
+            result = await self._sb.filesystem.upload(str(source_path), sandbox_path)
+            if not bool(getattr(result, "success", False)):
+                raise RuntimeError(f"ARCA file upload failed for {sandbox_path}")
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    async def read_file(self, sandbox_path: str, *, user: str = "admin") -> str:
+        self._require_admin(user)
+        result = await self._sb.filesystem.read(sandbox_path)
+        content = result.content
+        return content.decode("utf-8") if isinstance(content, bytes) else content
+
+
+def create_sandbox(image: str, *, metadata: dict[str, str] | None = None) -> Sandbox:
+    """Construct the explicitly selected backend; E2B remains the default."""
+    backend = _getenv("SLIME_AGENT_SANDBOX_BACKEND", default="e2b").lower()
+    if backend == "e2b":
+        return E2BSandbox(image)
+    if backend == "arca":
+        return ArcaSandbox(image, metadata=metadata)
+    raise ValueError(f"Unsupported SLIME_AGENT_SANDBOX_BACKEND={backend!r}; expected 'e2b' or 'arca'")
+
+
 async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
     """Create the unprivileged 'agent' user that owns workdir + can git diff."""
     await sb.exec(
@@ -397,3 +739,9 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
         check=True,
         timeout=60,
     )
+
+
+async def prepare_work_user(sb: Sandbox, workdir: str) -> None:
+    """Provision E2B's agent user; image-provided users need no mutation."""
+    if sb.work_user == "agent":
+        await ensure_agent_user(sb, workdir)

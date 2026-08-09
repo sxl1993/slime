@@ -12,7 +12,8 @@ pkill -9 ray || true
 sleep 3
 pkill -9 ray || true
 
-set -ex
+# Do not enable xtrace: Ray runtime_env contains sandbox credentials.
+set -e
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
@@ -208,14 +209,31 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
 
 export SWE_AGENT="${SWE_AGENT:-claude_code}"
 export SWE_TRAIN_PROTOCOL="${SWE_TRAIN_PROTOCOL:-scaleswe}"
-export E2B_API_KEY="${E2B_API_KEY:-e2b_0000000000000000000000000000000000000000}"
-# Metadata key your gateway routes images by; `image` is the neutral default.
-export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY="${SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY:-image}"
-export SLIME_AGENT_NODE_TARBALL="${SLIME_AGENT_NODE_TARBALL:-/path/to/node-v22.x-linux-x64.tar.xz}"
-export SLIME_AGENT_CC_TARBALL="${SLIME_AGENT_CC_TARBALL:-/path/to/anthropic-ai-claude-code-local-linux-x64.tgz}"
+export SLIME_AGENT_SANDBOX_BACKEND="${SLIME_AGENT_SANDBOX_BACKEND:-e2b}"
+
+if [[ "${SLIME_AGENT_SANDBOX_BACKEND}" == "arca" ]]; then
+  : "${SLIME_ARCA_APP_NAME:?Set SLIME_ARCA_APP_NAME for the ARCA backend}"
+  : "${SLIME_ARCA_BASE_URL:?Set SLIME_ARCA_BASE_URL for the ARCA backend}"
+  : "${SLIME_ARCA_API_KEY:?Set SLIME_ARCA_API_KEY for the ARCA backend}"
+  : "${SLIME_AGENT_ARCA_TEMPLATE_ID:?Set SLIME_AGENT_ARCA_TEMPLATE_ID for the ARCA backend}"
+  export SLIME_AGENT_ARCA_TTL_MINUTES="${SLIME_AGENT_ARCA_TTL_MINUTES:-40}"
+  export SLIME_AGENT_ARCA_CPU="${SLIME_AGENT_ARCA_CPU:-2}"
+  export SLIME_AGENT_ARCA_MEMORY="${SLIME_AGENT_ARCA_MEMORY:-4}"
+  export SLIME_AGENT_ARCA_DISK="${SLIME_AGENT_ARCA_DISK:-25}"
+  export SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC="${SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC:-150}"
+  export SLIME_AGENT_ARCA_READY_TIMEOUT_SEC="${SLIME_AGENT_ARCA_READY_TIMEOUT_SEC:-120}"
+  export SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC="${SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC:-2}"
+else
+  export E2B_API_KEY="${E2B_API_KEY:-e2b_0000000000000000000000000000000000000000}"
+  # Metadata key your gateway routes images by; `image` is the neutral default.
+  export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY="${SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY:-image}"
+  export SLIME_AGENT_NODE_TARBALL="${SLIME_AGENT_NODE_TARBALL:-/path/to/node-v22.x-linux-x64.tar.xz}"
+  export SLIME_AGENT_CC_TARBALL="${SLIME_AGENT_CC_TARBALL:-/path/to/anthropic-ai-claude-code-local-linux-x64.tgz}"
+fi
 
 # ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
+export ADAPTER_PUBLIC_URL="${ADAPTER_PUBLIC_URL:-}"
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 
@@ -266,12 +284,17 @@ ray status
 
 # ============ runtime env propagated to ray workers ============
 export SLIME_DIR
-RUNTIME_ENV_JSON=$(python3 - <<PY
+RUNTIME_ENV_FILE="$(mktemp "${TMPDIR:-/tmp}/slime-runtime-env.yaml.XXXXXX")"
+chmod 600 "${RUNTIME_ENV_FILE}"
+export RUNTIME_ENV_FILE
+trap 'rm -f "${RUNTIME_ENV_FILE}"' EXIT
+python3 - <<'PY'
 import json, os
 keys = (
     "no_proxy", "NO_PROXY",
     "SWE_AGENT",
-    "E2B_API_KEY", "ADAPTER_PUBLIC_HOST",
+    "SLIME_AGENT_SANDBOX_BACKEND",
+    "E2B_API_KEY", "ADAPTER_PUBLIC_HOST", "ADAPTER_PUBLIC_URL",
     "SLIME_AGENT_NODE_TARBALL", "SLIME_AGENT_CC_TARBALL",
     "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_BOOT_CONCURRENCY",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
@@ -280,6 +303,11 @@ keys = (
     "SWE_CC_PROMPT",
     "SWE_TRAIN_PROTOCOL",
     "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY",
+    "SLIME_ARCA_APP_NAME", "SLIME_ARCA_BASE_URL", "SLIME_ARCA_API_KEY",
+    "SLIME_AGENT_ARCA_TEMPLATE_ID", "SLIME_AGENT_ARCA_TTL_MINUTES",
+    "SLIME_AGENT_ARCA_CPU", "SLIME_AGENT_ARCA_MEMORY", "SLIME_AGENT_ARCA_DISK",
+    "SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC", "SLIME_AGENT_ARCA_READY_TIMEOUT_SEC",
+    "SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
@@ -290,12 +318,12 @@ env["NCCL_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
 env["PYTHONPATH"] = f"/root/Megatron-LM/:{os.environ['SLIME_DIR']}"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 env["NCCL_NVLS_ENABLE"] = "0"
-print(json.dumps({"env_vars": env}))
+with open(os.environ["RUNTIME_ENV_FILE"], "w", encoding="utf-8") as fp:
+    json.dump({"env_vars": env}, fp)
 PY
-)
 
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   --runtime-env="${RUNTIME_ENV_FILE}" \
    -- python3 -u train.py \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \

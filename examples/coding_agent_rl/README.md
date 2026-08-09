@@ -16,14 +16,25 @@ the Anthropic-compatible endpoint, and drains trainable `TokenSegment`s with
 
 ## Environment Setup
 
-The slime training stack itself follows the standard setup. On top of that you need:
+The slime training stack itself follows the standard setup. Select one sandbox
+backend with `SLIME_AGENT_SANDBOX_BACKEND=e2b|arca` (default: `e2b`):
 
-1. **An E2B-compatible sandbox cluster** (or any provider that speaks the E2B SDK). Configure via `E2B_API_KEY` (e.g. the standard `e2b_xxx` key from https://e2b.dev, or any internal endpoint that accepts the same SDK). The official SDK validates this value locally, so internal gateways that ignore auth still need a syntactically valid `e2b_` + 40 hex-character placeholder.
-2. **Host-side tarballs** that get uploaded into each sandbox at boot:
+1. **E2B:** configure `E2B_API_KEY`. The official SDK validates this value
+   locally, so compatible internal gateways that ignore auth still need a
+   syntactically valid `e2b_` + 40 hex-character placeholder.
+2. **ARCA:** install the optional `arca-sandbox==1.1.0` SDK on every Ray node,
+   then configure `SLIME_ARCA_APP_NAME`, `SLIME_ARCA_BASE_URL`,
+   `SLIME_ARCA_API_KEY`, and `SLIME_AGENT_ARCA_TEMPLATE_ID`. Slime writes these
+   values to a mode-`0600` temporary YAML only while constructing one
+   process-shared `SandboxFactory`, then deletes the file.
+3. **E2B host-side tarballs** uploaded into each sandbox at boot:
    - Node 22 (`node-v22.x-linux-x64.tar.xz`) — exported as `SLIME_AGENT_NODE_TARBALL`.
    - Claude Code CLI npm tarball (`anthropic-ai-claude-code-local-linux-x64.tgz`) — exported as `SLIME_AGENT_CC_TARBALL`.
-3. **An image routing key** (`SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`, legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted) — the metadata key your E2B gateway uses to route a boot to a specific image (e.g. `image`). Each sample's `metadata.image` is passed under this key when booting the sandbox.
-4. **Network reachability**: each sandbox dials back to the host's Anthropic adapter over `http://${ADAPTER_PUBLIC_HOST}:${ADAPTER_PORT}`. The adapter host must be reachable from inside the sandboxes (set `ADAPTER_PUBLIC_HOST` to a routable IP, not `127.0.0.1`).
+4. **An E2B image routing key** (`SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`, legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted) — the metadata key the E2B gateway uses to route a boot to a specific image. ARCA passes the dataset image directly as the SDK `image` override.
+5. **Network reachability:** use `ADAPTER_PUBLIC_URL=https://<gateway-domain>`
+   for a TLS gateway, or retain the E2B-compatible
+   `http://${ADAPTER_PUBLIC_HOST}:${ADAPTER_PORT}` fallback. Never use
+   `127.0.0.1` as a sandbox callback address.
 
 ## Dataset Format
 
@@ -61,13 +72,34 @@ export PROMPT_DATA=/path/to/swe_train.jsonl
 export SLIME_AGENT_NODE_TARBALL=/path/to/node-v22.20.0-linux-x64.tar.xz
 export SLIME_AGENT_CC_TARBALL=/path/to/anthropic-ai-claude-code-local-linux-x64.tgz
 
-# Sandbox provider:
+# E2B provider (default):
+export SLIME_AGENT_SANDBOX_BACKEND=e2b
 export E2B_API_KEY=e2b_xxx                       # real key for e2b.dev; a syntactically
                                                  # valid placeholder if your gateway ignores auth
 export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY=image   # metadata key your gateway routes images by
 
 bash examples/coding_agent_rl/run_qwen36_35b_a3b_swe_8nodes.sh
 ```
+
+ARCA uses the same launcher and dataset `metadata.image` field:
+
+```bash
+uv pip install 'arca-sandbox==1.1.0' \
+  --index-url https://artifacts.antgroup-inc.cn/simple/
+
+export SLIME_AGENT_SANDBOX_BACKEND=arca
+export SLIME_ARCA_APP_NAME=a3training
+export SLIME_ARCA_BASE_URL=http://arca-sandbox.global.alipay.com:8080
+export SLIME_ARCA_API_KEY='<secret>'
+export SLIME_AGENT_ARCA_TEMPLATE_ID=ARCA-TEMPLATE-xxxxxxxxxxxxxxxx
+export ADAPTER_PUBLIC_URL=https://<approved-adapter-gateway-domain>
+
+bash examples/coding_agent_rl/run_qwen36_35b_a3b_swe_8nodes.sh
+```
+
+The ARCA instance image must already contain the `admin` user, `/testbed`,
+`/home/admin/bin/arca_envd`, and Claude Code. Slime does not create an `agent`
+user or install Node/Claude Code in ARCA sandboxes.
 
 The launcher fans Ray out to every worker listed in `$HOSTFILE` (default
 `/root/mpi_rack_hostfile`, one worker IP per line, reachable over passwordless
@@ -116,12 +148,23 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `SLIME_AGENT_SANDBOX_BACKEND` | `e2b` | Explicit provider: `e2b` or `arca`. |
+| `ADAPTER_PUBLIC_URL` | unset | Full sandbox-visible adapter URL, including scheme. Takes precedence over `ADAPTER_PUBLIC_HOST`; use the approved HTTPS gateway for ARCA. |
 | `ADAPTER_PUBLIC_HOST` | `${MASTER_ADDR}` | Public IP the sandbox uses to reach the Anthropic adapter. **Must be routable from inside the sandbox.** |
 | `ADAPTER_BIND_HOST` / `ADAPTER_PORT` | `0.0.0.0` / `18001` | Bind address of the Anthropic adapter on the host. |
 | `E2B_API_KEY` | — | E2B (or compatible) API key. |
 | `SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY` | — | **Required.** Which metadata key the E2B gateway routes images by (e.g. `image`); each sample's `metadata.image` is passed under it. (Legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted.) |
 | `SLIME_AGENT_NODE_TARBALL` | — | Host path to Node 22 tarball uploaded into each sandbox. |
 | `SLIME_AGENT_CC_TARBALL` | — | Host path to the Claude Code CLI npm tarball. |
+| `SLIME_ARCA_APP_NAME` | — | ARCA service-authorized application name. Required by ARCA. |
+| `SLIME_ARCA_BASE_URL` | — | ARCA SDK gateway URL. Required by ARCA. |
+| `SLIME_ARCA_API_KEY` | — | ARCA API key. Required by ARCA; propagated to Ray but not printed by the launcher. |
+| `SLIME_AGENT_ARCA_TEMPLATE_ID` | — | Base template controlling ARCA permission/network/probe policy. Required by ARCA. |
+| `SLIME_AGENT_ARCA_TTL_MINUTES` | `40` | ARCA lease TTL in minutes. |
+| `SLIME_AGENT_ARCA_CPU` / `SLIME_AGENT_ARCA_MEMORY` / `SLIME_AGENT_ARCA_DISK` | `2` / `4` / `25` | ARCA `ResourceSpecification` fields. |
+| `SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC` | `150` | Timeout for the single ARCA create request. |
+| `SLIME_AGENT_ARCA_READY_TIMEOUT_SEC` | `120` | Bounded terminal readiness window after a sandbox ID is known. |
+| `SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC` | `2` | Delay between terminal readiness probes. |
 | `SLIME_AGENT_CC_EXTRA_ARGS` | (see launcher) | Extra flags appended to the `claude` CLI invocation — registers the read-only `investigator` sub-agent, disables `WebFetch`/`WebSearch`, disables slash commands. |
 | `SLIME_AGENT_CC_EXTRA_ENVS` | unset | JSON object of extra env vars exported into the `claude` process — escape hatch for env-only knobs (`MAX_THINKING_TOKENS`, `BASH_MAX_TIMEOUT_MS`, ...). Merged last, so it can also override the built-in defaults. |
 | `SWE_AGENT_TIME_BUDGET_SEC` | `1800` | Wallclock budget for the in-sandbox agent CLI itself (think/edit/run). |
@@ -129,6 +172,10 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SWE_ROLLOUT_GUARD_SEC` | `agent+eval+180` | Outer safety net wrapping the whole rollout (boot + workspace + agent + diff + eval). Auto-derived if unset. |
 | `SWE_BOOT_CONCURRENCY` | `16` | Cap on simultaneous sandbox boots (eases h2/SSL long-tail). |
 | `SWE_CC_PROMPT` | unset | Optional override for the user-turn prompt. Setting this to require sub-agent dispatch is the most reliable way to maximize fan-out. |
+
+The multi-node launcher serializes Ray's runtime environment into a mode-`0600`
+temporary file and removes it on shell exit, so `SLIME_ARCA_API_KEY` is not
+embedded in the `ray job submit` command line or emitted by shell xtrace.
 
 `--rollout-max-response-len` is the per-turn generation cap passed to each
 SGLang `/generate` call as `max_new_tokens`. `--rollout-max-context-len` is the
@@ -187,14 +234,17 @@ prompt-base restarts.
 
 ## Porting to a New Sandbox Backend
 
-`slime.agent.sandbox.Sandbox` exposes the shared sandbox contract, and
-`slime.agent.sandbox.E2BSandbox` is the E2B implementation:
+`slime.agent.sandbox.Sandbox` exposes the shared sandbox contract;
+`create_sandbox()` selects `E2BSandbox` or `ArcaSandbox`:
 
 ```python
 await sb.exec(cmd, user=..., check=..., timeout=...)
 await sb.write_file(sandbox_path, content_or_host_path, user=...)
 await sb.read_file(sandbox_path, user=...)
-async with E2BSandbox(...) as sb: ...
+async with create_sandbox(image, metadata=metadata) as sb: ...
 ```
 
-Reimplement those on Docker / Modal / a local VM and everything in `generate.py` keeps working unchanged.
+ARCA uses only the SDK's async create, terminal, filesystem, and destroy APIs.
+If create returns without a sandbox ID, `AmbiguousCreate` stops the outer boot
+retry to avoid allocating a duplicate lease. Agent and evaluator sandboxes both
+use the same selected backend.

@@ -115,6 +115,44 @@ def test_claude_code_write_config_preacks_bypass_permissions():
     asyncio.run(run_case())
 
 
+def test_claude_code_uses_admin_home_without_agent_provisioning_for_arca():
+    async def run_case():
+        sb = FakeSandbox()
+        sb.work_user = "admin"
+        sb.privileged_user = "admin"
+        sb.home_dir = "/home/admin"
+        sb.cli_preinstalled = True
+        with patch.object(sandbox_mod, "ensure_agent_user") as ensure:
+            await ClaudeCodeHarness().write_config(sb, _ctx(workdir="/testbed"))
+            ensure.assert_not_called()
+        joined = " ".join(cmd for cmd, _ in sb.exec_log)
+        assert "/home/admin/.claude/settings.json" in joined
+        assert "/home/agent" not in joined
+        assert "chown" not in joined
+        assert all(user == "admin" for _, user in sb.exec_log)
+
+    asyncio.run(run_case())
+
+
+def test_preinstalled_claude_is_verified_without_installing_tarballs():
+    async def run_case():
+        sb = FakeSandbox()
+        sb.work_user = "admin"
+        sb.privileged_user = "admin"
+        sb.home_dir = "/home/admin"
+        sb.cli_preinstalled = True
+        harness = ClaudeCodeHarness()
+        with patch.object(harness, "install_cli") as install:
+            await harness.prepare_cli(sb)
+            install.assert_not_called()
+        joined = " ".join(cmd for cmd, _ in sb.exec_log)
+        assert "command -v claude" in joined
+        assert "claude --version" in joined
+        assert all(user == "admin" for _, user in sb.exec_log)
+
+    asyncio.run(run_case())
+
+
 def test_claude_code_launch_command_and_env():
     async def run_case():
         captured = {}
@@ -228,6 +266,37 @@ def test_base_harness_run_calls_steps_in_order():
         # ensure_agent_user (useradd) -> write_config (settings.json) -> launch (setsid)
         order = [k for k in ("useradd", "settings.json", "setsid") if k in joined]
         assert order == ["useradd", "settings.json", "setsid"]
+
+    asyncio.run(run_case())
+
+
+def test_base_harness_run_uses_admin_and_never_calls_ensure_agent_user_for_arca():
+    async def run_case():
+        async def agent(_env):
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        sb.work_user = "admin"
+        sb.privileged_user = "admin"
+        sb.home_dir = "/home/admin"
+        sb.cli_preinstalled = True
+        with (
+            patch.object(sandbox_mod, "ensure_agent_user") as ensure,
+            patch.object(hc.asyncio, "sleep", new=_fast_sleep),
+        ):
+            rc = await ClaudeCodeHarness().run(
+                sb,
+                workdir="/testbed",
+                session_id="sess-arca",
+                adapter_url="https://adapter.example",
+                time_budget_sec=30,
+                prompt="go",
+            )
+        assert rc == 0
+        ensure.assert_not_called()
+        assert all(user == "admin" for _, user in sb.exec_log)
+        assert not _find(sb.exec_log, "useradd")
+        assert not _find(sb.exec_log, "chown agent:agent")
 
     asyncio.run(run_case())
 

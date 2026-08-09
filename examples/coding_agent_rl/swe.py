@@ -34,7 +34,7 @@ from typing import Any, NamedTuple
 
 from slime.agent import sandbox as agent_sandbox
 from slime.agent.adapters.common import flatten_content
-from slime.agent.sandbox import E2BSandbox, Sandbox, exec_and_wait
+from slime.agent.sandbox import Sandbox, create_sandbox, exec_and_wait
 from slime.utils.types import Sample
 
 try:
@@ -177,12 +177,10 @@ def _evaluability_check_swebench(md: dict) -> str | None:
 async def prepare_workspace(sb: Sandbox, workdir: str, md: dict) -> None:
     """Prep the agent sandbox, then drop PROBLEM_STATEMENT.md.
 
-    Assumes the agent user already owns ``workdir`` (the harness's ``run()`` calls
-    ``ensure_agent_user``; the orchestrator runs this before ``run()`` and the
-    agent user is created lazily there). To stay independent of call order we
-    create the agent user here too -- it is idempotent.
+    E2B provisions its ``agent`` user idempotently; ARCA uses the image-provided
+    ``admin`` user without creating or remapping users.
     """
-    await agent_sandbox.ensure_agent_user(sb, workdir)
+    await agent_sandbox.prepare_work_user(sb, workdir)
     if md.get("protocol") == PROTOCOL_SCALESWE:
         grading = md.get("grading") or {}
         swepro = grading.get("swepro")
@@ -194,7 +192,7 @@ async def prepare_workspace(sb: Sandbox, workdir: str, md: dict) -> None:
     await sb.write_file(
         f"{workdir}/PROBLEM_STATEMENT.md",
         md.get("problem_statement") or "",
-        user="agent",
+        user=sb.work_user,
     )
 
 
@@ -204,11 +202,12 @@ async def apply_before_repo_set_cmd(sb: Sandbox, workdir: str, swepro: dict) -> 
     if not before:
         return
     payload = f"set -e\ncd {workdir}\n{before}\n"
-    await sb.exec(
-        "mkdir -p /workspace/swepro_setup && chown agent:agent /workspace/swepro_setup", user="root", check=True
-    )
-    await sb.write_file("/workspace/swepro_setup/before.sh", payload, user="agent")
-    await sb.exec("bash /workspace/swepro_setup/before.sh", user="agent", check=False, timeout=600)
+    setup_cmd = "mkdir -p /workspace/swepro_setup"
+    if sb.privileged_user != sb.work_user:
+        setup_cmd += f" && chown {sb.work_user}:{sb.work_user} /workspace/swepro_setup"
+    await sb.exec(setup_cmd, user=sb.privileged_user, check=True)
+    await sb.write_file("/workspace/swepro_setup/before.sh", payload, user=sb.work_user)
+    await sb.exec("bash /workspace/swepro_setup/before.sh", user=sb.work_user, check=False, timeout=600)
 
 
 async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) -> None:
@@ -220,8 +219,13 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
         body = pre.replace("\\n", "\n")
     else:
         body = "\n".join(c for c in (pre or []) if c)
-    await sb.write_file(_PRE, "set -e\n" + body, user="agent")
-    await sb.exec(f"chmod 755 {_PRE} && cd {workdir} && bash {_PRE}", user="agent", check=False, timeout=600)
+    await sb.write_file(_PRE, "set -e\n" + body, user=sb.work_user)
+    await sb.exec(
+        f"chmod 755 {_PRE} && cd {workdir} && bash {_PRE}",
+        user=sb.work_user,
+        check=False,
+        timeout=600,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +233,7 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
 # ---------------------------------------------------------------------------
 async def git_diff(sb: Sandbox, workdir: str) -> str:
     cmd = f"cd {workdir} && git add -N . && git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
-    _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
+    _, out, _ = await sb.exec(cmd, user=sb.work_user, timeout=120)
     return out
 
 
@@ -266,8 +270,11 @@ async def _grade_scaleswe(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         logger.warning("[swe.scaleswe] no swepro/eval_cmd/f2p_script; reward=0")
         return EvalResult(0.0, True)
 
-    async with E2BSandbox(image) as ev:
-        await agent_sandbox.ensure_agent_user(ev, workdir)
+    async with create_sandbox(
+        image,
+        metadata={"instance_id": str(md["instance_id"]), "role": "eval", "attempt": "1"},
+    ) as ev:
+        await agent_sandbox.prepare_work_user(ev, workdir)
         if swepro:
             await _setup_swepro_assets(ev, swepro)
             await apply_before_repo_set_cmd(ev, workdir, swepro)
@@ -288,18 +295,29 @@ async def _grade_scaleswe(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
 
 
 async def _setup_swepro_assets(ev: Sandbox, swepro: dict) -> None:
-    await ev.exec(f"mkdir -p {_SWEPRO_DIR} && chmod 777 {_SWEPRO_DIR}", user="root", check=True)
+    await ev.exec(
+        f"mkdir -p {_SWEPRO_DIR} && chmod 777 {_SWEPRO_DIR}",
+        user=ev.privileged_user,
+        check=True,
+    )
     for k, dst in [("run_script_path", "run_script.sh"), ("parser_script_path", "parser.py")]:
         host_p = swepro.get(k)
         if host_p:
-            await ev.write_file(f"{_SWEPRO_DIR}/{dst}", Path(host_p), user="root")
-    await ev.exec(f"chmod 755 {_SWEPRO_DIR}/* && chown -R agent:agent {_SWEPRO_DIR}", user="root", check=True)
+            await ev.write_file(f"{_SWEPRO_DIR}/{dst}", Path(host_p), user=ev.privileged_user)
+    ownership = ""
+    if ev.privileged_user != ev.work_user:
+        ownership = f" && chown -R {ev.work_user}:{ev.work_user} {_SWEPRO_DIR}"
+    await ev.exec(
+        f"chmod 755 {_SWEPRO_DIR}/*{ownership}",
+        user=ev.privileged_user,
+        check=True,
+    )
 
 
 async def _apply_diff(ev: Sandbox, workdir: str, diff_text: str) -> bool:
     if not diff_text.strip():
         return True
-    await ev.write_file(_PATCH, diff_text, user="agent")
+    await ev.write_file(_PATCH, diff_text, user=ev.work_user)
     # First-success-wins ladder collapsed into one exec (one sandbox round-trip).
     ladder = " || ".join(
         f"({cmd})"
@@ -309,7 +327,7 @@ async def _apply_diff(ev: Sandbox, workdir: str, diff_text: str) -> bool:
             f"patch -p1 --no-backup-if-mismatch < {_PATCH}",
         )
     )
-    ec, _, _ = await ev.exec(f"cd {workdir} && ({ladder})", user="agent", check=False, timeout=120)
+    ec, _, _ = await ev.exec(f"cd {workdir} && ({ladder})", user=ev.work_user, check=False, timeout=120)
     return ec == 0
 
 
@@ -320,17 +338,17 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
     result_f = f"{_SWEPRO_DIR}/result.json"
     await ev.exec(
         f"cd {workdir} && bash {_SWEPRO_DIR}/run_script.sh {json.dumps(test_arg)} > {stdout_f} 2> {stderr_f} || true",
-        user="agent",
+        user=ev.work_user,
         check=False,
         timeout=timeout,
     )
     await ev.exec(
         f"python3 {_SWEPRO_DIR}/parser.py {stdout_f} {stderr_f} {result_f}",
-        user="agent",
+        user=ev.work_user,
         check=False,
         timeout=120,
     )
-    raw = await ev.read_file(result_f, user="agent")
+    raw = await ev.read_file(result_f, user=ev.work_user)
     parsed = json.loads(raw) if raw else {"tests": []}
     passed = {t["name"] for t in parsed.get("tests", []) if t.get("status") == "PASSED"}
     required = set(swepro.get("fail_to_pass") or []) | set(swepro.get("pass_to_pass") or [])
@@ -339,7 +357,7 @@ async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> 
 
 
 async def _run_eval_cmd(ev: Sandbox, workdir: str, cmd: str, timeout: int) -> float:
-    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=timeout)
+    ec, _, _ = await ev.exec(f"cd {workdir} && {cmd}", user=ev.work_user, check=False, timeout=timeout)
     return 1.0 if ec == 0 else 0.0
 
 
@@ -347,8 +365,8 @@ async def _run_f2p_script(ev: Sandbox, workdir: str, script: str, timeout: int) 
     # sweb f2p_script is a self-contained pytest file ending in
     # `sys.exit(pytest.main([...]))`; write it verbatim (no shell quoting) and
     # let python's exit code carry the pass/fail signal.
-    await ev.write_file(_F2P, script, user="agent")
-    ec, _, _ = await ev.exec(f"cd {workdir} && python {_F2P}", user="agent", check=False, timeout=timeout)
+    await ev.write_file(_F2P, script, user=ev.work_user)
+    ec, _, _ = await ev.exec(f"cd {workdir} && python {_F2P}", user=ev.work_user, check=False, timeout=timeout)
     return 1.0 if ec == 0 else 0.0
 
 
@@ -370,7 +388,7 @@ async def _apply_model_patch(ev: Sandbox, workdir: str) -> bool:
         f"cd {workdir} && git config --global --add safe.directory {workdir} "
         f"&& if [ -s /tmp/patch.diff ]; then {ladder}; fi"
     )
-    ec, _, _ = await ev.exec(cmd, user="root", check=False, timeout=120)
+    ec, _, _ = await ev.exec(cmd, user=ev.privileged_user, check=False, timeout=120)
     return ec == 0
 
 
@@ -462,10 +480,13 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         logger.warning("[swe.swebench] %s: missing image; reward=0", instance_id)
         return EvalResult(0.0, True)
 
-    async with E2BSandbox(image) as ev:
+    async with create_sandbox(
+        image,
+        metadata={"instance_id": str(instance_id), "role": "eval", "attempt": "1"},
+    ) as ev:
         await asyncio.gather(
-            ev.write_file("/tmp/patch.diff", diff_text or "", user="root"),
-            ev.write_file("/tmp/eval.sh", eval_sh, user="root"),
+            ev.write_file("/tmp/patch.diff", diff_text or "", user=ev.privileged_user),
+            ev.write_file("/tmp/eval.sh", eval_sh, user=ev.privileged_user),
         )
         # Apply the model patch first (eval_script assumes it is already applied);
         # if no apply strategy works, the instance is unsolvable -- skip the eval.
@@ -473,7 +494,12 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
             logger.warning("[swe.swebench] %s: model patch failed to apply; reward=0", instance_id)
             return EvalResult(0.0, False)
         exit_code, log = await exec_and_wait(
-            ev, cmd="bash /tmp/eval.sh", user="root", time_budget_sec=timeout_sec, tag="eval", want_output=True
+            ev,
+            cmd="bash /tmp/eval.sh",
+            user=ev.privileged_user,
+            time_budget_sec=timeout_sec,
+            tag="eval",
+            want_output=True,
         )
 
     try:

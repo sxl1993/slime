@@ -41,15 +41,28 @@ class ClaudeCodeHarness(BaseHarness):
             check_cmd="ls -la /usr/local/bin/claude && /usr/local/bin/claude --version",
         )
 
+    async def verify_cli(self, sb: Sandbox) -> None:
+        await sb.exec(
+            "command -v claude && claude --version",
+            user=sb.work_user,
+            check=True,
+            timeout=60,
+        )
+
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
         """Pre-ack bypass-permissions so claude-code starts headless."""
         settings = json.dumps({"hasCompletedOnboarding": True, "bypassPermissionsModeAccepted": True})
+        claude_dir = f"{sb.home_dir}/.claude"
+        claude_json = f"{sb.home_dir}/.claude.json"
+        ownership = ""
+        if sb.privileged_user != sb.work_user:
+            ownership = f" && chown -R {sb.work_user}:{sb.work_user} {claude_dir} {claude_json}"
         await sb.exec(
-            "mkdir -p /home/agent/.claude && "
+            f"mkdir -p {claude_dir} && "
             f"echo {shlex.quote(settings)} "
-            "| tee /home/agent/.claude.json /home/agent/.claude/settings.json > /dev/null && "
-            "chown -R agent:agent /home/agent/.claude /home/agent/.claude.json",
-            user="root",
+            f"| tee {claude_json} {claude_dir}/settings.json > /dev/null"
+            f"{ownership}",
+            user=sb.privileged_user,
             check=True,
             timeout=60,
         )

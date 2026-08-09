@@ -862,6 +862,14 @@ jobs:
             {
               "num_gpus": 0,
               "test_file": "test_agent/test_agent_rollout_cpu.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_agent/test_arca_sandbox.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_agent/test_arca_routing.py"
             }
           ]
     defaults:
