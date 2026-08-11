@@ -500,6 +500,60 @@ def _reset_arca_factory_for_tests() -> None:
     _ARCA_FACTORY_CONFIG = None
 
 
+class ArcaImageResolver:
+    """Resolve E2B-compatible local image keys for the ARCA backend."""
+
+    image_map_env = "SLIME_AGENT_ARCA_IMAGE_MAP"
+    local_prefix = "local/"
+
+    def __init__(self, mapping_path: str | None = None) -> None:
+        self.mapping_path = mapping_path.strip() if mapping_path else None
+        self._mapping: dict[str, str] | None = None
+
+    def resolve(self, image: str) -> str:
+        if not image.startswith(self.local_prefix):
+            return image
+
+        instance_id = image[len(self.local_prefix) :]
+        if not instance_id:
+            raise RuntimeError("ARCA image key 'local/' has an empty instance ID")
+
+        mapping = self._load_mapping()
+        try:
+            return mapping[instance_id]
+        except KeyError:
+            raise RuntimeError(f"ARCA image key {image!r} was not found in image map {self.mapping_path!r}") from None
+
+    def _load_mapping(self) -> dict[str, str]:
+        if self._mapping is not None:
+            return self._mapping
+        if self.mapping_path is None:
+            raise RuntimeError(
+                f"{self.image_map_env} is required when an ARCA image uses the {self.local_prefix!r} prefix"
+            )
+
+        try:
+            payload = json.loads(Path(self.mapping_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"Failed to load ARCA image map {self.mapping_path!r}: {type(e).__name__}") from None
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"ARCA image map {self.mapping_path!r} must contain a JSON object")
+
+        for instance_id, resolved_image in payload.items():
+            if (
+                not isinstance(resolved_image, str)
+                or not resolved_image.strip()
+                or resolved_image != resolved_image.strip()
+                or resolved_image.startswith(self.local_prefix)
+            ):
+                raise RuntimeError(
+                    f"ARCA image map {self.mapping_path!r} has an invalid image for instance {instance_id!r}"
+                )
+
+        self._mapping = payload
+        return self._mapping
+
+
 class ArcaSandbox:
     """Async ARCA sandbox backend for prebuilt coding-agent instance images."""
 
@@ -540,6 +594,7 @@ class ArcaSandbox:
         ready_poll_interval_sec: float | None = None,
     ) -> None:
         self.image = image
+        self.image_resolver = ArcaImageResolver(_getenv(ArcaImageResolver.image_map_env) or None)
         self.metadata = dict(metadata or {})
         self.template_id = template_id or _required_env(self.template_id_env)
         self.ttl_in_minutes = (
@@ -569,6 +624,7 @@ class ArcaSandbox:
         self.sandbox_id = ""
 
     async def __aenter__(self) -> ArcaSandbox:
+        resolved_image = self.image_resolver.resolve(self.image)
         factory = await asyncio.to_thread(_get_arca_factory)
         _, resource_spec_cls = _load_arca_sdk()
         resource_spec = resource_spec_cls(cpu=self.cpu, memory=self.memory, disk=self.disk)
@@ -577,7 +633,7 @@ class ArcaSandbox:
                 template_id=self.template_id,
                 ttl_in_minutes=self.ttl_in_minutes,
                 resource_spec=resource_spec,
-                image=self.image,
+                image=resolved_image,
                 timeout_in_millis=self.create_timeout_sec * 1000,
                 metadata=self.metadata,
                 ready_timeout_in_seconds=self.ready_timeout_sec,

@@ -189,6 +189,106 @@ def test_arca_create_is_async_once_and_polls_terminal_until_ready(monkeypatch):
     assert FakeFactory.provider.destroy_calls == 1
 
 
+def test_arca_image_map_hit_resolves_local_key_before_create(monkeypatch, tmp_path):
+    image_map = tmp_path / "arca-images.json"
+    image_map.write_text('{"astropy__astropy-14508": "asr.example/swebench:astropy__astropy-14508-v1"}')
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
+        await sb.__aenter__()
+        await sb.__aexit__(None, None, None)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created[0]["image"] == "asr.example/swebench:astropy__astropy-14508-v1"
+
+
+def test_arca_image_map_miss_fails_before_create(monkeypatch, tmp_path):
+    image_map = tmp_path / "arca-images.json"
+    image_map.write_text("{}")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-unknown")
+        with pytest.raises(RuntimeError, match="local/astropy__astropy-unknown") as exc_info:
+            await sb.__aenter__()
+        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created == []
+
+
+def test_arca_image_map_local_key_requires_config(monkeypatch):
+    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_MAP", raising=False)
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
+        with pytest.raises(RuntimeError, match="SLIME_AGENT_ARCA_IMAGE_MAP") as exc_info:
+            await sb.__aenter__()
+        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created == []
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[]",
+        '{"astropy__astropy-14508": ""}',
+        '{"astropy__astropy-14508": "local/astropy__astropy-14508"}',
+        '{"astropy__astropy-14508": " asr.example/swebench:astropy-v1"}',
+    ],
+)
+def test_arca_image_map_rejects_invalid_mapping_before_create(monkeypatch, tmp_path, contents):
+    image_map = tmp_path / "arca-images.json"
+    image_map.write_text(contents)
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
+        with pytest.raises(RuntimeError, match="ARCA image map") as exc_info:
+            await sb.__aenter__()
+        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created == []
+
+
+def test_arca_image_map_rejects_non_utf8_file_before_create(monkeypatch, tmp_path):
+    image_map = tmp_path / "arca-images.json"
+    image_map.write_bytes(b"\xff")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
+        with pytest.raises(RuntimeError, match="ARCA image map") as exc_info:
+            await sb.__aenter__()
+        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created == []
+
+
+def test_arca_image_map_passthrough_preserves_complete_reference(monkeypatch):
+    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_MAP", raising=False)
+    image = "asr.example/swebench:astropy__astropy-14508-v1"
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox(image)
+        await sb.__aenter__()
+        await sb.__aexit__(None, None, None)
+
+    asyncio.run(run_case())
+
+    assert FakeFactory.created[0]["image"] == image
+
+
 def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
     provider = FakeProviderSandbox(
         terminal=FakeTerminal(

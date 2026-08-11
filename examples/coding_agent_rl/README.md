@@ -30,8 +30,9 @@ backend with `SLIME_AGENT_SANDBOX_BACKEND=e2b|arca` (default: `e2b`):
 3. **E2B host-side tarballs** uploaded into each sandbox at boot:
    - Node 22 (`node-v22.x-linux-x64.tar.xz`) — exported as `SLIME_AGENT_NODE_TARBALL`.
    - Claude Code CLI npm tarball (`anthropic-ai-claude-code-local-linux-x64.tgz`) — exported as `SLIME_AGENT_CC_TARBALL`.
-4. **An E2B image routing key** (`SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`, legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted) — the metadata key the E2B gateway uses to route a boot to a specific image. ARCA passes the dataset image directly as the SDK `image` override.
-5. **Network reachability:** use `ADAPTER_PUBLIC_URL=https://<gateway-domain>`
+4. **An E2B image routing key** (`SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`, legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted) — the metadata key the E2B gateway uses to route a boot to a specific image.
+5. **An optional ARCA image map** (`SLIME_AGENT_ARCA_IMAGE_MAP`) — a JSON object that maps an instance ID from the E2B-compatible dataset key `local/<instance_id>` to a complete pullable image reference. Complete image references bypass the map unchanged.
+6. **Network reachability:** use `ADAPTER_PUBLIC_URL=https://<gateway-domain>`
    for a TLS gateway, or retain the E2B-compatible
    `http://${ADAPTER_PUBLIC_HOST}:${ADAPTER_PORT}` fallback. Never use
    `127.0.0.1` as a sandbox callback address.
@@ -45,7 +46,7 @@ Standard slime JSONL with three keys:
   "prompt": "<falls back here if metadata.problem_statement is missing>",
   "label": "<instance_id or grader label>",
   "metadata": {
-    "image": "your-registry/swe-image:<tag>",  // sandbox image reference
+    "image": "your-registry/swe-image:<tag>",  // complete reference or local/<instance_id>
     "workdir": "/workspace/<repo>",            // repo path inside the sandbox
     "problem_statement": "<issue body>",
     // exactly one of the following two graders:
@@ -92,10 +93,24 @@ export SLIME_ARCA_APP_NAME=a3training
 export SLIME_ARCA_BASE_URL=http://arca-sandbox.global.alipay.com:8080
 export SLIME_ARCA_API_KEY='<secret>'
 export SLIME_AGENT_ARCA_TEMPLATE_ID=ARCA-TEMPLATE-xxxxxxxxxxxxxxxx
+export SLIME_AGENT_ARCA_IMAGE_MAP=/path/to/arca-images.json
 export ADAPTER_PUBLIC_URL=https://<approved-adapter-gateway-domain>
 
 bash examples/coding_agent_rl/run_qwen36_35b_a3b_swe_8nodes.sh
 ```
+
+For datasets that retain E2B image keys, configure the map as:
+
+```json
+{
+  "astropy__astropy-14508": "asr.antgroup-inc.cn/arcaslimeagentrl/swebench:astropy__astropy-14508-claude-code-2.1.220-v1"
+}
+```
+
+Then `image: "local/astropy__astropy-14508"` resolves before ARCA sandbox
+creation. A complete image address continues to pass through unchanged and does
+not require `SLIME_AGENT_ARCA_IMAGE_MAP`. The configured file path must be
+readable at the same path on every Ray node that creates sandboxes.
 
 The ARCA instance image must already contain the `admin` user, `/testbed`,
 `/home/admin/bin/arca_envd`, and Claude Code. Slime does not create an `agent`
@@ -160,6 +175,7 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SLIME_ARCA_BASE_URL` | — | ARCA SDK gateway URL. Required by ARCA. |
 | `SLIME_ARCA_API_KEY` | — | ARCA API key. Required by ARCA; propagated to Ray but not printed by the launcher. |
 | `SLIME_AGENT_ARCA_TEMPLATE_ID` | — | Base template controlling ARCA permission/network/probe policy. Required by ARCA. |
+| `SLIME_AGENT_ARCA_IMAGE_MAP` | — | Optional JSON object path mapping `local/<instance_id>` keys to complete ARCA-pullable image references. Required only when a dataset uses `local/` keys. |
 | `SLIME_AGENT_ARCA_TTL_MINUTES` | `40` | ARCA lease TTL in minutes. |
 | `SLIME_AGENT_ARCA_CPU` / `SLIME_AGENT_ARCA_MEMORY` / `SLIME_AGENT_ARCA_DISK` | `2` / `4` / `25` | ARCA `ResourceSpecification` fields. |
 | `SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC` | `150` | Timeout for the single ARCA create request. |
