@@ -22,12 +22,16 @@ import logging
 import os
 import random
 import secrets
+import shlex
 import time
 import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
+
+import aiohttp
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
@@ -197,6 +201,126 @@ class _AdapterService(metaclass=SingletonMeta):
         )
 
 
+async def _probe_adapter_connectivity(sb: Sandbox, adapter_url: str) -> dict[str, Any]:
+    try:
+        parsed = urlsplit(adapter_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("unsupported adapter URL")
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid adapter port")
+    except (TypeError, ValueError):
+        return {
+            "target": "<invalid>",
+            "sandbox": {"status": "not_run"},
+            "host": {"status": "not_run"},
+            "classification": "malformed_adapter_url",
+        }
+
+    host = parsed.hostname
+    display_host = f"[{host}]" if ":" in host else host
+    target = f"{parsed.scheme}://{display_host}:{port}"
+
+    route_cmd = f"if command -v ip >/dev/null 2>&1; then ip route get {shlex.quote(host)}; else echo route_tool_unavailable; exit 127; fi"
+    try:
+        route_exit, route_stdout, route_stderr = await sb.exec(
+            route_cmd,
+            user=sb.work_user,
+            timeout=3,
+            check=False,
+            idempotent=True,
+        )
+        route_status = "unavailable" if route_exit == 127 else ("ok" if route_exit == 0 else "failed")
+        route_result = {
+            "route_status": route_status,
+            "route_exit": route_exit,
+            "route_stdout": (route_stdout or "")[:512],
+            "route_stderr": (route_stderr or "")[:512],
+        }
+    except Exception as e:
+        route_result = {
+            "route_status": "probe_error",
+            "route_error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
+
+    health_url = f"{target}/healthz"
+    curl_cmd = f"curl --noproxy '*' --connect-timeout 5 --max-time 8 --silent --show-error --output /dev/null --write-out 'http_code=%{{http_code}}\\n' {shlex.quote(health_url)}"
+    try:
+        curl_exit, curl_stdout, curl_stderr = await sb.exec(
+            curl_cmd,
+            user=sb.work_user,
+            timeout=10,
+            check=False,
+            idempotent=True,
+        )
+        http_code = 0
+        for line in (curl_stdout or "").splitlines():
+            if line.startswith("http_code="):
+                try:
+                    http_code = int(line.removeprefix("http_code="))
+                except ValueError:
+                    pass
+        sandbox_result = {
+            **route_result,
+            "curl_exit": curl_exit,
+            "http_code": http_code,
+            "curl_stdout": (curl_stdout or "")[:512],
+            "curl_stderr": (curl_stderr or "")[:512],
+        }
+    except Exception as e:
+        sandbox_result = {
+            **route_result,
+            "curl_status": "probe_error",
+            "curl_error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
+
+    timeout = aiohttp.ClientTimeout(total=8, connect=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+            async with session.get(health_url) as response:
+                await response.content.read(512)
+                host_result = {
+                    "status": "healthy" if response.status == 200 else "http_error",
+                    "http_code": response.status,
+                }
+    except Exception as e:
+        host_result = {
+            "status": "connect_error",
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
+
+    sandbox_http_reached = sandbox_result.get("curl_exit") == 0 and sandbox_result.get("http_code", 0) > 0
+    sandbox_healthy = sandbox_http_reached and sandbox_result.get("http_code") == 200
+    host_healthy = host_result["status"] == "healthy"
+    if sandbox_healthy and host_healthy:
+        classification = "adapter_reachable_no_turn"
+    elif sandbox_http_reached and not sandbox_healthy:
+        classification = "sandbox_adapter_http_error"
+    elif not sandbox_healthy and host_healthy:
+        curl_exit = sandbox_result.get("curl_exit")
+        if sandbox_result.get("route_status") == "failed":
+            classification = "sandbox_route_failure"
+        elif curl_exit == 6:
+            classification = "sandbox_dns_failure"
+        elif curl_exit == 7:
+            classification = "sandbox_connect_failure"
+        elif curl_exit == 28:
+            classification = "sandbox_connect_timeout"
+        else:
+            classification = "sandbox_cannot_connect_adapter"
+    elif sandbox_healthy:
+        classification = "host_cannot_connect_adapter"
+    else:
+        classification = "adapter_unreachable_from_both"
+
+    return {
+        "target": target,
+        "sandbox": sandbox_result,
+        "host": host_result,
+        "classification": classification,
+    }
+
+
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
     state = _AdapterService(args)
@@ -229,6 +353,29 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     prompt=swe.SWE_PROMPT,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
+                adapter_turns = state.adapter.manager.turn_count(session_id)
+                if adapter_turns == 0:
+                    try:
+                        adapter_connectivity = await _probe_adapter_connectivity(sb, state.adapter_url)
+                    except Exception as e:
+                        adapter_connectivity = {
+                            "classification": "diagnostic_failed",
+                            "error": f"{type(e).__name__}: {str(e)[:200]}",
+                        }
+                    trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
+                    try:
+                        trajectory_tail = (await sb.read_file(trajectory_path, user=sb.work_user))[-4096:]
+                    except Exception as e:
+                        trajectory_tail = f"<read failed: {type(e).__name__}: {str(e)[:200]}>"
+                    logger.warning(
+                        "[coding_agent_rl] %s: adapter_turns=0 agent_exit_code=%d diff_bytes=%d adapter=%s adapter_connectivity=%r trajectory_tail=%r",
+                        instance_id,
+                        agent_exit_code,
+                        len(diff_text.encode("utf-8")),
+                        adapter_connectivity.get("target", "<unavailable>"),
+                        adapter_connectivity,
+                        trajectory_tail,
+                    )
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,

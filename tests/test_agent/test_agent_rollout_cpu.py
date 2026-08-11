@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import logging
 import sys
 import types
 from pathlib import Path
@@ -33,6 +34,7 @@ from types import SimpleNamespace
 
 import aiohttp
 import pytest
+from aiohttp import web
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -178,6 +180,11 @@ def test_generate_produces_trained_samples():
         sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
         _patch_generate(monkeypatch, tok, sandbox_factory)
 
+        async def fail_if_probed(*_args, **_kwargs):
+            raise AssertionError("probe ran on healthy rollout")
+
+        monkeypatch.setattr(gen, "_probe_adapter_connectivity", fail_if_probed)
+
         samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
 
         assert samples, "rollout produced no samples"
@@ -194,7 +201,81 @@ def test_generate_produces_trained_samples():
         asyncio.run(run_case(mp))
 
 
-def test_generate_aborts_on_empty_trajectory():
+def test_adapter_connectivity_probe_rejects_malformed_url_without_credentials():
+    async def run_case():
+        result = await gen._probe_adapter_connectivity(
+            FakeSandbox(),
+            "http://secret@example.invalid:not-a-port/path?token=hidden",
+        )
+        assert result == {
+            "target": "<invalid>",
+            "sandbox": {"status": "not_run"},
+            "host": {"status": "not_run"},
+            "classification": "malformed_adapter_url",
+        }
+        assert "secret" not in repr(result)
+        assert "hidden" not in repr(result)
+
+    asyncio.run(run_case())
+
+
+def test_adapter_connectivity_probe_classifies_sandbox_only_failure():
+    async def run_case():
+        async def health(_request):
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_get("/healthz", health)
+        handle = run_app_in_thread(app, host="127.0.0.1", port=0, thread_name="test-connectivity-probe")
+        sb = FakeSandbox(
+            responses=[
+                ("ip route get", (0, "127.0.0.1 dev lo src 127.0.0.1\n", "")),
+                ("curl", (7, "http_code=000\n", "Failed to connect")),
+            ]
+        )
+        try:
+            result = await gen._probe_adapter_connectivity(sb, f"http://127.0.0.1:{handle.port}")
+        finally:
+            handle.stop()
+
+        assert result["target"] == f"http://127.0.0.1:{handle.port}"
+        assert result["sandbox"]["route_status"] == "ok"
+        assert result["sandbox"]["curl_exit"] == 7
+        assert result["sandbox"]["http_code"] == 0
+        assert result["host"]["status"] == "healthy"
+        assert result["classification"] == "sandbox_connect_failure"
+
+    asyncio.run(run_case())
+
+
+def test_adapter_connectivity_probe_distinguishes_sandbox_http_error():
+    async def run_case():
+        async def health(_request):
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_get("/healthz", health)
+        handle = run_app_in_thread(app, host="127.0.0.1", port=0, thread_name="test-connectivity-http-error")
+        sb = FakeSandbox(
+            responses=[
+                ("ip route get", (0, "127.0.0.1 dev lo src 127.0.0.1\n", "")),
+                ("curl", (0, "http_code=503\n", "")),
+            ]
+        )
+        try:
+            result = await gen._probe_adapter_connectivity(sb, f"http://127.0.0.1:{handle.port}")
+        finally:
+            handle.stop()
+
+        assert result["sandbox"]["curl_exit"] == 0
+        assert result["sandbox"]["http_code"] == 503
+        assert result["host"]["status"] == "healthy"
+        assert result["classification"] == "sandbox_adapter_http_error"
+
+    asyncio.run(run_case())
+
+
+def test_generate_aborts_on_empty_trajectory(caplog):
     """If the agent never drives a turn, the session is empty and generate()
     returns a single ABORTED sample (the fan-out shape) rather than crashing."""
 
@@ -203,8 +284,20 @@ def test_generate_aborts_on_empty_trajectory():
 
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
-        sandbox_factory = FakeSandbox.factory(on_launch=silent_agent)
+        sandbox_factory = FakeSandbox.factory(
+            on_launch=silent_agent,
+            responses=[
+                ("ip route get", (0, "33.215.27.151 dev eth0 src 10.0.0.2\n", "")),
+                ("curl", (7, "http_code=000\n", "Failed to connect")),
+            ],
+        )
         _patch_generate(monkeypatch, tok, sandbox_factory)
+
+        async def silent_run(self, sb, *, workdir, **_kwargs):
+            sb.files[f"{workdir}/.harness/trajectory.jsonl"] = '{"type":"error","error":"adapter unreachable"}\n'
+            return 0
+
+        monkeypatch.setattr(ClaudeCodeHarness, "run", silent_run)
 
         samples = await gen.generate(_args(), _base_sample(), sampling_params={})
 
@@ -212,8 +305,44 @@ def test_generate_aborts_on_empty_trajectory():
         assert samples[0].status == Sample.Status.ABORTED
         assert samples[0].metadata.get("abort_reason") == "adapter_session_empty"
 
+    caplog.set_level(logging.WARNING)
     with pytest.MonkeyPatch.context() as mp:
         asyncio.run(run_case(mp))
+
+    assert "adapter_turns=0" in caplog.text
+    assert "agent_exit_code=0" in caplog.text
+    assert "diff_bytes=0" in caplog.text
+    assert "adapter unreachable" in caplog.text
+    assert "adapter_connectivity=" in caplog.text
+    assert "sandbox_connect_failure" in caplog.text
+    assert "ANTHROPIC_AUTH_TOKEN" not in caplog.text
+
+
+def test_generate_keeps_empty_session_abort_when_connectivity_probe_fails(caplog):
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        _patch_generate(monkeypatch, tok, FakeSandbox.factory())
+
+        async def silent_run(self, sb, **_kwargs):
+            return 0
+
+        async def failed_probe(*_args, **_kwargs):
+            raise RuntimeError("probe transport failed")
+
+        monkeypatch.setattr(ClaudeCodeHarness, "run", silent_run)
+        monkeypatch.setattr(gen, "_probe_adapter_connectivity", failed_probe)
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={})
+
+        assert len(samples) == 1
+        assert samples[0].status == Sample.Status.ABORTED
+        assert samples[0].metadata["abort_reason"] == "adapter_session_empty"
+
+    caplog.set_level(logging.WARNING)
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+    assert "diagnostic_failed" in caplog.text
+    assert "probe transport failed" in caplog.text
 
 
 def test_generate_aborts_on_missing_image():
