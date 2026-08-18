@@ -5,8 +5,9 @@ effect):
 
   - "scaleswe" (default): scaleswe data shape (image_url + pre_commands +
     swepro/eval_cmd/f2p_script); custom "exit 0 == solved" grading.
-  - "swebench": SWE-bench Verified (remote_env_info.{image,base_commit,
-    test_patch,FAIL_TO_PASS,PASS_TO_PASS,version}); graded with swebench's
+  - "swebench": SWE-bench Verified v5 (remote_env_info.{image,base_commit,
+    test_patch,FAIL_TO_PASS,PASS_TO_PASS,version,eval_script,log_parser,
+    eval_type}); graded with swebench's
     official make_test_spec + get_eval_report so each repo uses its own
     test_cmd and log parser.
 
@@ -37,20 +38,28 @@ from slime.agent.adapters.common import flatten_content
 from slime.agent.sandbox import Sandbox, create_sandbox, exec_and_wait
 from slime.utils.types import Sample
 
-try:
-    from swebench.harness.grading import get_eval_report  # type: ignore
-    from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
-
-    _SWEBENCH_IMPORT_ERROR: Exception | None = None
-except Exception as _exc:  # pragma: no cover - import-time diagnostic
-    get_eval_report = None  # type: ignore
-    make_test_spec = None  # type: ignore
-    _SWEBENCH_IMPORT_ERROR = _exc
+from swebench.harness.grading import get_eval_report  # type: ignore
+from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 PROTOCOL_SCALESWE = "scaleswe"
 PROTOCOL_SWEBENCH = "swebench"
+_SWEBENCH_REQUIRED_FIELDS = (
+    "instance_id",
+    "repo",
+    "version",
+    "base_commit",
+    "problem_statement",
+    "test_patch",
+    "FAIL_TO_PASS",
+    "PASS_TO_PASS",
+    "environment_setup_commit",
+    "image",
+    "eval_script",
+    "log_parser",
+    "eval_type",
+)
 
 # Paths inside the sandbox (avoid clashes with image-shipped paths).
 _PATCH = "/workspace/__cagent_patch__.diff"
@@ -111,26 +120,23 @@ def _metadata_scaleswe(sample: Sample) -> dict[str, Any]:
 
 
 def _metadata_swebench(sample: Sample) -> dict[str, Any]:
-    """SWE-bench Verified shape: carry the full instance dict through so
-    make_test_spec gets every field it needs (version, hints_text, ...)."""
+    """SWE-bench Verified v5 shape: carry all fields through unchanged.
+
+    The v5 dataset is the contract with the official ``make_test_spec`` API.
+    Validation is intentionally deferred to ``evaluability_check`` so rollout
+    code can report the exact missing fields and instance ID.
+    """
     m = sample.metadata or {}
     rem = m.get("remote_env_info") or {}
-    instance = {
-        "instance_id": rem.get("instance_id") or "unknown",
-        "repo": rem.get("repo") or "",
-        "version": rem.get("version"),
-        "base_commit": rem.get("base_commit") or "",
-        "problem_statement": rem.get("problem_statement") or _coerce_prompt(sample.prompt),
-        "hints_text": rem.get("hints_text") or "",
-        "test_patch": rem.get("test_patch") or "",
-        "FAIL_TO_PASS": rem.get("FAIL_TO_PASS"),
-        "PASS_TO_PASS": rem.get("PASS_TO_PASS"),
-        "environment_setup_commit": rem.get("environment_setup_commit"),
-    }
+    instance = dict(rem)
+    instance["instance_id"] = rem.get("instance_id") or sample.label or "unknown"
+    instance["problem_statement"] = rem.get("problem_statement") or _coerce_prompt(sample.prompt)
+    instance.setdefault("hints_text", "")
+    instance.setdefault("workdir", "/testbed")
     return {
         "protocol": PROTOCOL_SWEBENCH,
         "instance_id": instance["instance_id"],
-        "image": rem.get("image"),
+        "image": instance.get("image"),
         "workdir": rem.get("workdir") or "/testbed",
         "problem_statement": instance["problem_statement"],
         "grading": {"sweb_instance": instance},
@@ -155,9 +161,14 @@ def evaluability_check(md: dict) -> str | None:
 
 
 def _evaluability_check_swebench(md: dict) -> str | None:
-    if _SWEBENCH_IMPORT_ERROR is not None:
-        return f"swebench_import_failed:{type(_SWEBENCH_IMPORT_ERROR).__name__}"
     inst = md.get("grading", {}).get("sweb_instance") or {}
+    missing_fields = [
+        field
+        for field in _SWEBENCH_REQUIRED_FIELDS
+        if field not in inst or inst[field] is None or (isinstance(inst[field], str) and not inst[field].strip())
+    ]
+    if missing_fields:
+        return f"missing_swebench_fields:{','.join(missing_fields)}"
     if not inst.get("repo"):
         return "missing_repo"
     if not inst.get("base_commit"):
@@ -178,7 +189,7 @@ async def prepare_workspace(sb: Sandbox, workdir: str, md: dict) -> None:
     """Prep the agent sandbox, then drop PROBLEM_STATEMENT.md.
 
     E2B provisions its ``agent`` user idempotently; ARCA uses the image-provided
-    ``admin`` user without creating or remapping users.
+    ``admin`` user directly.
     """
     await agent_sandbox.prepare_work_user(sb, workdir)
     if md.get("protocol") == PROTOCOL_SCALESWE:
@@ -231,10 +242,10 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
 # ---------------------------------------------------------------------------
 # Diff capture (agent sandbox, after harness.run)
 # ---------------------------------------------------------------------------
-async def git_diff(sb: Sandbox, workdir: str) -> str:
+async def git_diff(sb: Sandbox, workdir: str) -> tuple[str, int, str]:
     cmd = f"cd {workdir} && git add -N . && git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
-    _, out, _ = await sb.exec(cmd, user=sb.work_user, timeout=120)
-    return out
+    exit_code, out, err = await sb.exec(cmd, user=sb.work_user, timeout=120)
+    return out, exit_code, err
 
 
 # ---------------------------------------------------------------------------
@@ -460,14 +471,6 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
     instance_id = md["instance_id"]
     inst = md["grading"]["sweb_instance"]
 
-    if _SWEBENCH_IMPORT_ERROR is not None:
-        logger.error(
-            "[swe.swebench] %s: swebench import failed: %r; reward=0",
-            instance_id,
-            _SWEBENCH_IMPORT_ERROR,
-        )
-        return EvalResult(0.0, True)
-
     try:
         ts = _build_test_spec(inst)
         eval_sh = ts.eval_script  # may raise on unknown repo/version
@@ -484,10 +487,10 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         image,
         metadata={"instance_id": str(instance_id), "role": "eval", "attempt": "1"},
     ) as ev:
-        await asyncio.gather(
-            ev.write_file("/tmp/patch.diff", diff_text or "", user=ev.privileged_user),
-            ev.write_file("/tmp/eval.sh", eval_sh, user=ev.privileged_user),
-        )
+        writes = [ev.write_file("/tmp/eval.sh", eval_sh, user=ev.privileged_user)]
+        if diff_text:
+            writes.append(ev.write_file("/tmp/patch.diff", diff_text, user=ev.privileged_user))
+        await asyncio.gather(*writes)
         # Apply the model patch first (eval_script assumes it is already applied);
         # if no apply strategy works, the instance is unsolvable -- skip the eval.
         if not await _apply_model_patch(ev, md["workdir"]):

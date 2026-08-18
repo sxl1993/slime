@@ -52,6 +52,7 @@ class HarnessContext:
     session_id: str
     adapter_url: str
     model_label: str = "slime-actor"
+    adapter_auth_token: str | None = None
 
 
 class BaseHarness(ABC, metaclass=SingletonABCMeta):
@@ -96,6 +97,8 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         workdir: str,
         session_id: str,
         adapter_url: str,
+        adapter_auth_token: str | None = None,
+        model_label: str = "slime-actor",
         time_budget_sec: int,
         prompt: str,
     ) -> int:
@@ -110,6 +113,8 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
             workdir=workdir,
             session_id=session_id,
             adapter_url=adapter_url,
+            adapter_auth_token=adapter_auth_token,
+            model_label=model_label,
         )
         await self.write_config(sb, ctx)
         return await self.launch_and_wait(sb, ctx, prompt, time_budget_sec)

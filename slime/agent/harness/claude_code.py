@@ -68,13 +68,16 @@ class ClaudeCodeHarness(BaseHarness):
         )
 
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
-        cmd = f"/usr/local/bin/claude -p {shlex.quote(prompt)} {self.launch_flags}"
+        cmd = (
+            f"/usr/local/bin/claude -p {shlex.quote(prompt)} "
+            f"--session-id {shlex.quote(ctx.session_id)} {self.launch_flags}"
+        )
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
             cmd = f"{cmd} {extra}"
         env = {
             "ANTHROPIC_BASE_URL": ctx.adapter_url,
-            "ANTHROPIC_AUTH_TOKEN": ctx.session_id,
+            "ANTHROPIC_AUTH_TOKEN": ctx.adapter_auth_token or ctx.session_id,
             "ANTHROPIC_MODEL": ctx.model_label,
             **self.static_env,
         }

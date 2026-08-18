@@ -117,7 +117,7 @@ def test_ambiguous_create_does_not_enter_outer_boot_retry():
 
         class AmbiguousSandbox(FakeSandbox):
             async def __aenter__(self):
-                raise generate.AmbiguousCreate("unknown create outcome")
+                raise generate.SandboxLeaseError("unknown create outcome")
 
         def factory(image, *, metadata=None):
             nonlocal calls
@@ -133,10 +133,11 @@ def test_ambiguous_create_does_not_enter_outer_boot_retry():
         generate.CONFIG = generate.SweConfig(
             eval_protocol="scaleswe",
             train_protocol="scaleswe",
-            adapter_public_url=None,
-            adapter_public_host=None,
             adapter_bind_host="0.0.0.0",
             adapter_port=18001,
+            theta_base_url="https://theta.example/api/anthropic",
+            theta_service_name="test-service",
+            theta_api_key="test-key",
             fork_merge_threshold=None,
             agent_time_budget_sec=30,
             eval_timeout_sec=30,
@@ -146,7 +147,7 @@ def test_ambiguous_create_does_not_enter_outer_boot_retry():
         )
 
         async def run_case():
-            with pytest.raises(generate.AmbiguousCreate):
+            with pytest.raises(generate.SandboxLeaseError):
                 async with generate.boot_agent_sandbox("image", "instance-1", "session-1"):
                     pass
 
@@ -160,7 +161,7 @@ def test_unreleased_sandbox_does_not_enter_outer_boot_retry():
 
         class Unreleased(FakeSandbox):
             async def __aenter__(self):
-                raise generate.UnreleasedSandbox("known sandbox was not destroyed")
+                raise generate.SandboxLeaseError("known sandbox was not destroyed")
 
         def factory(image, *, metadata=None):
             nonlocal calls
@@ -171,10 +172,11 @@ def test_unreleased_sandbox_does_not_enter_outer_boot_retry():
         generate.CONFIG = generate.SweConfig(
             eval_protocol="scaleswe",
             train_protocol="scaleswe",
-            adapter_public_url=None,
-            adapter_public_host=None,
             adapter_bind_host="0.0.0.0",
             adapter_port=18001,
+            theta_base_url="https://theta.example/api/anthropic",
+            theta_service_name="test-service",
+            theta_api_key="test-key",
             fork_merge_threshold=None,
             agent_time_budget_sec=30,
             eval_timeout_sec=30,
@@ -184,7 +186,7 @@ def test_unreleased_sandbox_does_not_enter_outer_boot_retry():
         )
 
         async def run_case():
-            with pytest.raises(generate.UnreleasedSandbox):
+            with pytest.raises(generate.SandboxLeaseError):
                 async with generate.boot_agent_sandbox("image", "instance-1", "session-1"):
                     pass
 
@@ -195,10 +197,19 @@ def test_unreleased_sandbox_does_not_enter_outer_boot_retry():
 def test_multinode_launcher_keeps_arca_api_key_out_of_ray_cli_arguments():
     launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_35b_a3b_swe_8nodes.sh").read_text()
 
-    assert "SLIME_ARCA_API_KEY" in launcher
+    assert "SLIME_AGENT_ARCA_API_KEY" in launcher
     assert 'chmod 600 "${RUNTIME_ENV_FILE}"' in launcher
     assert '--runtime-env="${RUNTIME_ENV_FILE}"' in launcher
     assert '--runtime-env-json="${RUNTIME_ENV_JSON}"' not in launcher
+
+
+def test_arca_8gpu_launcher_enables_core_attention_activation_offloading():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_8gpu_arca.sh").read_text()
+
+    assert "--fine-grained-activation-offloading" in launcher
+    assert "--offload-modules core_attn" in launcher
+    assert "export NVTE_CPU_OFFLOAD_V1=1" in launcher
+    assert '"NVTE_CPU_OFFLOAD_V1",' in launcher
 
 
 if __name__ == "__main__":

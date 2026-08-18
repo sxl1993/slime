@@ -21,10 +21,10 @@ import asyncio
 import logging
 import os
 import random
-import secrets
 import shlex
 import time
 import traceback
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -36,7 +36,7 @@ import aiohttp
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
-from slime.agent.sandbox import AmbiguousCreate, Sandbox, UnreleasedSandbox, create_sandbox
+from slime.agent.sandbox import Sandbox, SandboxLeaseError, create_sandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -53,6 +53,8 @@ _AGENTS = {
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:
     raise ValueError(f"SWE_AGENT={AGENT_NAME!r} not in {sorted(_AGENTS)}")
+if AGENT_NAME == "codex":
+    raise ValueError("SWE_AGENT=codex is not supported by the Theta-only route yet")
 HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
 
 
@@ -60,10 +62,11 @@ HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
 class SweConfig:
     eval_protocol: str  # eval-path schema/grader (SWE_EVAL_PROTOCOL)
     train_protocol: str  # train-path schema/grader (SWE_TRAIN_PROTOCOL)
-    adapter_public_url: str | None
-    adapter_public_host: str | None
     adapter_bind_host: str
     adapter_port: int
+    theta_base_url: str
+    theta_service_name: str
+    theta_api_key: str
     fork_merge_threshold: int | None
     agent_time_budget_sec: int
     eval_timeout_sec: int
@@ -80,10 +83,11 @@ class SweConfig:
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
-            adapter_public_url=os.environ.get("ADAPTER_PUBLIC_URL"),
-            adapter_public_host=os.environ.get("ADAPTER_PUBLIC_HOST"),
             adapter_bind_host=os.environ.get("ADAPTER_BIND_HOST", "0.0.0.0"),
             adapter_port=int(os.environ.get("ADAPTER_PORT", "18001")),
+            theta_base_url=os.environ.get("THETA_BASE_URL", "").rstrip("/"),
+            theta_service_name=os.environ.get("THETA_SERVICE_NAME", "").strip(),
+            theta_api_key=os.environ.get("THETA_API_KEY", "").strip(),
             fork_merge_threshold=fork,
             agent_time_budget_sec=agent_time_budget,
             eval_timeout_sec=eval_timeout,
@@ -127,7 +131,7 @@ async def boot_agent_sandbox(image: str, instance_id: str, session_id: str) -> A
                     raise
             sb = cand
             break
-        except (AmbiguousCreate, UnreleasedSandbox):
+        except SandboxLeaseError:
             logger.error(
                 "[coding_agent_rl] %s: sandbox lease requires reconciliation; automatic retry disabled",
                 instance_id,
@@ -160,15 +164,17 @@ class _AdapterService(metaclass=SingletonMeta):
         self.tool_parser = getattr(args, "sglang_tool_call_parser", None) or None
         self.reasoning_parser = getattr(args, "sglang_reasoning_parser", None) or None
         sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        if CONFIG.adapter_public_url:
-            adapter_url = CONFIG.adapter_public_url.rstrip("/")
-        elif CONFIG.adapter_public_host:
-            adapter_url = None
-        else:
-            raise RuntimeError(
-                "Neither ADAPTER_PUBLIC_URL nor ADAPTER_PUBLIC_HOST is set. "
-                "Export a URL or host that sandboxes can reach for reverse-connection."
+        missing_theta = [
+            name
+            for name, value in (
+                ("THETA_BASE_URL", CONFIG.theta_base_url),
+                ("THETA_SERVICE_NAME", CONFIG.theta_service_name),
+                ("THETA_API_KEY", CONFIG.theta_api_key),
             )
+            if not value
+        ]
+        if missing_theta:
+            raise RuntimeError("Coding-agent RL requires the Theta gateway; set " + ", ".join(missing_theta))
         self.adapter = ADAPTER_CLS(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
@@ -190,15 +196,73 @@ class _AdapterService(metaclass=SingletonMeta):
                 "access_log_class": FilteredAccessLogger,
             },
         )
-        self.adapter_url = adapter_url or f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
+        self.adapter_url = CONFIG.theta_base_url
+        self.adapter_auth_token = CONFIG.theta_api_key
+        self.model_label = f"ckpt:{CONFIG.theta_service_name}"
         logger.info(
-            "[coding_agent_rl] tokenizer=%s adapter=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
+            "[coding_agent_rl] tokenizer=%s theta=%s model=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
             args.hf_checkpoint,
             self.adapter_url,
+            self.model_label,
             self.max_context_len,
             self.tool_parser,
             self.reasoning_parser,
         )
+        _register_adapter_to_theta(self.app_handle.port)
+
+
+_THETA_DEFAULT_HOST = "https://aistudio.alipay.com"
+
+
+def _register_adapter_to_theta(port: int) -> None:
+    """Register this adapter pod to the Theta gateway so antchat can route
+    ``ckpt:<THETA_SERVICE_NAME>`` requests back here.
+
+    Runs inside the RolloutManager / adapter pod, where AIStudio injects
+    ``POD_IP``, ``SYSTEM_API_JWT_TAG`` (register auth) and, on aidc clusters,
+    ``DV_ENDPOINT_ADDR`` (the proxy address; absence means pod-direct reachable
+    from antchat). The URL is registered to ``/v1`` -- not the CLI's hardcoded
+    ``/v1/chat/completions`` -- so llmpivotbase maps antchat
+    ``/api/anthropic/v1/messages`` onto the adapter's ``/v1/messages`` route.
+
+    Raises on missing env or registration failure: in Theta mode an unregistered
+    adapter means every sandbox rollout 404s at antchat, so fail fast and loud
+    rather than degrade into per-sample ambiguity.
+    """
+    pod_ip = os.environ.get("POD_IP")
+    jwt = os.environ.get("SYSTEM_API_JWT_TAG")
+    service = os.environ.get("THETA_SERVICE_NAME")
+    missing = [
+        k for k, v in (("POD_IP", pod_ip), ("SYSTEM_API_JWT_TAG", jwt), ("THETA_SERVICE_NAME", service)) if not v
+    ]
+    if missing:
+        raise RuntimeError(
+            "Theta registration requires " + ", ".join(missing) + " to be injected into the adapter pod env"
+        )
+    dv = os.environ.get("DV_ENDPOINT_ADDR")
+    base = f"{dv}/proxy?target={pod_ip}:{port}" if dv else f"http://{pod_ip}:{port}"
+    url = f"{base}/v1"
+    # Prefer the package's own register path (it handles JWT read, host
+    # resolution and retries); fall back to a direct POST if the package is
+    # unavailable on this image.
+    try:
+        from aistudio_checkpoint.cli.caller import register_theta_service
+
+        register_theta_service(service, url, None, None, None)
+    except ImportError:
+        import requests
+
+        host = os.environ.get("AISTUDIO_CHECKPOINT_HOST") or _THETA_DEFAULT_HOST
+        if not host.startswith("http"):
+            host = os.environ.get("AISTUDIO_NETWORK_PROTOCOL", "https://") + host
+        resp = requests.post(
+            f"{host}/api/theta/model/register",
+            json={"name": service, "url": url},
+            headers={"Authorization": f"Bearer {jwt}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    logger.info("[coding_agent_rl] registered adapter to Theta: %s -> %s", service, url)
 
 
 async def _probe_adapter_connectivity(sb: Sandbox, adapter_url: str) -> dict[str, Any]:
@@ -349,34 +413,52 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     workdir=md["workdir"],
                     session_id=session_id,
                     adapter_url=state.adapter_url,
+                    adapter_auth_token=state.adapter_auth_token,
+                    model_label=state.model_label,
                     time_budget_sec=CONFIG.agent_time_budget_sec,
                     prompt=swe.SWE_PROMPT,
                 )
-                diff_text = await swe.git_diff(sb, md["workdir"])
+                diff_text, git_diff_exit_code, git_diff_stderr = await swe.git_diff(sb, md["workdir"])
                 adapter_turns = state.adapter.manager.turn_count(session_id)
-                if adapter_turns == 0:
-                    try:
-                        adapter_connectivity = await _probe_adapter_connectivity(sb, state.adapter_url)
-                    except Exception as e:
-                        adapter_connectivity = {
-                            "classification": "diagnostic_failed",
-                            "error": f"{type(e).__name__}: {str(e)[:200]}",
-                        }
+                empty_diff = not diff_text.strip()
+                if empty_diff or git_diff_exit_code != 0 or adapter_turns == 0:
+                    status_exit_code, status_out, status_err = await sb.exec(
+                        f"cd {md['workdir']} && git status --short --untracked-files=all --ignored",
+                        user=sb.work_user,
+                        timeout=30,
+                    )
                     trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
                     try:
                         trajectory_tail = (await sb.read_file(trajectory_path, user=sb.work_user))[-4096:]
                     except Exception as e:
                         trajectory_tail = f"<read failed: {type(e).__name__}: {str(e)[:200]}>"
+
+                    adapter_connectivity = None
+                    if adapter_turns == 0:
+                        try:
+                            adapter_connectivity = await _probe_adapter_connectivity(sb, state.adapter_url)
+                        except Exception as e:
+                            adapter_connectivity = {
+                                "classification": "diagnostic_failed",
+                                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                            }
                     logger.warning(
-                        "[coding_agent_rl] %s: adapter_turns=0 agent_exit_code=%d diff_bytes=%d adapter=%s adapter_connectivity=%r trajectory_tail=%r",
+                        "[coding_agent_rl] %s: empty_diff=%s agent_exit_code=%d adapter_turns=%d diff_bytes=%d "
+                        "git_diff_exit_code=%d git_diff_stderr=%r git_status_exit_code=%d git_status=%r "
+                        "git_status_stderr=%r adapter_connectivity=%r trajectory_tail=%r",
                         instance_id,
+                        empty_diff,
                         agent_exit_code,
+                        adapter_turns,
                         len(diff_text.encode("utf-8")),
-                        adapter_connectivity.get("target", "<unavailable>"),
+                        git_diff_exit_code,
+                        git_diff_stderr[-400:],
+                        status_exit_code,
+                        status_out[-4096:],
+                        status_err[-400:],
                         adapter_connectivity,
                         trajectory_tail,
                     )
-
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
@@ -472,10 +554,15 @@ def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
 
 def _session_id(sample: Sample, instance_id: str) -> str:
     if sample.session_id:
-        return sample.session_id
+        try:
+            return str(uuid.UUID(sample.session_id))
+        except ValueError:
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, f"slime:coding-agent:session:{sample.session_id}"))
     if sample.index is not None and sample.group_index is not None:
-        return f"cagent-{instance_id}-{sample.index}-{sample.group_index}"
-    return f"cagent-{instance_id}-{secrets.token_hex(8)}"
+        return str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"slime:coding-agent:{instance_id}:{sample.index}:{sample.group_index}")
+        )
+    return str(uuid.uuid4())
 
 
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:

@@ -50,7 +50,7 @@ class AnthropicAdapter(BaseAdapter):
         app.router.add_post("/v1/messages/count_tokens", _count_tokens)
 
     def _session_id(self, request: web.Request, body: dict) -> str:
-        return _request_session_id(request)
+        return _request_session_id(request, body)
 
     def _preprocess_body(self, body: dict) -> None:
         _fold_mid_list_system_into_user(body)
@@ -189,9 +189,19 @@ def _build_reply_parts(
 # --- Request framing: session id + wire response/stream rendering ---
 
 
-def _request_session_id(request: web.Request) -> str:
-    # Anthropic auth lands in Authorization: Bearer or X-Api-Key; the Messages
-    # body carries no sid hint. Bearer wins when both are present.
+def _request_session_id(request: web.Request, body: dict) -> str:
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict) and isinstance(user_id := metadata.get("user_id"), str):
+        try:
+            user = json.loads(user_id)
+        except json.JSONDecodeError:
+            user = None
+        if isinstance(user, dict) and isinstance(session_id := user.get("session_id"), str):
+            if session_id := session_id.strip():
+                return session_id
+
+    # Direct clients carry the sid in Anthropic auth. Theta rewrites these
+    # headers, so Claude Code metadata takes precedence when it is present.
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 

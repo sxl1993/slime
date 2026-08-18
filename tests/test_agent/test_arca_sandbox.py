@@ -7,10 +7,12 @@ import logging
 import os
 import stat
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -80,10 +82,13 @@ class FakeProviderSandbox:
 class FakeFactory:
     created = []
     config_observations = []
+    instances = []
     provider = FakeProviderSandbox()
     create_error = None
 
     def __init__(self, *, config_file):
+        self.closed = False
+        self.__class__.instances.append(self)
         path = Path(config_file)
         self.__class__.config_observations.append(
             {
@@ -92,6 +97,9 @@ class FakeFactory:
                 "text": path.read_text(),
             }
         )
+
+    def close(self):
+        self.closed = True
 
     async def create_async_sandbox(self, **kwargs):
         self.__class__.created.append(kwargs)
@@ -104,21 +112,26 @@ class FakeFactory:
 def _reset_arca(monkeypatch):
     FakeFactory.created = []
     FakeFactory.config_observations = []
+    FakeFactory.instances = []
     FakeFactory.provider = FakeProviderSandbox()
     FakeFactory.create_error = None
-    sandbox_mod._reset_arca_factory_for_tests()
-    monkeypatch.setattr(
-        sandbox_mod,
-        "_load_arca_sdk",
-        lambda: (FakeFactory, FakeResourceSpecification),
-    )
+    arca_module = types.ModuleType("arca")
+    arca_module.SandboxFactory = FakeFactory
+    arca_model_module = types.ModuleType("arca.model")
+    arca_sandbox_module = types.ModuleType("arca.model.sandbox")
+    arca_sandbox_module.ResourceSpecification = FakeResourceSpecification
+    arca_module.model = arca_model_module
+    arca_model_module.sandbox = arca_sandbox_module
+    monkeypatch.setitem(sys.modules, "arca", arca_module)
+    monkeypatch.setitem(sys.modules, "arca.model", arca_model_module)
+    monkeypatch.setitem(sys.modules, "arca.model.sandbox", arca_sandbox_module)
     for key in tuple(os.environ):
-        if key.startswith("SLIME_ARCA_") or key.startswith("SLIME_AGENT_ARCA_"):
+        if key.startswith("SLIME_AGENT_ARCA_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("SLIME_AGENT_SANDBOX_BACKEND", raising=False)
-    monkeypatch.setenv("SLIME_ARCA_APP_NAME", "a3training")
-    monkeypatch.setenv("SLIME_ARCA_BASE_URL", "https://arca.example.test")
-    monkeypatch.setenv("SLIME_ARCA_API_KEY", "secret-do-not-log")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_APP_NAME", "a3training")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_BASE_URL", "https://arca.example.test")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_API_KEY", "secret-do-not-log")
     monkeypatch.setenv("SLIME_AGENT_ARCA_TEMPLATE_ID", "ARCA-TEMPLATE-test")
 
 
@@ -134,33 +147,34 @@ def test_backend_defaults_to_e2b_and_arca_is_explicit(monkeypatch):
     assert sb.cli_preinstalled is True
 
 
-def test_factory_uses_0600_short_lived_yaml_without_logging_secret(caplog):
+def test_arca_factory_uses_0600_short_lived_yaml_without_logging_secret(caplog):
     caplog.set_level(logging.DEBUG)
-    factory = sandbox_mod._get_arca_factory()
+    sb = sandbox_mod.ArcaSandbox("image")
 
-    assert isinstance(factory, FakeFactory)
+    async def run_case():
+        await sb.__aenter__()
+        await sb.__aexit__(None, None, None)
+
+    asyncio.run(run_case())
+
+    factory = FakeFactory.instances[0]
     observation = FakeFactory.config_observations[0]
+    config = yaml.safe_load(observation["text"])
     assert observation["mode"] == 0o600
-    assert "a3training" in observation["text"]
-    assert "https://arca.example.test" in observation["text"]
-    assert "secret-do-not-log" in observation["text"]
+    assert config == {
+        "app_name": "a3training",
+        "sandbox": {
+            "base_url": "https://arca.example.test",
+            "api_key": "secret-do-not-log",
+        },
+    }
     assert not observation["path"].exists()
     assert "secret-do-not-log" not in caplog.text
-
-    assert sandbox_mod._get_arca_factory() is factory
     assert len(FakeFactory.config_observations) == 1
+    assert factory.closed is True
 
 
-def test_arca_create_is_async_once_and_polls_terminal_until_ready(monkeypatch):
-    FakeFactory.provider = FakeProviderSandbox(
-        terminal=FakeTerminal(
-            [
-                RuntimeError("502 connection refused"),
-                SimpleNamespace(exit_code=0, stdout="ready\n", stderr=""),
-            ]
-        )
-    )
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC", "0")
+def test_arca_create_is_async_once_and_returns_ready_sandbox():
     metadata = {"instance_id": "astropy__astropy-12907", "role": "agent", "attempt": "1"}
 
     async def run_case():
@@ -184,15 +198,14 @@ def test_arca_create_is_async_once_and_polls_terminal_until_ready(monkeypatch):
     )
     assert kwargs["metadata"] == metadata
     assert "command" not in kwargs
-    assert len(FakeFactory.provider.terminal.calls) == 2
-    assert all(call[1]["user"] == "admin" for call in FakeFactory.provider.terminal.calls)
+    assert FakeFactory.provider.terminal.calls == []
     assert FakeFactory.provider.destroy_calls == 1
+    assert FakeFactory.instances[0].closed is True
 
 
-def test_arca_image_map_hit_resolves_local_key_before_create(monkeypatch, tmp_path):
-    image_map = tmp_path / "arca-images.json"
-    image_map.write_text('{"astropy__astropy-14508": "asr.example/swebench:astropy__astropy-14508-v1"}')
-    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
+def test_arca_local_key_resolves_canonical_tag_before_create(monkeypatch):
+    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_REGISTRY", raising=False)
+    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX", raising=False)
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
@@ -201,82 +214,38 @@ def test_arca_image_map_hit_resolves_local_key_before_create(monkeypatch, tmp_pa
 
     asyncio.run(run_case())
 
-    assert FakeFactory.created[0]["image"] == "asr.example/swebench:astropy__astropy-14508-v1"
+    assert FakeFactory.created[0]["image"] == (
+        "asr.antgroup-inc.cn/arcaslimeagentrl/sweb.instance:astropy__astropy-14508-claude-code-2.1.220-latest"
+    )
 
 
-def test_arca_image_map_miss_fails_before_create(monkeypatch, tmp_path):
-    image_map = tmp_path / "arca-images.json"
-    image_map.write_text("{}")
-    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
-
-    async def run_case():
-        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-unknown")
-        with pytest.raises(RuntimeError, match="local/astropy__astropy-unknown") as exc_info:
-            await sb.__aenter__()
-        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
-
-    asyncio.run(run_case())
-
-    assert FakeFactory.created == []
-
-
-def test_arca_image_map_local_key_requires_config(monkeypatch):
-    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_MAP", raising=False)
+def test_arca_local_key_resolution_honors_env_overrides(monkeypatch):
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_REGISTRY", "asr.example/custom")
+    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX", "claude-code-9.9.9-v7")
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
-        with pytest.raises(RuntimeError, match="SLIME_AGENT_ARCA_IMAGE_MAP") as exc_info:
-            await sb.__aenter__()
-        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+        await sb.__aenter__()
+        await sb.__aexit__(None, None, None)
 
     asyncio.run(run_case())
 
-    assert FakeFactory.created == []
+    assert FakeFactory.created[0]["image"] == "asr.example/custom:astropy__astropy-14508-claude-code-9.9.9-v7"
 
 
-@pytest.mark.parametrize(
-    "contents",
-    [
-        "[]",
-        '{"astropy__astropy-14508": ""}',
-        '{"astropy__astropy-14508": "local/astropy__astropy-14508"}',
-        '{"astropy__astropy-14508": " asr.example/swebench:astropy-v1"}',
-    ],
-)
-def test_arca_image_map_rejects_invalid_mapping_before_create(monkeypatch, tmp_path, contents):
-    image_map = tmp_path / "arca-images.json"
-    image_map.write_text(contents)
-    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
-
+def test_arca_local_key_empty_instance_id_fails_before_create():
     async def run_case():
-        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
-        with pytest.raises(RuntimeError, match="ARCA image map") as exc_info:
+        sb = sandbox_mod.ArcaSandbox("local/")
+        with pytest.raises(RuntimeError, match="empty instance ID") as exc_info:
             await sb.__aenter__()
-        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
+        assert not isinstance(exc_info.value, sandbox_mod.SandboxLeaseError)
 
     asyncio.run(run_case())
 
     assert FakeFactory.created == []
 
 
-def test_arca_image_map_rejects_non_utf8_file_before_create(monkeypatch, tmp_path):
-    image_map = tmp_path / "arca-images.json"
-    image_map.write_bytes(b"\xff")
-    monkeypatch.setenv("SLIME_AGENT_ARCA_IMAGE_MAP", str(image_map))
-
-    async def run_case():
-        sb = sandbox_mod.ArcaSandbox("local/astropy__astropy-14508")
-        with pytest.raises(RuntimeError, match="ARCA image map") as exc_info:
-            await sb.__aenter__()
-        assert not isinstance(exc_info.value, sandbox_mod.AmbiguousCreate)
-
-    asyncio.run(run_case())
-
-    assert FakeFactory.created == []
-
-
-def test_arca_image_map_passthrough_preserves_complete_reference(monkeypatch):
-    monkeypatch.delenv("SLIME_AGENT_ARCA_IMAGE_MAP", raising=False)
+def test_arca_image_passthrough_preserves_complete_reference():
     image = "asr.example/swebench:astropy__astropy-14508-v1"
 
     async def run_case():
@@ -293,7 +262,6 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
     provider = FakeProviderSandbox(
         terminal=FakeTerminal(
             [
-                SimpleNamespace(exit_code=0, stdout="ready\n", stderr=""),
                 SimpleNamespace(exit_code=7, stdout="out", stderr="err"),
             ]
         )
@@ -317,7 +285,7 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
 
     asyncio.run(run_case())
 
-    assert provider.terminal.calls[1][1]["timeout_in_millis"] == 120_000
+    assert provider.terminal.calls[0][1]["timeout_in_millis"] == 120_000
     assert provider.filesystem.writes == [("/testbed/text", "hello")]
     assert provider.filesystem.uploads == [(str(host_file), "/testbed/payload")]
 
@@ -327,59 +295,24 @@ def test_ambiguous_create_is_recognizable_and_not_retried():
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("image")
-        with pytest.raises(sandbox_mod.AmbiguousCreate):
+        with pytest.raises(sandbox_mod.SandboxLeaseError):
             await sb.__aenter__()
 
     asyncio.run(run_case())
     assert len(FakeFactory.created) == 1
+    assert FakeFactory.instances[0].closed is True
 
 
-def test_readiness_timeout_destroys_known_sandbox(monkeypatch):
-    provider = FakeProviderSandbox(terminal=FakeTerminal([RuntimeError("not ready")] * 10))
-    FakeFactory.provider = provider
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_TIMEOUT_SEC", "0")
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC", "0")
+def test_ambiguous_create_without_id_closes_factory():
+    FakeFactory.provider = FakeProviderSandbox(sandbox_id="")
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("image")
-        with pytest.raises(RuntimeError, match="terminal readiness"):
+        with pytest.raises(sandbox_mod.SandboxLeaseError, match="without a sandbox ID"):
             await sb.__aenter__()
 
     asyncio.run(run_case())
-    assert provider.destroy_calls == 1
-
-
-def test_readiness_deadline_bounds_long_poll_interval(monkeypatch):
-    provider = FakeProviderSandbox(terminal=FakeTerminal([RuntimeError("not ready")] * 10))
-    FakeFactory.provider = provider
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_TIMEOUT_SEC", "0.01")
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC", "60")
-
-    async def run_case():
-        sb = sandbox_mod.ArcaSandbox("image")
-        with pytest.raises(RuntimeError, match="terminal readiness"):
-            await asyncio.wait_for(sb.__aenter__(), timeout=0.25)
-
-    asyncio.run(run_case())
-    assert provider.destroy_calls == 1
-
-
-def test_failed_cleanup_after_readiness_failure_is_recognizable(monkeypatch):
-    provider = FakeProviderSandbox(
-        terminal=FakeTerminal([RuntimeError("not ready")] * 10),
-        destroy_success=False,
-    )
-    FakeFactory.provider = provider
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_TIMEOUT_SEC", "0")
-    monkeypatch.setenv("SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC", "0")
-
-    async def run_case():
-        sb = sandbox_mod.ArcaSandbox("image")
-        with pytest.raises(sandbox_mod.UnreleasedSandbox, match="arca-1"):
-            await sb.__aenter__()
-
-    asyncio.run(run_case())
-    assert provider.destroy_calls == 1
+    assert FakeFactory.instances[0].closed is True
 
 
 def test_destroy_failure_is_reported_with_bounded_diagnostics(caplog):
@@ -399,15 +332,10 @@ def test_destroy_failure_is_reported_with_bounded_diagnostics(caplog):
 
 
 def test_optional_sdk_import_fails_only_when_arca_is_selected(monkeypatch):
-    monkeypatch.setattr(
-        sandbox_mod,
-        "_load_arca_sdk",
-        lambda: (_ for _ in ()).throw(RuntimeError("install arca-sandbox==1.1.0")),
-    )
-    sandbox_mod._reset_arca_factory_for_tests()
-
     assert isinstance(sandbox_mod.create_sandbox("image"), sandbox_mod.E2BSandbox)
     monkeypatch.setenv("SLIME_AGENT_SANDBOX_BACKEND", "arca")
+    monkeypatch.setitem(sys.modules, "arca", None)
+    monkeypatch.setitem(sys.modules, "arca.model.sandbox", None)
 
     async def run_case():
         with pytest.raises(RuntimeError, match="arca-sandbox"):

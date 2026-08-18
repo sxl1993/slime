@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import sys
 import types
@@ -78,6 +79,38 @@ from slime.utils.types import Sample  # noqa: E402
 NUM_GPUS = 0
 
 _REAL_SLEEP = asyncio.sleep
+_TEST_SESSION_ID = "37c411bf-5b8f-5ceb-a5de-a944cc16e136"
+
+
+class _ThetaGateway:
+    """Minimal reverse proxy used to keep the rollout test on the Theta path."""
+
+    def __init__(self) -> None:
+        self.target: str | None = None
+        app = web.Application()
+        app.router.add_get("/healthz", self.healthz)
+        app.router.add_route("*", "/{path:.*}", self.forward)
+        self.handle = run_app_in_thread(app, host="127.0.0.1", port=0, thread_name="test-theta-gateway")
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.handle.port}"
+
+    async def healthz(self, _request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    async def forward(self, request: web.Request) -> web.Response:
+        assert self.target is not None, "Theta service was not registered"
+        body = await request.read()
+        headers = {key: value for key, value in request.headers.items() if key.lower() != "host"}
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            async with session.request(
+                request.method, f"{self.target}{request.rel_url}", headers=headers, data=body
+            ) as response:
+                return web.Response(status=response.status, headers=response.headers, body=await response.read())
+
+
+_THETA_GATEWAY = _ThetaGateway()
 
 
 async def _fast_sleep(_secs):  # collapse run_command's 5s poll loop
@@ -118,7 +151,12 @@ async def _anthropic_agent(env: dict, *, n_turns: int = 2) -> int:
             async with sess.post(
                 f"{base_url}/v1/messages",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"model": "m", "max_tokens": 64, "messages": history},
+                json={
+                    "model": "ckpt:test-service",
+                    "max_tokens": 64,
+                    "metadata": {"user_id": json.dumps({"session_id": _TEST_SESSION_ID})},
+                    "messages": history,
+                },
             ) as r:
                 data = await r.json()
             history.append({"role": "assistant", "content": data["content"]})
@@ -128,15 +166,17 @@ async def _anthropic_agent(env: dict, *, n_turns: int = 2) -> int:
 
 def _patch_generate(monkeypatch, tokenizer: FakeTokenizer, sandbox_factory) -> None:
     """Wire generate.generate()'s four external edges to CPU fakes."""
-    # in-thread adapter must bind to loopback and need no public host check.
+    # The Adapter remains loopback-only; the fake gateway is its only public route.
     monkeypatch.setattr(
         gen,
         "CONFIG",
         dataclasses.replace(
             gen.CONFIG,
-            adapter_public_host="127.0.0.1",
             adapter_bind_host="127.0.0.1",
             adapter_port=0,
+            theta_base_url=_THETA_GATEWAY.base_url,
+            theta_service_name="test-service",
+            theta_api_key="test-theta-token",
             rollout_guard_sec=60,
             agent_time_budget_sec=30,
             eval_timeout_sec=30,
@@ -146,6 +186,11 @@ def _patch_generate(monkeypatch, tokenizer: FakeTokenizer, sandbox_factory) -> N
     monkeypatch.setattr(gen, "load_tokenizer", lambda *a, **k: tokenizer)
     monkeypatch.setattr(gen, "create_sandbox", sandbox_factory)  # boot sandbox
     monkeypatch.setattr(swe, "create_sandbox", sandbox_factory)  # eval sandbox
+    monkeypatch.setattr(
+        gen,
+        "_register_adapter_to_theta",
+        lambda port: setattr(_THETA_GATEWAY, "target", f"http://127.0.0.1:{port}"),
+    )
     monkeypatch.setattr(ClaudeCodeHarness, "install_cli", _noop_install)
     monkeypatch.setattr(harness_common.asyncio, "sleep", _fast_sleep)
     monkeypatch.setattr(
@@ -174,7 +219,18 @@ def _two_turn_script():
 # ===========================================================================
 
 
-def test_generate_produces_trained_samples():
+def test_coding_agent_session_id_is_a_stable_uuid():
+    sample = _base_sample()
+    assert gen._session_id(sample, "demo-1") == "37c411bf-5b8f-5ceb-a5de-a944cc16e136"
+
+    sample.session_id = "cagent-legacy"
+    assert gen._session_id(sample, "demo-1") == "1f88c9f3-b6e1-5408-ba1d-79dd287aef28"
+
+    sample.session_id = "11111111-1111-4111-8111-111111111111"
+    assert gen._session_id(sample, "demo-1") == sample.session_id
+
+
+def test_generate_produces_trained_samples(caplog):
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
         sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
@@ -197,8 +253,13 @@ def test_generate_produces_trained_samples():
         # split evenly across the emitted samples.
         assert abs(sum(s.reward for s in samples) - 1.0) < 1e-9
 
+    caplog.set_level(logging.WARNING)
     with pytest.MonkeyPatch.context() as mp:
         asyncio.run(run_case(mp))
+
+    assert "empty_diff=True" in caplog.text
+    assert "git_diff_exit_code=0" in caplog.text
+    assert "git_status_exit_code=0" in caplog.text
 
 
 def test_adapter_connectivity_probe_rejects_malformed_url_without_credentials():

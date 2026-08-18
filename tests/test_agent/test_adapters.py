@@ -79,10 +79,32 @@ async def _drain(adapter, sid) -> list[Sample]:
 # ===========================================================================
 
 
-def test_anthropic_session_id_prefers_bearer_then_api_key():
-    assert anthropic._request_session_id(_Headers({"X-Api-Key": "key"})) == "key"
-    assert anthropic._request_session_id(_Headers({"Authorization": "Bearer bsid", "X-Api-Key": "key"})) == "bsid"
-    assert anthropic._request_session_id(_Headers({})) == "default"
+def test_anthropic_session_id_prefers_claude_metadata_then_bearer_then_api_key():
+    metadata = {
+        "metadata": {
+            "user_id": json.dumps(
+                {
+                    "device_id": "device",
+                    "account_uuid": "",
+                    "session_id": "11111111-1111-4111-8111-111111111111",
+                }
+            )
+        }
+    }
+    theta_headers = _Headers({"Authorization": "Bearer theta-internal", "X-Api-Key": "theta-internal"})
+    assert anthropic._request_session_id(theta_headers, metadata) == "11111111-1111-4111-8111-111111111111"
+    assert anthropic._request_session_id(_Headers({"X-Api-Key": "key"}), {}) == "key"
+    assert anthropic._request_session_id(_Headers({"Authorization": "Bearer bsid", "X-Api-Key": "key"}), {}) == "bsid"
+    assert anthropic._request_session_id(_Headers({}), {}) == "default"
+
+
+def test_anthropic_session_id_ignores_malformed_claude_metadata():
+    request = _Headers({"Authorization": "Bearer direct-session"})
+    assert anthropic._request_session_id(request, {"metadata": {"user_id": "not-json"}}) == "direct-session"
+    assert (
+        anthropic._request_session_id(request, {"metadata": {"user_id": json.dumps({"session_id": "  "})}})
+        == "direct-session"
+    )
 
 
 def test_openai_session_id_prefers_bearer_then_body():
@@ -197,6 +219,51 @@ def test_anthropic_messages_nonstream_records_token_segments():
         assert s.loss_mask[-2:] == [1, 1]
         assert s.rollout_log_probs[-2:] == [-0.1, -0.2]
         assert s.response == "done now"
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_theta_metadata_isolates_concurrent_sessions():
+    async def run_case():
+        session_ids = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        )
+        async with FakeSGLangServer([[(-0.1, 101)], [(-0.2, 102)]]) as sglang:
+            tok = FakeTokenizer(outputs={(101,): "first", (102,): "second"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            for session_id in session_ids:
+                adapter.open_session(session_id)
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+
+            async def post(session_id: str):
+                return await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer theta-internal", "X-Api-Key": "theta-internal"},
+                    json={
+                        "model": "auto",
+                        "max_tokens": 7,
+                        "metadata": {
+                            "user_id": json.dumps(
+                                {"device_id": "device", "account_uuid": "", "session_id": session_id}
+                            )
+                        },
+                        "messages": [{"role": "user", "content": session_id}],
+                    },
+                )
+
+            try:
+                responses = await asyncio.gather(*(post(session_id) for session_id in session_ids))
+                bodies = [await response.json() for response in responses]
+            finally:
+                await client.close()
+            samples = [await _drain(adapter, session_id) for session_id in session_ids]
+
+        assert [response.status for response in responses] == [200, 200]
+        assert all(body["type"] == "message" for body in bodies)
+        assert set(sglang.routing_keys) == set(session_ids)
+        assert all(len(session_samples) == 1 for session_samples in samples)
 
     asyncio.run(run_case())
 

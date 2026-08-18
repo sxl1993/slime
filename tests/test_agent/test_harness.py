@@ -39,8 +39,16 @@ async def _fast_sleep(_secs):
     await _REAL_SLEEP(0)
 
 
-def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001") -> HarnessContext:
-    return HarnessContext(workdir=workdir, session_id=sid, adapter_url=url)
+def _ctx(
+    workdir="/workspace/repo", sid="sess-1", url="http://host:18001", *, model="slime-actor", token=None
+) -> HarnessContext:
+    return HarnessContext(
+        workdir=workdir,
+        session_id=sid,
+        adapter_url=url,
+        model_label=model,
+        adapter_auth_token=token,
+    )
 
 
 def _find(exec_log, needle):
@@ -156,6 +164,7 @@ def test_preinstalled_claude_is_verified_without_installing_tarballs():
 def test_claude_code_launch_command_and_env():
     async def run_case():
         captured = {}
+        session_id = "11111111-1111-4111-8111-111111111111"
 
         async def agent(env):
             captured["env"] = env
@@ -164,18 +173,27 @@ def test_claude_code_launch_command_and_env():
         capturing = FakeSandbox(on_launch=agent)
         with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
             rc = await ClaudeCodeHarness().launch_and_wait(
-                capturing, _ctx(sid="sess-cc", url="http://host:18001"), prompt="solve it", time_budget_sec=30
+                capturing,
+                _ctx(
+                    sid=session_id,
+                    url="https://theta.example/api/anthropic",
+                    model="ckpt:theta-service",
+                    token="theta-api-key",
+                ),
+                prompt="solve it",
+                time_budget_sec=30,
             )
         assert rc == 0
         # the prompt + flags land in the launcher script body.
         body = next(v for k, v in capturing.files.items() if k.endswith("run.sh"))
         assert "claude -p 'solve it'" in body
+        assert f"--session-id {session_id}" in body
         assert "--permission-mode bypassPermissions" in body
         # env carries the adapter wiring under the Anthropic var names.
         env = captured["env"]
-        assert env["ANTHROPIC_BASE_URL"] == "http://host:18001"
-        assert env["ANTHROPIC_AUTH_TOKEN"] == "sess-cc"
-        assert env["ANTHROPIC_MODEL"] == "slime-actor"
+        assert env["ANTHROPIC_BASE_URL"] == "https://theta.example/api/anthropic"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "theta-api-key"
+        assert env["ANTHROPIC_MODEL"] == "ckpt:theta-service"
         assert env["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
 
     asyncio.run(run_case())
