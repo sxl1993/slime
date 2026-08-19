@@ -18,9 +18,11 @@ and produces the md dict consumed below.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import os
 import random
+import re
 import shlex
 import time
 import traceback
@@ -28,6 +30,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -73,6 +76,10 @@ class SweConfig:
     rollout_guard_sec: int
     boot_concurrency: int
     boot_retries: int
+    max_tool_result_chars: int | None = None
+    trajectory_save: str = "none"
+    trajectory_dir: str = "/personal/muchen"
+    trajectory_write_concurrency: int = 4
 
     @classmethod
     def from_env(cls) -> SweConfig:
@@ -80,6 +87,17 @@ class SweConfig:
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
+        max_tool_result_chars = (
+            int(v) if (v := os.environ.get("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS", "").strip()) else None
+        )
+        if max_tool_result_chars is not None and max_tool_result_chars <= 0:
+            raise ValueError("SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS must be positive")
+        trajectory_save = os.environ.get("SLIME_AGENT_TRAJECTORY_SAVE", "none").strip().lower()
+        if trajectory_save not in {"all", "abnormal", "none"}:
+            raise ValueError("SLIME_AGENT_TRAJECTORY_SAVE must be one of: all, abnormal, none")
+        trajectory_dir = os.environ.get("SLIME_AGENT_TRAJECTORY_DIR", "/personal/muchen").strip()
+        if trajectory_save != "none" and not trajectory_dir:
+            raise ValueError("SLIME_AGENT_TRAJECTORY_DIR is required when trajectory saving is enabled")
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -94,12 +112,92 @@ class SweConfig:
             rollout_guard_sec=guard,
             boot_concurrency=int(os.environ.get("SWE_BOOT_CONCURRENCY", "16")),
             boot_retries=int(os.environ.get("SWE_BOOT_RETRIES", "2")),
+            max_tool_result_chars=max_tool_result_chars,
+            trajectory_save=trajectory_save,
+            trajectory_dir=trajectory_dir,
+            trajectory_write_concurrency=max(1, int(os.environ.get("SLIME_AGENT_TRAJECTORY_WRITE_CONCURRENCY", "4"))),
         )
 
 
 CONFIG = SweConfig.from_env()
 
 _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
+_TRAJECTORY_WRITE_SEM = asyncio.Semaphore(CONFIG.trajectory_write_concurrency)
+
+
+def _path_component(value: Any) -> str:
+    component = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._")
+    return component or "unknown"
+
+
+def _trajectory_destination(base_sample: Sample, instance_id: str, session_id: str) -> Path:
+    rollout_id = base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index
+    return (
+        Path(CONFIG.trajectory_dir)
+        / f"rollout-{_path_component(rollout_id)}"
+        / _path_component(instance_id)
+        / f"{_path_component(session_id)}.jsonl.gz"
+    )
+
+
+def _write_trajectory_gzip(destination: Path, trajectory: str) -> int:
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "xb") as raw:
+            os.chmod(temporary, 0o600)
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1, mtime=0) as compressed:
+                compressed.write(trajectory.encode("utf-8"))
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+        return destination.stat().st_size
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+async def _persist_trajectory(
+    trajectory: str,
+    *,
+    base_sample: Sample,
+    instance_id: str,
+    session_id: str,
+    read_ms: float,
+) -> dict[str, Any]:
+    destination = _trajectory_destination(base_sample, instance_id, session_id)
+    raw_bytes = len(trajectory.encode("utf-8"))
+    queued = time.monotonic()
+    async with _TRAJECTORY_WRITE_SEM:
+        queue_ms = (time.monotonic() - queued) * 1000
+        started = time.monotonic()
+        gzip_bytes = await asyncio.to_thread(_write_trajectory_gzip, destination, trajectory)
+    write_ms = (time.monotonic() - started) * 1000
+    logger.info(
+        "[coding_agent_rl] %s: trajectory_saved path=%s raw_bytes=%d gzip_bytes=%d "
+        "read_ms=%.1f queue_ms=%.1f write_ms=%.1f",
+        instance_id,
+        destination,
+        raw_bytes,
+        gzip_bytes,
+        read_ms,
+        queue_ms,
+        write_ms,
+    )
+    return {
+        "trajectory_path": str(destination),
+        "trajectory_raw_bytes": raw_bytes,
+        "trajectory_gzip_bytes": gzip_bytes,
+        "trajectory_read_ms": read_ms,
+        "trajectory_queue_ms": queue_ms,
+        "trajectory_write_ms": write_ms,
+    }
+
+
+def _should_save_trajectory(*, agent_exit_code: int, empty_diff: bool, adapter_turns: int) -> bool:
+    if CONFIG.trajectory_save == "all":
+        return True
+    if CONFIG.trajectory_save == "abnormal":
+        return agent_exit_code != 0 or empty_diff or adapter_turns == 0
+    return False
 
 
 @asynccontextmanager
@@ -199,6 +297,7 @@ class _AdapterService(metaclass=SingletonMeta):
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
+            max_tool_result_chars=CONFIG.max_tool_result_chars,
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
@@ -218,11 +317,13 @@ class _AdapterService(metaclass=SingletonMeta):
         self.adapter_auth_token = CONFIG.theta_api_key
         self.model_label = f"ckpt:{CONFIG.theta_service_name}"
         logger.info(
-            "[coding_agent_rl] tokenizer=%s theta=%s model=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
+            "[coding_agent_rl] tokenizer=%s theta=%s model=%s max_context_len=%s "
+            "max_tool_result_chars=%s tool_parser=%s reasoning_parser=%s",
             args.hf_checkpoint,
             self.adapter_url,
             self.model_label,
             self.max_context_len,
+            CONFIG.max_tool_result_chars,
             self.tool_parser,
             self.reasoning_parser,
         )
@@ -426,7 +527,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id, session_id) as sb:
                 await swe.prepare_workspace(sb, md["workdir"], md)
-                agent_exit_code = await HARNESS_CLS().run(
+                run_result = await HARNESS_CLS().run(
                     sb,
                     workdir=md["workdir"],
                     session_id=session_id,
@@ -436,21 +537,76 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     time_budget_sec=CONFIG.agent_time_budget_sec,
                     prompt=swe.SWE_PROMPT,
                 )
+                agent_exit_code = run_result.exit_code
                 diff_text, git_diff_exit_code, git_diff_stderr = await swe.git_diff(sb, md["workdir"])
                 adapter_turns = state.adapter.manager.turn_count(session_id)
+                session_stats = state.adapter.session_stats(session_id)
                 empty_diff = not diff_text.strip()
-                if empty_diff or git_diff_exit_code != 0 or adapter_turns == 0:
+                diff_bytes = len(diff_text.encode("utf-8"))
+                needs_diagnostic = empty_diff or git_diff_exit_code != 0 or adapter_turns == 0
+                save_trajectory = _should_save_trajectory(
+                    agent_exit_code=agent_exit_code,
+                    empty_diff=empty_diff,
+                    adapter_turns=adapter_turns,
+                )
+                trajectory_metadata: dict[str, Any] = {}
+                trajectory_tail = ""
+                if needs_diagnostic or save_trajectory:
+                    trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
+                    read_started = time.monotonic()
+                    try:
+                        trajectory = await sb.read_file(trajectory_path, user=sb.work_user)
+                        read_ms = (time.monotonic() - read_started) * 1000
+                        trajectory_tail = trajectory[-4096:]
+                    except Exception as e:
+                        trajectory = ""
+                        read_ms = (time.monotonic() - read_started) * 1000
+                        trajectory_tail = f"<read failed: {type(e).__name__}: {str(e)[:200]}>"
+                        logger.warning(
+                            "[coding_agent_rl] %s: trajectory_read failed: %s: %s",
+                            instance_id,
+                            type(e).__name__,
+                            str(e)[:200],
+                        )
+                    if save_trajectory and trajectory:
+                        try:
+                            trajectory_metadata = await _persist_trajectory(
+                                trajectory,
+                                base_sample=base_sample,
+                                instance_id=instance_id,
+                                session_id=session_id,
+                                read_ms=read_ms,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[coding_agent_rl] %s: trajectory_save failed: %s: %s",
+                                instance_id,
+                                type(e).__name__,
+                                str(e)[:200],
+                            )
+                    elif save_trajectory:
+                        logger.warning(
+                            "[coding_agent_rl] %s: trajectory_save skipped because sandbox file is empty",
+                            instance_id,
+                        )
+                if agent_exit_code != 0:
+                    logger.warning(
+                        "[coding_agent_rl] %s: agent_exit_code=%d error_type=%s terminal_reason=%s "
+                        "error_message=%r adapter_turns=%d diff_bytes=%d evaluation_continues=True",
+                        instance_id,
+                        agent_exit_code,
+                        run_result.error_type,
+                        run_result.terminal_reason,
+                        run_result.error_message,
+                        adapter_turns,
+                        diff_bytes,
+                    )
+                if needs_diagnostic:
                     status_exit_code, status_out, status_err = await sb.exec(
                         f"cd {md['workdir']} && git status --short --untracked-files=all --ignored",
                         user=sb.work_user,
                         timeout=30,
                     )
-                    trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
-                    try:
-                        trajectory_tail = (await sb.read_file(trajectory_path, user=sb.work_user))[-4096:]
-                    except Exception as e:
-                        trajectory_tail = f"<read failed: {type(e).__name__}: {str(e)[:200]}>"
-
                     adapter_connectivity = None
                     if adapter_turns == 0:
                         try:
@@ -468,7 +624,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         empty_diff,
                         agent_exit_code,
                         adapter_turns,
-                        len(diff_text.encode("utf-8")),
+                        diff_bytes,
                         git_diff_exit_code,
                         git_diff_stderr[-400:],
                         status_exit_code,
@@ -497,6 +653,37 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     applied_cleanly=bool(applied_cleanly),
                     agent_exit_code=agent_exit_code,
                     instance_id=instance_id,
+                    extra_metadata={**session_stats, **trajectory_metadata},
+                )
+
+            if agent_exit_code != 0:
+                invalid_reason = f"agent_exit:{run_result.error_type or run_result.terminal_reason or agent_exit_code}"
+                logger.warning(
+                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d trainable=False "
+                    "invalid_reason=%s compaction_count=%d max_prompt_tokens=%d context_exceeded_count=%d",
+                    instance_id,
+                    float(reward),
+                    bool(applied_cleanly),
+                    agent_exit_code,
+                    invalid_reason,
+                    session_stats["compaction_count"],
+                    session_stats["max_prompt_tokens"],
+                    session_stats["context_exceeded_count"],
+                )
+                return _abort_result(
+                    base_sample,
+                    invalid_reason,
+                    instance_id,
+                    extra_metadata={
+                        **session_stats,
+                        **trajectory_metadata,
+                        "agent_exit_code": agent_exit_code,
+                        "agent_error_type": run_result.error_type,
+                        "agent_terminal_reason": run_result.terminal_reason,
+                        "agent_error_message": run_result.error_message,
+                        "grading_solved": float(reward) == 1.0,
+                        "applied_cleanly": bool(applied_cleanly),
+                    },
                 )
 
             samples = await state.adapter.finish_session(
@@ -505,30 +692,34 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 reward=float(reward),
                 extra_metadata={
                     "grading_solved": float(reward) == 1.0,
+                    "applied_cleanly": bool(applied_cleanly),
                     "instance_id": instance_id,
+                    "agent_exit_code": agent_exit_code,
+                    "trainable": True,
+                    "invalid_reason": None,
+                    **trajectory_metadata,
                 },
             )
             if not samples:
-                return _abort_result(base_sample, "adapter_session_empty", instance_id)
-
-            for s in samples:
-                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
-            if agent_exit_code != 0:
-                reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
-                logger.warning(
-                    "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
+                return _abort_result(
+                    base_sample,
+                    "adapter_session_empty",
                     instance_id,
-                    agent_exit_code,
-                    reason,
+                    extra_metadata=trajectory_metadata,
                 )
+
             logger.info(
-                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
+                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d "
+                "trainable=True compaction_count=%d max_prompt_tokens=%d context_exceeded_count=%d",
                 instance_id,
                 float(reward),
                 bool(applied_cleanly),
                 agent_exit_code,
                 time.time() - t0,
                 len(samples),
+                session_stats["compaction_count"],
+                session_stats["max_prompt_tokens"],
+                session_stats["context_exceeded_count"],
             )
             return samples
 
@@ -583,7 +774,13 @@ def _session_id(sample: Sample, instance_id: str) -> str:
     return str(uuid.uuid4())
 
 
-def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:
+def _abort_result(
+    sample: Sample,
+    reason: str,
+    instance_id: str,
+    *,
+    extra_metadata: dict[str, Any] | None = None,
+) -> list[Sample]:
     """Mark ``sample`` aborted in place and return it in the list shape this
     fan-out generate function always yields."""
     sample.tokens = [0, 0]
@@ -596,8 +793,11 @@ def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]
     sample.status = Sample.Status.ABORTED
     sample.metadata = {
         **(sample.metadata or {}),
+        **(extra_metadata or {}),
         "abort_reason": reason,
         "instance_id": instance_id,
+        "trainable": False,
+        "invalid_reason": reason,
     }
     logger.warning("[coding_agent_rl] %s aborted: %s", instance_id, reason)
     return [sample]
@@ -610,6 +810,7 @@ def _eval_result(
     applied_cleanly: bool,
     agent_exit_code: int | None,
     instance_id: str,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> list[Sample]:
     """Eval-path placeholder: only ``reward`` matters for ``eval/sweb``."""
 
@@ -623,9 +824,12 @@ def _eval_result(
     sample.status = Sample.Status.COMPLETED
     sample.metadata = {
         **(sample.metadata or {}),
+        **(extra_metadata or {}),
         "instance_id": instance_id,
         "grading_solved": float(reward) == 1.0,
         "applied_cleanly": applied_cleanly,
         "agent_exit_code": agent_exit_code,
+        "trainable": False,
+        "invalid_reason": "evaluation_only",
     }
     return [sample]

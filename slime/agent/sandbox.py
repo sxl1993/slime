@@ -153,7 +153,7 @@ async def exec_and_wait(
         return exit_code, ""
     if want_output:
         return exit_code, await sb.read_file(out_file, user=user)
-    _, tail, _ = await sb.exec(f"tail -c 512 {out_file} 2>/dev/null", user=user, timeout=15, check=False)
+    _, tail, _ = await sb.exec(f"tail -c 4096 {out_file} 2>/dev/null", user=user, timeout=15, check=False)
     return exit_code, tail or ""
 
 

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from .claude_code import ClaudeCodeHarness
 from .codex import CodexHarness
-from .common import BaseHarness, HarnessContext
+from .common import BaseHarness, HarnessContext, HarnessRunResult
 
 __all__ = [
     "BaseHarness",
     "HarnessContext",
+    "HarnessRunResult",
     "ClaudeCodeHarness",
     "CodexHarness",
 ]

@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import gzip
 import json
 import logging
+import stat
 import sys
 import types
 from pathlib import Path
@@ -71,7 +73,7 @@ from tests.test_agent._fakes import FakeSandbox, FakeTokenizer, fake_call_sglang
 from slime.agent.adapters import OpenAIAdapter  # noqa: E402
 from slime.agent.adapters import common as adapters_common  # noqa: E402
 from slime.agent.aiohttp_threaded import run_app_in_thread  # noqa: E402
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness  # noqa: E402
+from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessRunResult  # noqa: E402
 from slime.agent.harness import common as harness_common  # noqa: E402
 from slime.utils.misc import SingletonMeta  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
@@ -80,6 +82,13 @@ NUM_GPUS = 0
 
 _REAL_SLEEP = asyncio.sleep
 _TEST_SESSION_ID = "37c411bf-5b8f-5ceb-a5de-a944cc16e136"
+
+
+def test_swe_config_defaults_trajectory_dir(monkeypatch):
+    monkeypatch.delenv("SLIME_AGENT_TRAJECTORY_DIR", raising=False)
+    monkeypatch.delenv("SLIME_AGENT_TRAJECTORY_SAVE", raising=False)
+
+    assert gen.SweConfig.from_env().trajectory_dir == "/personal/muchen"
 
 
 class _ThetaGateway:
@@ -249,6 +258,10 @@ def test_generate_produces_trained_samples(caplog):
             assert len(s.loss_mask) == len(s.rollout_log_probs) == s.response_length
             assert sum(s.loss_mask) > 0  # at least one trained token
             assert s.metadata.get("agent_exit_code") == 0
+            assert s.metadata.get("trainable") is True
+            assert s.metadata.get("invalid_reason") is None
+            assert s.metadata.get("compaction_count") == 0
+            assert s.metadata.get("max_prompt_tokens", 0) > 0
         # eval_cmd "true" applied cleanly on a clean (empty) diff -> reward 1.0,
         # split evenly across the emitted samples.
         assert abs(sum(s.reward for s in samples) - 1.0) < 1e-9
@@ -260,6 +273,115 @@ def test_generate_produces_trained_samples(caplog):
     assert "empty_diff=True" in caplog.text
     assert "git_diff_exit_code=0" in caplog.text
     assert "git_status_exit_code=0" in caplog.text
+
+
+def test_generate_persists_complete_trajectory_as_atomic_gzip(tmp_path, caplog):
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        monkeypatch.setattr(
+            gen,
+            "CONFIG",
+            dataclasses.replace(
+                gen.CONFIG,
+                trajectory_save="all",
+                trajectory_dir=str(tmp_path),
+            ),
+        )
+
+        full_trajectory = json.dumps({"type": "assistant", "text": "x" * 5000}) + "\n"
+        original_run = ClaudeCodeHarness.run
+
+        async def run_with_trajectory(self, sb, *, workdir, **kwargs):
+            result = await original_run(self, sb, workdir=workdir, **kwargs)
+            sb.files[f"{workdir}/.harness/trajectory.jsonl"] = full_trajectory
+            return result
+
+        monkeypatch.setattr(ClaudeCodeHarness, "run", run_with_trajectory)
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert samples
+        trajectory_paths = {s.metadata.get("trajectory_path") for s in samples}
+        assert len(trajectory_paths) == 1
+        trajectory_path = Path(trajectory_paths.pop())
+        assert trajectory_path.parent.parent.parent == tmp_path
+        assert trajectory_path.suffixes == [".jsonl", ".gz"]
+        with gzip.open(trajectory_path, "rt", encoding="utf-8") as fp:
+            assert fp.read() == full_trajectory
+        assert stat.S_IMODE(trajectory_path.stat().st_mode) == 0o600
+        assert all(s.metadata["trajectory_raw_bytes"] == len(full_trajectory.encode()) for s in samples)
+        assert all(s.metadata["trajectory_gzip_bytes"] == trajectory_path.stat().st_size for s in samples)
+        assert not list(tmp_path.rglob("*.tmp"))
+
+    caplog.set_level(logging.INFO)
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+    assert "trajectory_saved path=" in caplog.text
+
+
+def test_generate_logs_structured_nonzero_harness_exit_and_continues_evaluation(caplog):
+    launch_count = 0
+
+    async def failing_agent(env):
+        nonlocal launch_count
+        launch_count += 1
+        await _anthropic_agent(env, n_turns=1)
+        return 1
+
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        output_tail = json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "terminal_reason": "api_error",
+                "result": "API Error: Claude's response exceeded the 32000 output token maximum.",
+            }
+        )
+        sandbox_factory = FakeSandbox.factory(
+            on_launch=failing_agent,
+            responses=[
+                ("tail -c", (0, output_tail, "")),
+                ("git add -N . && git diff", (0, "diff --git a/a.py b/a.py\n+fixed\n", "")),
+            ],
+        )
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        monkeypatch.setattr(
+            adapters_common,
+            "call_sglang_generate",
+            fake_call_sglang_generate(_two_turn_script()[:1] * 3, tok),
+        )
+
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert len(samples) == 1
+        sample = samples[0]
+        assert sample.status == Sample.Status.ABORTED
+        assert sample.remove_sample is True
+        assert sample.metadata.get("trainable") is False
+        assert sample.metadata.get("invalid_reason") == "agent_exit:max_output_tokens"
+        assert sample.metadata.get("abort_reason") == "agent_exit:max_output_tokens"
+        assert sample.metadata.get("agent_exit_code") == 1
+        assert sample.metadata.get("agent_error_type") == "max_output_tokens"
+        assert sample.metadata.get("grading_solved") is True
+        assert sample.metadata.get("applied_cleanly") is True
+        assert sample.metadata.get("compaction_count") == 0
+        assert sample.metadata.get("max_prompt_tokens", 0) > 0
+        assert launch_count == 1 + ClaudeCodeHarness.max_recovery_attempts
+
+    caplog.set_level(logging.WARNING)
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+    assert "agent_exit_code=1" in caplog.text
+    assert "error_type=max_output_tokens" in caplog.text
+    assert "terminal_reason=api_error" in caplog.text
+    assert "evaluation_continues=True" in caplog.text
+    assert "trainable=False" in caplog.text
+    assert "CLI error (exit 1)" not in caplog.text
+    assert "trajectory_tail=" not in caplog.text
 
 
 def test_adapter_connectivity_probe_rejects_malformed_url_without_credentials():
@@ -356,7 +478,7 @@ def test_generate_aborts_on_empty_trajectory(caplog):
 
         async def silent_run(self, sb, *, workdir, **_kwargs):
             sb.files[f"{workdir}/.harness/trajectory.jsonl"] = '{"type":"error","error":"adapter unreachable"}\n'
-            return 0
+            return HarnessRunResult(exit_code=0)
 
         monkeypatch.setattr(ClaudeCodeHarness, "run", silent_run)
 
@@ -385,7 +507,7 @@ def test_generate_keeps_empty_session_abort_when_connectivity_probe_fails(caplog
         _patch_generate(monkeypatch, tok, FakeSandbox.factory())
 
         async def silent_run(self, sb, **_kwargs):
-            return 0
+            return HarnessRunResult(exit_code=0)
 
         async def failed_probe(*_args, **_kwargs):
             raise RuntimeError("probe transport failed")
@@ -461,7 +583,7 @@ def test_codex_openai_rollout_closes_loop(monkeypatch):
         adapter.open_session(sid)
         try:
             sb = FakeSandbox(on_launch=_codex_agent)
-            rc = await CodexHarness().run(
+            result = await CodexHarness().run(
                 sb,
                 workdir="/workspace/repo",
                 session_id=sid,
@@ -473,7 +595,7 @@ def test_codex_openai_rollout_closes_loop(monkeypatch):
         finally:
             handle.stop()
 
-        assert rc == 0
+        assert result == HarnessRunResult(exit_code=0)
         assert samples
         for s in samples:
             assert len(s.loss_mask) == len(s.rollout_log_probs) == s.response_length
