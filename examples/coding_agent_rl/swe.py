@@ -39,7 +39,7 @@ from slime.agent.sandbox import Sandbox, create_sandbox, exec_and_wait
 from slime.utils.types import Sample
 
 from swebench.harness.grading import get_eval_report  # type: ignore
-from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
+from swebench.harness.utils import make_test_spec  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ SWE_PROMPT = os.environ.get(
 
 
 class EvalResult(NamedTuple):
-    """Grading outcome. Tuple-compatible: ``reward, applied = run_evaluation(...)``."""
+    """Grading outcome; ``applied_cleanly`` only tracks model patch application."""
 
     reward: float
     applied_cleanly: bool
@@ -441,23 +441,31 @@ def _ratio(d: dict) -> tuple[int, int]:
     return len(passed), len(passed) + len(failed)
 
 
-def _log_swebench_result(instance_id: str, exit_code, info: dict, log: str) -> None:
-    """Emit the per-instance grading outcome with test-bucket ratios; on a
-    non-resolved row that parsed NO test lines, surface the log tail so failures
-    (missing pytest plugin, conda not activated, ...) can be diagnosed."""
-    if info.get("resolved"):
-        logger.info("[swe.swebench] %s: reward=1 exit_code=%s", instance_id, exit_code)
-        return
+def _log_swebench_result(
+    instance_id: str,
+    exit_code,
+    *,
+    model_patch_apply_ok: bool,
+    info: dict,
+    log: str,
+) -> None:
+    """Log patch application and eval-log parsing as independent states."""
+    # SWE-bench sets this legacy field only after get_logs_eval finds a valid
+    # test-output section; the actual model patch was applied above.
+    eval_log_parse_ok = bool(info.get("patch_successfully_applied"))
     ts_status = info.get("tests_status") or {}
     f2p_pass, f2p_total = _ratio(ts_status.get("FAIL_TO_PASS", {}))
     p2p_pass, p2p_total = _ratio(ts_status.get("PASS_TO_PASS", {}))
     nothing_parsed = not (f2p_total or p2p_total)
     tail = log[-800:] if nothing_parsed else ""
     logger.info(
-        "[swe.swebench] %s: reward=0 exit_code=%s patch_applied=%s F2P=(%d/%d) P2P=(%d/%d)%s",
+        "[swe.swebench] %s: reward=%d exit_code=%s model_patch_apply_ok=%s "
+        "eval_log_parse_ok=%s F2P=(%d/%d) P2P=(%d/%d)%s",
         instance_id,
+        1 if info.get("resolved") else 0,
         exit_code,
-        bool(info.get("patch_successfully_applied")),
+        model_patch_apply_ok,
+        eval_log_parse_ok,
         f2p_pass,
         f2p_total,
         p2p_pass,
@@ -494,7 +502,11 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         # Apply the model patch first (eval_script assumes it is already applied);
         # if no apply strategy works, the instance is unsolvable -- skip the eval.
         if not await _apply_model_patch(ev, md["workdir"]):
-            logger.warning("[swe.swebench] %s: model patch failed to apply; reward=0", instance_id)
+            logger.warning(
+                "[swe.swebench] %s: reward=0 model_patch_apply_ok=False "
+                "eval_log_parse_ok=None; model patch failed to apply",
+                instance_id,
+            )
             return EvalResult(0.0, False)
         exit_code, log = await exec_and_wait(
             ev,
@@ -509,7 +521,8 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         report = _eval_report_from_log(ts, instance_id, diff_text, log)
     except Exception as e:
         logger.warning(
-            "[swe.swebench] %s: get_eval_report failed: %s; reward=0 (tail=%r)",
+            "[swe.swebench] %s: reward=0 model_patch_apply_ok=True "
+            "eval_log_parse_ok=False; get_eval_report failed: %s (tail=%r)",
             instance_id,
             e,
             log[-600:],
@@ -517,5 +530,11 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         return EvalResult(0.0, True)
 
     info = report.get(instance_id, {})
-    _log_swebench_result(instance_id, exit_code, info, log)
-    return EvalResult(1.0 if info.get("resolved") else 0.0, bool(info.get("patch_successfully_applied")))
+    _log_swebench_result(
+        instance_id,
+        exit_code,
+        model_patch_apply_ok=True,
+        info=info,
+        log=log,
+    )
+    return EvalResult(1.0 if info.get("resolved") else 0.0, True)

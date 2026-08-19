@@ -26,7 +26,7 @@ def test_swebench_empty_hints_are_evaluable(monkeypatch):
     assert swe.evaluability_check({"protocol": swe.PROTOCOL_SWEBENCH, "grading": {"sweb_instance": instance}}) is None
 
 
-def test_swebench_empty_diff_skips_empty_patch_write(monkeypatch):
+def test_swebench_empty_diff_skips_empty_patch_write(monkeypatch, caplog):
     writes = []
 
     class FakeSandbox:
@@ -65,10 +65,14 @@ def test_swebench_empty_diff_skips_empty_patch_write(monkeypatch):
     monkeypatch.setattr(
         swe,
         "_eval_report_from_log",
-        lambda *_args: {instance_id: {"resolved": False, "patch_successfully_applied": True}},
+        lambda *_args: {instance_id: {"resolved": False, "patch_successfully_applied": False}},
     )
 
+    caplog.set_level("INFO")
     result = asyncio.run(swe._grade_swebench(md, "", 1))
 
     assert result.reward == 0.0
+    assert result.applied_cleanly is True
     assert [path for path, _content, _user in writes] == ["/tmp/eval.sh"]
+    assert "model_patch_apply_ok=True eval_log_parse_ok=False" in caplog.text
+    assert "patch_applied=" not in caplog.text

@@ -61,9 +61,9 @@ class FakeFilesystem:
         self.uploads.append((source, dest))
         return SimpleNamespace(success=True)
 
-    async def read(self, path):
-        self.reads.append(path)
-        return SimpleNamespace(content="file-body")
+    async def read(self, path, *, raw=False):
+        self.reads.append((path, raw))
+        return SimpleNamespace(content=b"file-body")
 
 
 class FakeProviderSandbox:
@@ -288,6 +288,7 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
     assert provider.terminal.calls[0][1]["timeout_in_millis"] == 120_000
     assert provider.filesystem.writes == [("/testbed/text", "hello")]
     assert provider.filesystem.uploads == [(str(host_file), "/testbed/payload")]
+    assert provider.filesystem.reads == [("/testbed/text", True)]
 
 
 def test_ambiguous_create_is_recognizable_and_not_retried():

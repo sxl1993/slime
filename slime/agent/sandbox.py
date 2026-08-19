@@ -667,7 +667,7 @@ class ArcaSandbox:
 
     async def read_file(self, sandbox_path: str, *, user: str = "admin") -> str:
         self._require_admin(user)
-        result = await self._sb.filesystem.read(sandbox_path)
+        result = await self._sb.filesystem.read(sandbox_path, raw=True)
         content = result.content
         return content.decode("utf-8") if isinstance(content, bytes) else content
 
