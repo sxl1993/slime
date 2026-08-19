@@ -142,9 +142,16 @@ class FakeSGLangServer:
     Use as an async context manager; ``.url`` is the base url to hand the adapter.
     """
 
-    def __init__(self, turns: list[list[tuple[float, int]]], *, finish_reason: str = "stop") -> None:
+    def __init__(
+        self,
+        turns: list[list[tuple[float, int]]],
+        *,
+        finish_reason: str = "stop",
+        cached_tokens: list[int] | None = None,
+    ) -> None:
         self.turns = [list(t) for t in turns]
         self.finish_reason = finish_reason
+        self.cached_tokens = list(cached_tokens or [])
         self.requests: list[dict] = []
         self.routing_keys: list[str | None] = []
         self._server = None
@@ -154,14 +161,18 @@ class FakeSGLangServer:
         from aiohttp import web
 
         self.routing_keys.append(request.headers.get("X-SMG-Routing-Key"))
-        self.requests.append(await request.json())
+        body = await request.json()
+        self.requests.append(body)
         assert self.turns, "unexpected /generate call (turn script exhausted)"
         pairs = self.turns.pop(0)
+        cached_tokens = self.cached_tokens.pop(0) if self.cached_tokens else 0
         return web.json_response(
             {
                 "meta_info": {
                     "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
                     "finish_reason": {"type": self.finish_reason},
+                    "cached_tokens": cached_tokens,
+                    "prompt_tokens": len(body["input_ids"]),
                 }
             }
         )

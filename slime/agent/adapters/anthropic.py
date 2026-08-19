@@ -25,6 +25,7 @@ from aiohttp import web
 
 from slime.agent.adapters.common import (
     BaseAdapter,
+    ContextWindowExceeded,
     Reply,
     flatten_content,
     manager_finish_reason,
@@ -34,6 +35,8 @@ from slime.agent.adapters.common import (
 from slime.agent.parsing import ParsedModelOutput
 
 logger = logging.getLogger(__name__)
+
+_TOOL_RESULT_TRUNCATION_MARKER = "\n...[tool result truncated]...\n"
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -45,9 +48,15 @@ class AnthropicAdapter(BaseAdapter):
     max_token_keys = ("max_tokens",)
     stop_keys = ("stop_sequences",)
 
+    def __init__(self, *, max_tool_result_chars: int | None = None, **kwargs) -> None:
+        if max_tool_result_chars is not None and max_tool_result_chars <= 0:
+            raise ValueError("max_tool_result_chars must be positive")
+        super().__init__(**kwargs)
+        self.max_tool_result_chars = max_tool_result_chars
+
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_post("/v1/messages", self._run_turn)
-        app.router.add_post("/v1/messages/count_tokens", _count_tokens)
+        app.router.add_post("/v1/messages/count_tokens", self._count_tokens)
 
     def _session_id(self, request: web.Request, body: dict) -> str:
         return _request_session_id(request, body)
@@ -56,7 +65,11 @@ class AnthropicAdapter(BaseAdapter):
         _fold_mid_list_system_into_user(body)
 
     def _translate(self, body: dict) -> tuple[list[dict], list[dict] | None]:
-        translated = _translate_messages(body.get("messages") or [], body.get("system"))
+        translated = _translate_messages(
+            body.get("messages") or [],
+            body.get("system"),
+            max_tool_result_chars=self.max_tool_result_chars,
+        )
         tools_schema = _tools_to_chat_tools(body.get("tools"))
         return translated, tools_schema
 
@@ -74,11 +87,51 @@ class AnthropicAdapter(BaseAdapter):
             return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
         return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok))
 
+    def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
+        return web.json_response(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        f"Prompt is too long: {error.prompt_tokens} input tokens plus "
+                        f"{error.output_tokens} requested output tokens exceeds the "
+                        f"{error.max_context_tokens} token context window"
+                    ),
+                },
+            },
+            status=400,
+        )
+
+    async def _count_tokens(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        self._preprocess_body(body)
+        _, _, prompt_ids = self._prepare_prompt(body)
+        return web.json_response({"input_tokens": len(prompt_ids)})
+
 
 # --- Translation (Anthropic wire -> chat-template messages) ---
 
 
-def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
+def _truncate_tool_result(content: str, max_chars: int | None) -> str:
+    if max_chars is None or len(content) <= max_chars:
+        return content
+    if max_chars <= len(_TOOL_RESULT_TRUNCATION_MARKER):
+        return content[:max_chars]
+
+    kept_chars = max_chars - len(_TOOL_RESULT_TRUNCATION_MARKER)
+    tail_chars = (kept_chars + 1) // 2
+    head_chars = kept_chars - tail_chars
+    tail = content[-tail_chars:] if tail_chars else ""
+    return content[:head_chars] + _TOOL_RESULT_TRUNCATION_MARKER + tail
+
+
+def _translate_messages(
+    msgs: list[dict],
+    system: Any,
+    *,
+    max_tool_result_chars: int | None = None,
+) -> list[dict]:
     """Anthropic messages + system -> chat-template messages. Pure function."""
     translated: list[dict] = []
     if system:
@@ -91,7 +144,8 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
             blocks = content if isinstance(content, list) else [{"type": "text", "text": flatten_content(content)}]
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    translated.append({"role": "tool", "content": flatten_content(b.get("content"))})
+                    tool_result = _truncate_tool_result(flatten_content(b.get("content")), max_tool_result_chars)
+                    translated.append({"role": "tool", "content": tool_result})
                 elif isinstance(b, dict) and b.get("type") == "text":
                     translated.append({"role": "user", "content": b.get("text", "")})
                 else:
@@ -282,13 +336,6 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
     await out.write(f"event: message_stop\ndata: {json.dumps(mst_data, ensure_ascii=False)}\n\n".encode())
 
     return out
-
-
-# count_tokens runs every turn but the client uses it only as a hint, not a
-# hard budget, so returning 0 is fine.
-async def _count_tokens(request: web.Request) -> web.Response:
-    await request.read()
-    return web.json_response({"input_tokens": 0})
 
 
 # --- Anthropic-specific quirks: mid-list system folding ---

@@ -36,6 +36,8 @@ class TurnRecord:
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    cached_tokens: int = 0
+    prompt_tokens: int = 0
 
 
 # ===========================================================================
@@ -165,6 +167,8 @@ class _SampleBuilder:
         self.logprobs: list[float] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
+        self.cached_tokens: int = 0
+        self.total_prompt_tokens: int = 0
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -209,6 +213,9 @@ class _SampleBuilder:
         self._append_tokens(
             turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
         )
+        if trained:
+            self.cached_tokens += turn.cached_tokens
+            self.total_prompt_tokens += turn.prompt_tokens
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
@@ -258,6 +265,10 @@ class _SampleBuilder:
             reward=0.0,
             status=Sample.Status.COMPLETED,
             metadata=md,
+            prefix_cache_info=Sample.PrefixCacheInfo(
+                cached_tokens=self.cached_tokens,
+                total_prompt_tokens=self.total_prompt_tokens,
+            ),
         )
 
 
