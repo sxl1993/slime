@@ -108,6 +108,16 @@ class FakeFactory:
         return self.__class__.provider
 
 
+def _sdk_create_error(message: str) -> RuntimeError:
+    try:
+        raise RuntimeError(message)
+    except RuntimeError as cause:
+        try:
+            raise RuntimeError("Failed to create async sandbox") from cause
+        except RuntimeError as error:
+            return error
+
+
 @pytest.fixture(autouse=True)
 def _reset_arca(monkeypatch):
     FakeFactory.created = []
@@ -293,6 +303,39 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
 
 def test_ambiguous_create_is_recognizable_and_not_retried():
     FakeFactory.create_error = RuntimeError("request outcome unknown")
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("image")
+        with pytest.raises(sandbox_mod.SandboxLeaseError):
+            await sb.__aenter__()
+
+    asyncio.run(run_case())
+    assert len(FakeFactory.created) == 1
+    assert FakeFactory.instances[0].closed is True
+
+
+def test_lifecycle_rate_limit_is_recognizable_as_safe_to_retry():
+    FakeFactory.create_error = _sdk_create_error(
+        '429: {"code":42911,"message":"Rate limit exceeded","success":false,'
+        '"data":{"limitType":"LIFECYCLE","limit":250,"retryAfter":1}}'
+    )
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("image")
+        with pytest.raises(sandbox_mod.SandboxCreateRateLimitError) as exc_info:
+            await sb.__aenter__()
+        assert exc_info.value.retry_after == 1.0
+
+    asyncio.run(run_case())
+    assert len(FakeFactory.created) == 1
+    assert FakeFactory.instances[0].closed is True
+
+
+def test_non_lifecycle_rate_limit_remains_ambiguous():
+    FakeFactory.create_error = _sdk_create_error(
+        '429: {"code":42911,"message":"Rate limit exceeded","success":false,'
+        '"data":{"limitType":"QUERY","limit":250,"retryAfter":1}}'
+    )
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("image")

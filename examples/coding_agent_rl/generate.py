@@ -36,7 +36,7 @@ import aiohttp
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
-from slime.agent.sandbox import Sandbox, SandboxLeaseError, create_sandbox
+from slime.agent.sandbox import Sandbox, SandboxCreateRateLimitError, SandboxLeaseError, create_sandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -139,15 +139,33 @@ async def boot_agent_sandbox(image: str, instance_id: str, session_id: str) -> A
             raise
         except Exception as e:
             last_err = e
+            if attempt + 1 >= CONFIG.boot_retries:
+                logger.warning(
+                    "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s; giving up",
+                    instance_id,
+                    attempt + 1,
+                    CONFIG.boot_retries,
+                    type(e).__name__,
+                    str(e)[:200],
+                )
+                continue
+            retry_delay = (
+                max(
+                    1 + attempt,
+                    e.retry_after if isinstance(e, SandboxCreateRateLimitError) else 0,
+                )
+                + random.random()
+            )
             logger.warning(
-                "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s",
+                "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s; backoff %.1fs",
                 instance_id,
                 attempt + 1,
                 CONFIG.boot_retries,
                 type(e).__name__,
                 str(e)[:200],
+                retry_delay,
             )
-            await asyncio.sleep(1 + attempt + random.random())
+            await asyncio.sleep(retry_delay)
     if sb is None:
         assert last_err is not None
         raise last_err

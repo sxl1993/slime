@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import random
+import re
 import tempfile
 import time
 from collections.abc import Iterator
@@ -413,6 +414,32 @@ class SandboxLeaseError(RuntimeError):
     """The ARCA sandbox lease is unsafe for automatic retry."""
 
 
+class SandboxCreateRateLimitError(RuntimeError):
+    """ARCA explicitly rejected sandbox creation before allocating a lease."""
+
+    def __init__(self, *, retry_after: float) -> None:
+        self.retry_after = max(0.0, retry_after)
+        super().__init__(f"ARCA lifecycle rate limit exceeded; retry after {self.retry_after:g}s")
+
+
+def _arca_lifecycle_rate_limit_retry_after(error: BaseException) -> float | None:
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        compact_message = "".join(str(current).split())
+        if '"code":42911' in compact_message and '"limitType":"LIFECYCLE"' in compact_message:
+            match = re.search(r'"retryAfter":(\d+(?:\.\d+)?)', compact_message)
+            return float(match.group(1)) if match else 1.0
+
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
+    return None
+
+
 class ArcaImageResolver:
     """Resolve E2B-compatible local image keys for the ARCA backend.
 
@@ -577,6 +604,8 @@ class ArcaSandbox:
                 factory.close()
             if isinstance(error, SandboxLeaseError):
                 raise
+            if (retry_after := _arca_lifecycle_rate_limit_retry_after(error)) is not None:
+                raise SandboxCreateRateLimitError(retry_after=retry_after) from error
             raise SandboxLeaseError(
                 "ARCA create outcome is ambiguous because the request returned without a sandbox ID"
             ) from None

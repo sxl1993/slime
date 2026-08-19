@@ -155,6 +155,102 @@ def test_ambiguous_create_does_not_enter_outer_boot_retry():
         assert calls == 1
 
 
+def test_lifecycle_rate_limit_enters_outer_boot_retry(monkeypatch):
+    with _coding_modules() as (generate, _swe):
+        calls = []
+        sleeps = []
+        rate_limit_error = generate.SandboxCreateRateLimitError
+
+        class RateLimitedSandbox(FakeSandbox):
+            async def __aenter__(self):
+                raise rate_limit_error(retry_after=5)
+
+        def factory(image, *, metadata=None):
+            calls.append(dict(metadata or {}))
+            return RateLimitedSandbox(image) if len(calls) == 1 else FakeSandbox(image)
+
+        class Harness:
+            async def prepare_cli(self, sb):
+                return None
+
+        async def record_sleep(delay):
+            sleeps.append(delay)
+
+        generate.create_sandbox = factory
+        generate.HARNESS_CLS = Harness
+        generate.CONFIG = generate.SweConfig(
+            eval_protocol="scaleswe",
+            train_protocol="scaleswe",
+            adapter_bind_host="0.0.0.0",
+            adapter_port=18001,
+            theta_base_url="https://theta.example/api/anthropic",
+            theta_service_name="test-service",
+            theta_api_key="test-key",
+            fork_merge_threshold=None,
+            agent_time_budget_sec=30,
+            eval_timeout_sec=30,
+            rollout_guard_sec=60,
+            boot_concurrency=1,
+            boot_retries=2,
+        )
+        monkeypatch.setattr(generate.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(generate.random, "random", lambda: 0.25)
+
+        async def run_case():
+            async with generate.boot_agent_sandbox("image", "instance-1", "session-1"):
+                pass
+
+        asyncio.run(run_case())
+        assert [metadata["attempt"] for metadata in calls] == ["1", "2"]
+        assert sleeps == [5.25]
+
+
+def test_lifecycle_rate_limit_does_not_sleep_after_final_attempt(monkeypatch):
+    with _coding_modules() as (generate, _swe):
+        calls = []
+        sleeps = []
+        rate_limit_error = generate.SandboxCreateRateLimitError
+
+        class RateLimitedSandbox(FakeSandbox):
+            async def __aenter__(self):
+                raise rate_limit_error(retry_after=5)
+
+        def factory(image, *, metadata=None):
+            calls.append(dict(metadata or {}))
+            return RateLimitedSandbox(image)
+
+        async def record_sleep(delay):
+            sleeps.append(delay)
+
+        generate.create_sandbox = factory
+        generate.CONFIG = generate.SweConfig(
+            eval_protocol="scaleswe",
+            train_protocol="scaleswe",
+            adapter_bind_host="0.0.0.0",
+            adapter_port=18001,
+            theta_base_url="https://theta.example/api/anthropic",
+            theta_service_name="test-service",
+            theta_api_key="test-key",
+            fork_merge_threshold=None,
+            agent_time_budget_sec=30,
+            eval_timeout_sec=30,
+            rollout_guard_sec=60,
+            boot_concurrency=1,
+            boot_retries=2,
+        )
+        monkeypatch.setattr(generate.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(generate.random, "random", lambda: 0.25)
+
+        async def run_case():
+            with pytest.raises(rate_limit_error):
+                async with generate.boot_agent_sandbox("image", "instance-1", "session-1"):
+                    pass
+
+        asyncio.run(run_case())
+        assert [metadata["attempt"] for metadata in calls] == ["1", "2"]
+        assert sleeps == [5.25]
+
+
 def test_unreleased_sandbox_does_not_enter_outer_boot_retry():
     with _coding_modules() as (generate, _swe):
         calls = 0
