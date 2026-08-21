@@ -199,7 +199,7 @@ MISC_ARGS=(
 )
 
 # ============ ray cluster network ============
-# Set MASTER_ADDR before the SWE block: ADAPTER_PUBLIC_HOST below falls back to it.
+# Set MASTER_ADDR before the SWE block: Ray uses it for cluster membership.
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
@@ -212,17 +212,15 @@ export SWE_TRAIN_PROTOCOL="${SWE_TRAIN_PROTOCOL:-scaleswe}"
 export SLIME_AGENT_SANDBOX_BACKEND="${SLIME_AGENT_SANDBOX_BACKEND:-e2b}"
 
 if [[ "${SLIME_AGENT_SANDBOX_BACKEND}" == "arca" ]]; then
-  : "${SLIME_ARCA_APP_NAME:?Set SLIME_ARCA_APP_NAME for the ARCA backend}"
-  : "${SLIME_ARCA_BASE_URL:?Set SLIME_ARCA_BASE_URL for the ARCA backend}"
-  : "${SLIME_ARCA_API_KEY:?Set SLIME_ARCA_API_KEY for the ARCA backend}"
+  : "${SLIME_AGENT_ARCA_APP_NAME:?Set SLIME_AGENT_ARCA_APP_NAME for the ARCA backend}"
+  : "${SLIME_AGENT_ARCA_BASE_URL:?Set SLIME_AGENT_ARCA_BASE_URL for the ARCA backend}"
+  : "${SLIME_AGENT_ARCA_API_KEY:?Set SLIME_AGENT_ARCA_API_KEY for the ARCA backend}"
   : "${SLIME_AGENT_ARCA_TEMPLATE_ID:?Set SLIME_AGENT_ARCA_TEMPLATE_ID for the ARCA backend}"
   export SLIME_AGENT_ARCA_TTL_MINUTES="${SLIME_AGENT_ARCA_TTL_MINUTES:-40}"
   export SLIME_AGENT_ARCA_CPU="${SLIME_AGENT_ARCA_CPU:-2}"
   export SLIME_AGENT_ARCA_MEMORY="${SLIME_AGENT_ARCA_MEMORY:-4}"
   export SLIME_AGENT_ARCA_DISK="${SLIME_AGENT_ARCA_DISK:-25}"
   export SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC="${SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC:-150}"
-  export SLIME_AGENT_ARCA_READY_TIMEOUT_SEC="${SLIME_AGENT_ARCA_READY_TIMEOUT_SEC:-120}"
-  export SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC="${SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC:-2}"
 else
   export E2B_API_KEY="${E2B_API_KEY:-e2b_0000000000000000000000000000000000000000}"
   # Metadata key your gateway routes images by; `image` is the neutral default.
@@ -231,11 +229,15 @@ else
   export SLIME_AGENT_CC_TARBALL="${SLIME_AGENT_CC_TARBALL:-/path/to/anthropic-ai-claude-code-local-linux-x64.tgz}"
 fi
 
-# ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
-export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
-export ADAPTER_PUBLIC_URL="${ADAPTER_PUBLIC_URL:-}"
+# Sandboxes route every coding-agent request through Theta; the Adapter only
+# listens locally for the registered Theta service target.
+: "${THETA_API_KEY:?Set THETA_API_KEY for the Theta gateway}"
+: "${HOST_PORTS:?Set HOST_PORTS to the AIDC-exposed Adapter port}"
+export THETA_API_KEY
+export THETA_SERVICE_NAME="${THETA_SERVICE_NAME:-slime_qwen36_35b_${STAMP}}"
+export THETA_BASE_URL="${THETA_BASE_URL:-https://antchat.alipay.com/api/anthropic}"
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
-export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
+export ADAPTER_PORT="${ADAPTER_PORT:-${HOST_PORTS%%,*}}"
 
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1800}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
@@ -252,7 +254,7 @@ export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-
 # export SWE_CC_PROMPT="Read PROBLEM_STATEMENT.md. BEFORE editing any file, dispatch the 'investigator' sub-agent (via the Agent tool with subagent_type=investigator) to locate every file relevant to the issue. Then fix the issue and run the tests."
 
 # ============ proxy bypass for in-cluster traffic ============
-export no_proxy="127.0.0.1,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST}"
+export no_proxy="127.0.0.1,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 
 cd "${SLIME_DIR}"
@@ -294,7 +296,8 @@ keys = (
     "no_proxy", "NO_PROXY",
     "SWE_AGENT",
     "SLIME_AGENT_SANDBOX_BACKEND",
-    "E2B_API_KEY", "ADAPTER_PUBLIC_HOST", "ADAPTER_PUBLIC_URL",
+    "E2B_API_KEY", "THETA_API_KEY", "THETA_SERVICE_NAME", "THETA_BASE_URL",
+    "POD_IP", "SYSTEM_API_JWT_TAG", "DV_ENDPOINT_ADDR",
     "SLIME_AGENT_NODE_TARBALL", "SLIME_AGENT_CC_TARBALL",
     "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_BOOT_CONCURRENCY",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
@@ -303,12 +306,12 @@ keys = (
     "SWE_CC_PROMPT",
     "SWE_TRAIN_PROTOCOL",
     "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY",
-    "SLIME_ARCA_APP_NAME", "SLIME_ARCA_BASE_URL", "SLIME_ARCA_API_KEY",
-    "SLIME_AGENT_ARCA_TEMPLATE_ID", "SLIME_AGENT_ARCA_IMAGE_MAP",
+    "SLIME_AGENT_ARCA_APP_NAME", "SLIME_AGENT_ARCA_BASE_URL", "SLIME_AGENT_ARCA_API_KEY",
+    "SLIME_AGENT_ARCA_TEMPLATE_ID",
+    "SLIME_AGENT_ARCA_IMAGE_REGISTRY", "SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX",
     "SLIME_AGENT_ARCA_TTL_MINUTES",
     "SLIME_AGENT_ARCA_CPU", "SLIME_AGENT_ARCA_MEMORY", "SLIME_AGENT_ARCA_DISK",
-    "SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC", "SLIME_AGENT_ARCA_READY_TIMEOUT_SEC",
-    "SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC",
+    "SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]

@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -306,6 +308,115 @@ def test_arca_8gpu_launcher_enables_core_attention_activation_offloading():
     assert "--offload-modules core_attn" in launcher
     assert "export NVTE_CPU_OFFLOAD_V1=1" in launcher
     assert '"NVTE_CPU_OFFLOAD_V1",' in launcher
+
+
+def test_arca_32gpu_launcher_configures_claude_context_budget():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert '--rollout-max-response-len "${MAX_GEN_LEN:-16384}"' in launcher
+    assert 'export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-100000}"' in launcher
+    assert 'export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-45}"' in launcher
+    assert 'export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-32768}"' in launcher
+    assert 'export SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS="${SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS:-10000}"' in launcher
+    assert '"CLAUDE_CODE_AUTO_COMPACT_WINDOW",' in launcher
+    assert '"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",' in launcher
+    assert '"CLAUDE_CODE_MAX_OUTPUT_TOKENS",' in launcher
+    assert '"SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS",' in launcher
+    assert '"autoCompactWindow":20000' not in launcher
+
+
+def test_arca_32gpu_launcher_disables_generate_replay_and_uses_testbed_python():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert "--router-disable-retries" in launcher
+    assert "/opt/miniconda3/envs/testbed/bin" in launcher
+    assert "export SLIME_AGENT_CC_EXTRA_ENVS=" in launcher
+    assert '"SLIME_AGENT_CC_EXTRA_ENVS",' in launcher
+
+
+def test_arca_32gpu_launcher_uses_32gpu_names():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert 'EXP_TAG_DEFAULT="arca-sandbox-32gpu-27b"' in launcher
+    assert 'EXP_TAG_DEFAULT="arca-sandbox-32gpu-non-colocate-27b"' in launcher
+    assert 'THETA_SERVICE_NAME="${THETA_SERVICE_NAME:-slime_qwen36_27b_32gpu_${STAMP}}"' in launcher
+
+
+def test_arca_32gpu_launcher_configures_trajectory_directory():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert 'export SLIME_AGENT_TRAJECTORY_SAVE="${SLIME_AGENT_TRAJECTORY_SAVE:-all}"' in launcher
+    assert 'export SLIME_AGENT_TRAJECTORY_DIR="${SLIME_AGENT_TRAJECTORY_DIR:-${RUN_ROOT}/trajectories}"' in launcher
+    assert "export SLIME_AGENT_TRAJECTORY_WRITE_CONCURRENCY=" in launcher
+    assert 'install -d -m 700 "${SLIME_AGENT_TRAJECTORY_DIR}"' in launcher
+    assert '"SLIME_AGENT_TRAJECTORY_SAVE", "SLIME_AGENT_TRAJECTORY_DIR",' in launcher
+    assert '"SLIME_AGENT_TRAJECTORY_WRITE_CONCURRENCY",' in launcher
+
+
+def test_arca_32gpu_launcher_supports_explicit_placement_modes():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert 'PLACEMENT_MODE="${PLACEMENT_MODE:-colocate}"' in launcher
+    assert 'MISC_ARGS+=(--rollout-num-gpus "${ROLLOUT_NUM_GPUS}")' in launcher
+    assert "MISC_ARGS+=(--colocate)" in launcher
+
+
+def test_arca_32gpu_launcher_saves_training_checkpoints_every_100_steps():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-100}"' in launcher
+    assert 'SAVE_PATH="${SAVE_PATH:-${RUN_ROOT}/checkpoints}"' in launcher
+    assert '--save "${SAVE_PATH}"' in launcher
+    assert '--save-interval "${SAVE_INTERVAL}"' in launcher
+    assert 'if [[ "${ROLLOUT_ONLY}" != "1" ]]; then' in launcher
+
+
+def test_arca_32gpu_launcher_rejects_invalid_save_interval():
+    launcher = REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh"
+    env = os.environ.copy()
+    env.update({"SAVE_INTERVAL": "0", "SLIME_DIR": str(REPO_ROOT)})
+
+    result = subprocess.run(
+        ["bash", str(launcher)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "SAVE_INTERVAL must be a positive integer" in result.stderr
+
+
+def test_arca_32gpu_launcher_rejects_existing_run_root(tmp_path):
+    launcher = REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh"
+    env = os.environ.copy()
+    env.update({"RUN_ROOT": str(tmp_path), "SLIME_DIR": str(REPO_ROOT)})
+
+    result = subprocess.run(
+        ["bash", str(launcher)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "RUN_ROOT already exists or cannot be created" in result.stderr
+
+
+def test_qwen36_27b_arca_launchers_allocate_fresh_run_roots():
+    for name in (
+        "run_qwen36_27b_swe_8gpu_arca.sh",
+        "run_qwen36_27b_swe_32gpu_arca.sh",
+    ):
+        launcher = (REPO_ROOT / "examples/coding_agent_rl" / name).read_text()
+
+        assert 'RUN_ID="${RUN_ID:-${STAMP}_$$}"' in launcher
+        assert 'if ! mkdir -m 700 "${RUN_ROOT}"; then' in launcher
+        assert 'mkdir -p "${RUN_ROOT}"' not in launcher
 
 
 if __name__ == "__main__":

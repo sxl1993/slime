@@ -8,23 +8,31 @@ SLIME_DIR="${SLIME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev
 
 # ============ ARCA sandbox pre-flight ============
 export SLIME_AGENT_SANDBOX_BACKEND=arca
-export SLIME_ARCA_APP_NAME="${SLIME_ARCA_APP_NAME:-a3training}"
-export SLIME_ARCA_BASE_URL="${SLIME_ARCA_BASE_URL:-http://arca-sandbox.global.alipay.com:8080}"
-: "${SLIME_ARCA_API_KEY:?Set SLIME_ARCA_API_KEY for the ARCA backend}"
-export SLIME_ARCA_API_KEY
+export SLIME_AGENT_ARCA_APP_NAME="${SLIME_AGENT_ARCA_APP_NAME:-arcaslimeagentrl}"
+export SLIME_AGENT_ARCA_BASE_URL="${SLIME_AGENT_ARCA_BASE_URL:-http://arca-sandbox.global.alipay.com:8080}"
+: "${SLIME_AGENT_ARCA_API_KEY:?Set SLIME_AGENT_ARCA_API_KEY for the ARCA backend}"
+export SLIME_AGENT_ARCA_API_KEY
 export SLIME_AGENT_ARCA_TEMPLATE_ID="${SLIME_AGENT_ARCA_TEMPLATE_ID:-ARCA-TEMPLATE-000000004480168f}"
-export SLIME_AGENT_ARCA_TTL_MINUTES="${SLIME_AGENT_ARCA_TTL_MINUTES:-40}"
-export SLIME_AGENT_ARCA_CPU="${SLIME_AGENT_ARCA_CPU:-2}"
-export SLIME_AGENT_ARCA_MEMORY="${SLIME_AGENT_ARCA_MEMORY:-4}"
-export SLIME_AGENT_ARCA_DISK="${SLIME_AGENT_ARCA_DISK:-25}"
-export SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC="${SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC:-150}"
-export SLIME_AGENT_ARCA_READY_TIMEOUT_SEC="${SLIME_AGENT_ARCA_READY_TIMEOUT_SEC:-120}"
-export SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC="${SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC:-2}"
+export SLIME_AGENT_ARCA_IMAGE_REGISTRY="${SLIME_AGENT_ARCA_IMAGE_REGISTRY:-asr.antgroup-inc.cn/arcaslimeagentrl/sweb.instance}"
+export SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX="${SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX:-claude-code-2.1.220-v1}"
 
 python3 -c 'import arca' || {
   echo "ERROR: arca-sandbox SDK is not importable" >&2
   exit 1
 }
+
+EXP_TAG="${EXP_TAG:-arca-sandbox-8gpu-27b}"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${RUN_ID:-${STAMP}_$$}"
+RUN_ROOT="${RUN_ROOT:-${SLIME_DIR}/runs/${EXP_TAG}_${RUN_ID}}"
+mkdir -p "$(dirname -- "${RUN_ROOT}")"
+if ! mkdir -m 700 "${RUN_ROOT}"; then
+   echo "ERROR: RUN_ROOT already exists or cannot be created: ${RUN_ROOT}" >&2
+   exit 2
+fi
+LOG_FILE="${RUN_ROOT}/run.log"
+echo "Training log: ${LOG_FILE}"
+echo "RUN_ROOT=${RUN_ROOT} | backend=${SLIME_AGENT_SANDBOX_BACKEND}"
 
 # ============ Cleanup ============
 pkill -9 sglang || true
@@ -37,53 +45,26 @@ pkill -9 ray || true
 # ============ Model spec (qwen3_5 hybrid 27B from scripts/models/qwen3.5-27B.sh) ============
 source "${SLIME_DIR}/scripts/models/qwen3.5-27B.sh"
 
-# ============ context length ============
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-65536}"
-MAX_GEN_LEN="${MAX_GEN_LEN:-8192}"
-CP_SIZE="${CP_SIZE:-2}"
 # Keep enough headroom for torch_memory_saver.pause() after the actor update.
 # 32768 tokens/GPU left only ~7 GB free and caused the native offload path to die.
 
-# ============ Paths ============
-HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/amed-s1/common/ckpt/muchen/Qwen3.6-27B}"
-REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/amed-s1/common/ckpt/muchen/Qwen3.6-27B-tdst/}"
-PROMPT_DATA="${PROMPT_DATA:-/personal/muchen/code_agent_data/swe_django.jsonl}"
-
-EXP_TAG="${EXP_TAG:-arca-sandbox-8gpu-27b}"
-STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ROOT="${RUN_ROOT:-${SLIME_DIR}/runs/${EXP_TAG}_${STAMP}}"
-LOG_FILE="${RUN_ROOT}/run.log"
-mkdir -p "${RUN_ROOT}"
-echo "======================================================================"
-echo "Training log: ${LOG_FILE}"
-echo "RUN_ROOT=${RUN_ROOT}"
-echo "SLIME_AGENT_SANDBOX_BACKEND=${SLIME_AGENT_SANDBOX_BACKEND}"
-echo "======================================================================"
-
-# ============ Phase 0 observability ============
-PHASE0_ONLY="${PHASE0_ONLY:-0}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-4}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
-export SWE_ROLLOUT_METRICS_PATH="${SWE_ROLLOUT_METRICS_PATH:-}"
-export SWE_ROLLOUT_RUN_ID="${SWE_ROLLOUT_RUN_ID:-unknown}"
-export SWE_ROLLOUT_SEED="${SWE_ROLLOUT_SEED:-}"
-
 CKPT_ARGS=(
-   --hf-checkpoint "${HF_CHECKPOINT}"
-   --ref-load "${REF_MODEL_PATH}"
+   --hf-checkpoint "${HF_CHECKPOINT:-/mnt/amedelastic-m/common/ckpt/muchen/Qwen3.6-27B}"
+   --ref-load "${REF_MODEL_PATH:-/mnt/amedelastic-m/common/ckpt/muchen/Qwen3.6-27B-tdst}"
 )
 
 ROLLOUT_ARGS=(
    --custom-generate-function-path examples.coding_agent_rl.generate.generate
-   --prompt-data "${PROMPT_DATA}"
+   --prompt-data "${PROMPT_DATA:-/personal/muchen/code_agent_data/swe_verified_v5.jsonl}"
    --input-key prompt
    --label-key label
    --metadata-key metadata
-   --num-rollout "${NUM_ROLLOUT}"
-   --rollout-batch-size 4
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
-   --rollout-max-context-len "${MAX_CONTEXT_LEN}"
-   --rollout-max-response-len "${MAX_GEN_LEN}"
+   --apply-chat-template
+   --num-rollout "${NUM_ROLLOUT:-1}"
+   --rollout-batch-size 1
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-1}"
+   --rollout-max-context-len "${MAX_CONTEXT_LEN:-65536}"
+   --rollout-max-response-len "${MAX_GEN_LEN:-8192}"
    --rollout-temperature 1.0
    --rollout-stop-token-ids 248046 248044
    --num-steps-per-rollout 1
@@ -92,14 +73,19 @@ ROLLOUT_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP_SIZE:-4}"
    --sequence-parallel
-   --context-parallel-size "${CP_SIZE}"
+   --context-parallel-size "${CP_SIZE:-2}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-24576}"
+   --fine-grained-activation-offloading
+   --offload-modules core_attn
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
    --use-dynamic-batch-size
    --qkv-format thd
 )
+
+# Transformer Engine v2.10+ otherwise offloads weights as well as activations.
+export NVTE_CPU_OFFLOAD_V1=1
 
 ALGO_ARGS=(
    --advantage-estimator grpo
@@ -128,8 +114,8 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus 8
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static "${ROLLOUT_MEM_UTILIZATION:-0.60}"
-   --sglang-context-length "${MAX_CONTEXT_LEN}"
+   --sglang-mem-fraction-static "${ROLLOUT_MEM_UTILIZATION:-0.80}"
+   --sglang-context-length "${MAX_CONTEXT_LEN:-65536}"
    --sglang-tool-call-parser qwen3_coder
    --sglang-reasoning-parser qwen3
 )
@@ -141,72 +127,44 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
    --colocate
+   --no-tms-cpu-backup
 )
-# --no-tms-cpu-backup cuts host memory during the colocated train<->rollout
-# offload; it needs --offload-train, which --debug-rollout-only (PHASE0_ONLY)
-# force-disables. Gate it to normal training so PHASE0_ONLY runs don't trip
-# slime_validate_args ("--no-tms-cpu-backup requires --offload-train").
-if [[ "${PHASE0_ONLY}" != "1" ]]; then
-   MISC_ARGS+=(--no-tms-cpu-backup)
-fi
 
 # ============ Network ============
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-29500}}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-${MLP_SOCKET_IFNAME:-eth0}}"
+export SLIME_DESTROY_WORLD_PROCESS_GROUP="0"
 
 # ============ SWE agent knobs ============
-export SWE_AGENT="${SWE_AGENT:-claude_code}"
 export SWE_TRAIN_PROTOCOL="${SWE_TRAIN_PROTOCOL:-swebench}"
 export SWE_EVAL_PROTOCOL="${SWE_EVAL_PROTOCOL:-swebench}"
 
-# The Adapter starts lazily in the RolloutManager process on the first SWE sample.
-export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR}}"
-export ADAPTER_PUBLIC_URL="${ADAPTER_PUBLIC_URL:-}"
+# The single-node RolloutManager owns one Adapter and registers it to Theta in
+# code. Sandbox Claude Code always calls antchat at THETA_BASE_URL, addressing
+# the model as ckpt:<THETA_SERVICE_NAME>; Theta routes it to the registered
+# Adapter. Session routing rides on Claude Code's metadata.user_id because the
+# gateway bearer token is no longer a session identifier.
+: "${THETA_API_KEY:?Set THETA_API_KEY for the Theta gateway}"
+export THETA_API_KEY
+export THETA_SERVICE_NAME="${THETA_SERVICE_NAME:-slime_qwen36_27b_${STAMP}}"
+export THETA_BASE_URL="${THETA_BASE_URL:-https://antchat.alipay.com/api/anthropic}"
 export ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 
-export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1500}"
-export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
-export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-8}"
-
-# Adapter context compression
-export SLIME_ADAPTER_SYSTEM_PROMPT="${SLIME_ADAPTER_SYSTEM_PROMPT:-1}"
-export SLIME_ADAPTER_TOOL_WHITELIST="${SLIME_ADAPTER_TOOL_WHITELIST:-Bash,Read,Edit,Write}"
-export SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS="${SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS:-10000}"
-
-# autoCompactWindow (20k) < MAX_CONTEXT_LEN (65536): compact early so the CLI
+# autoCompactWindow (20k) < context length (65536): compact early so the CLI
 # has more room before the 65536 training-side cap.
 SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":20000}'
 export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --disallowedTools WebFetch WebSearch Task Agent EnterWorktree ExitWorktree"
 
-# Raise CLI session output cap to match rollout context length.
-# Without this the CLI defaults to 32000 tokens and aborts multi-turn sessions.
-export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-${MAX_CONTEXT_LEN}}"
-
 # Allow SGLang to extend context beyond model's max_position_embeddings.
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
-export no_proxy="127.0.0.1,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST}"
+export no_proxy="127.0.0.1,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 
 cd "${SLIME_DIR}"
-
-# ============ Phase 0 debug-rollout-only mode ============
-DEBUG_ARGS=()
-if [[ "${PHASE0_ONLY}" == "1" ]]; then
-   mkdir -p "${RUN_ROOT}/rollout_dumps"
-   DEBUG_ARGS=(
-      --debug-rollout-only
-      --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
-   )
-   export SWE_ROLLOUT_METRICS_PATH="${SWE_ROLLOUT_METRICS_PATH:-${RUN_ROOT}/rollout_metrics.jsonl}"
-   echo "PHASE0_ONLY=1: debug-rollout-only mode enabled"
-   echo "  rollout_dumps: ${RUN_ROOT}/rollout_dumps/"
-   echo "  metrics_path:  ${SWE_ROLLOUT_METRICS_PATH}"
-   echo "  rollout_seed:  ${SWE_ROLLOUT_SEED:-<unset>} (prompt-selection reproducibility only; does not fix sampling)"
-fi
 
 # ============ Ray (single node) ============
 # --num-cpus omitted: let Ray autodetect machine cores. Placement-group bundles
@@ -231,29 +189,20 @@ import os
 
 keys = (
     "no_proxy", "NO_PROXY",
-    "SWE_AGENT",
-    "ADAPTER_PUBLIC_HOST", "ADAPTER_PUBLIC_URL", "ADAPTER_BIND_HOST", "ADAPTER_PORT",
-    "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_BOOT_CONCURRENCY",
+    "NVTE_CPU_OFFLOAD_V1",
+    "ADAPTER_BIND_HOST", "ADAPTER_PORT",
+    "THETA_API_KEY", "THETA_SERVICE_NAME", "THETA_BASE_URL",
+    "POD_IP", "SYSTEM_API_JWT_TAG", "DV_ENDPOINT_ADDR",
     "SLIME_AGENT_CC_EXTRA_ARGS",
     "SLIME_AGENT_CC_EXTRA_ENVS",
     "SWE_CC_PROMPT",
     "SWE_TRAIN_PROTOCOL", "SWE_EVAL_PROTOCOL",
     "SLIME_AGENT_SANDBOX_BACKEND",
-    "SLIME_ARCA_APP_NAME", "SLIME_ARCA_BASE_URL", "SLIME_ARCA_API_KEY",
-    "SLIME_AGENT_ARCA_TEMPLATE_ID", "SLIME_AGENT_ARCA_IMAGE_MAP",
-    "SLIME_AGENT_ARCA_TTL_MINUTES",
-    "SLIME_AGENT_ARCA_CPU", "SLIME_AGENT_ARCA_MEMORY", "SLIME_AGENT_ARCA_DISK",
-    "SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC", "SLIME_AGENT_ARCA_READY_TIMEOUT_SEC",
-    "SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC",
+    "SLIME_AGENT_ARCA_APP_NAME", "SLIME_AGENT_ARCA_BASE_URL", "SLIME_AGENT_ARCA_API_KEY",
+    "SLIME_AGENT_ARCA_TEMPLATE_ID",
+    "SLIME_AGENT_ARCA_IMAGE_REGISTRY", "SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX",
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN",
-    "SLIME_ADAPTER_SYSTEM_PROMPT",
-    "SLIME_ADAPTER_TOOL_WHITELIST",
-    "SLIME_ADAPTER_MAX_TOOL_RESULT_CHARS",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-    "SWE_ROLLOUT_METRICS_PATH",
-    "SWE_ROLLOUT_RUN_ID",
-    "SWE_ROLLOUT_SEED",
-    "SLIME_AGENT_TOOL_TIMING",
+    "SLIME_DESTROY_WORLD_PROCESS_GROUP",
 )
 env = {key: os.environ[key] for key in keys if key in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
@@ -263,7 +212,6 @@ env["TP_SOCKET_IFNAME"] = os.environ["GLOO_SOCKET_IFNAME"]
 env["NCCL_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
 env["PYTHONPATH"] = f"/root/Megatron-LM/:{os.environ['SLIME_DIR']}:{os.environ['SLIME_DIR']}/third_party"
 env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-env["NCCL_NVLS_ENABLE"] = "0"
 with open(os.environ["RUNTIME_ENV_FILE"], "w", encoding="utf-8") as fp:
     json.dump({"env_vars": env}, fp)
 PY
@@ -276,7 +224,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
-   "${DEBUG_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${ALGO_ARGS[@]}" \
    "${PERF_ARGS[@]}" \

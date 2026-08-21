@@ -194,3 +194,17 @@ glm/
 _examples_synced/
 .env
 .DS_Store
+runs/
+
+.remote-agent/
+docs/adr/
+CONTEXT.md
+docs/superpowers/
+
+# Local rollout analysis and runtime artifacts
+datasets/
+rollout_analysis/
+.codex/
+.superpowers/
+logs/
+*.log

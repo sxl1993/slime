@@ -913,6 +913,16 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     return addr_and_ports, node_port_cursor
 
 
+def _disable_router_health_check(router_args) -> None:
+    if hasattr(router_args, "disable_health_check"):
+        router_args.disable_health_check = True
+        return
+
+    logger.warning(
+        "sglang-router does not expose RouterArgs.disable_health_check; router health checks remain enabled."
+    )
+
+
 def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
     """Start sglang_router and return (router_ip, router_port).
 
@@ -949,9 +959,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     # contention under high load) and do not indicate a dead server.
     router_args.disable_circuit_breaker = True
 
-    # We will not use the health check from router.
-    if hasattr(router_args, "disable_health_check"):
-        router_args.disable_health_check = True
+    _disable_router_health_check(router_args)
 
     logger.info(f"Launch router with args: {router_args}")
 

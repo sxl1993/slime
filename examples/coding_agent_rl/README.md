@@ -23,19 +23,20 @@ backend with `SLIME_AGENT_SANDBOX_BACKEND=e2b|arca` (default: `e2b`):
    locally, so compatible internal gateways that ignore auth still need a
    syntactically valid `e2b_` + 40 hex-character placeholder.
 2. **ARCA:** install the optional `arca-sandbox==1.1.0` SDK on every Ray node,
-   then configure `SLIME_ARCA_APP_NAME`, `SLIME_ARCA_BASE_URL`,
-   `SLIME_ARCA_API_KEY`, and `SLIME_AGENT_ARCA_TEMPLATE_ID`. Slime writes these
+   then configure `SLIME_AGENT_ARCA_APP_NAME`, `SLIME_AGENT_ARCA_BASE_URL`,
+   `SLIME_AGENT_ARCA_API_KEY`, and `SLIME_AGENT_ARCA_TEMPLATE_ID`. Slime writes these
    values to a mode-`0600` temporary YAML only while constructing one
-   process-shared `SandboxFactory`, then deletes the file.
+   per-sandbox `SandboxFactory`, then deletes the file.
 3. **E2B host-side tarballs** uploaded into each sandbox at boot:
    - Node 22 (`node-v22.x-linux-x64.tar.xz`) — exported as `SLIME_AGENT_NODE_TARBALL`.
    - Claude Code CLI npm tarball (`anthropic-ai-claude-code-local-linux-x64.tgz`) — exported as `SLIME_AGENT_CC_TARBALL`.
 4. **An E2B image routing key** (`SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`, legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted) — the metadata key the E2B gateway uses to route a boot to a specific image.
-5. **An optional ARCA image map** (`SLIME_AGENT_ARCA_IMAGE_MAP`) — a JSON object that maps an instance ID from the E2B-compatible dataset key `local/<instance_id>` to a complete pullable image reference. Complete image references bypass the map unchanged.
-6. **Network reachability:** use `ADAPTER_PUBLIC_URL=https://<gateway-domain>`
-   for a TLS gateway, or retain the E2B-compatible
-   `http://${ADAPTER_PUBLIC_HOST}:${ADAPTER_PORT}` fallback. Never use
-   `127.0.0.1` as a sandbox callback address.
+5. **ARCA image resolution:** `local/<instance_id>` resolves to
+   `${SLIME_AGENT_ARCA_IMAGE_REGISTRY}:<instance_id>-${SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX}`.
+   Complete image references bypass resolution unchanged.
+6. **Theta gateway:** configure `THETA_BASE_URL`, `THETA_SERVICE_NAME`, and
+   `THETA_API_KEY`. All coding-agent sandbox traffic uses this gateway; direct
+   Adapter callback addresses are not supported.
 
 ## Dataset Format
 
@@ -89,28 +90,19 @@ uv pip install 'arca-sandbox==1.1.0' \
   --index-url https://artifacts.antgroup-inc.cn/simple/
 
 export SLIME_AGENT_SANDBOX_BACKEND=arca
-export SLIME_ARCA_APP_NAME=a3training
-export SLIME_ARCA_BASE_URL=http://arca-sandbox.global.alipay.com:8080
-export SLIME_ARCA_API_KEY='<secret>'
+export SLIME_AGENT_ARCA_APP_NAME=a3training
+export SLIME_AGENT_ARCA_BASE_URL=http://arca-sandbox.global.alipay.com:8080
+export SLIME_AGENT_ARCA_API_KEY='<secret>'
 export SLIME_AGENT_ARCA_TEMPLATE_ID=ARCA-TEMPLATE-xxxxxxxxxxxxxxxx
-export SLIME_AGENT_ARCA_IMAGE_MAP=/path/to/arca-images.json
-export ADAPTER_PUBLIC_URL=https://<approved-adapter-gateway-domain>
+export THETA_API_KEY='<secret>'
+export THETA_SERVICE_NAME=slime_qwen36_35b
+export THETA_BASE_URL=https://antchat.alipay.com/api/anthropic
 
 bash examples/coding_agent_rl/run_qwen36_35b_a3b_swe_8nodes.sh
 ```
 
-For datasets that retain E2B image keys, configure the map as:
-
-```json
-{
-  "astropy__astropy-14508": "asr.antgroup-inc.cn/arcaslimeagentrl/swebench:astropy__astropy-14508-claude-code-2.1.220-v1"
-}
-```
-
 Then `image: "local/astropy__astropy-14508"` resolves before ARCA sandbox
-creation. A complete image address continues to pass through unchanged and does
-not require `SLIME_AGENT_ARCA_IMAGE_MAP`. The configured file path must be
-readable at the same path on every Ray node that creates sandboxes.
+creation. A complete image address continues to pass through unchanged.
 
 The ARCA instance image must already contain the `admin` user, `/testbed`,
 `/home/admin/bin/arca_envd`, and Claude Code. Slime does not create an `agent`
@@ -121,6 +113,34 @@ The launcher fans Ray out to every worker listed in `$HOSTFILE` (default
 SSH as `root`) — create that file (or point `HOSTFILE` at your own) before
 launching. It then dumps every rollout to `runs/${EXP_TAG}_${STAMP}/rollout_dumps/`
 and tees stdout into `runs/${EXP_TAG}_${STAMP}/run.log`.
+
+### Qwen3.6-27B ARCA launchers
+
+Use `run_qwen36_27b_swe_8gpu_arca.sh` for the single-node development setup.
+It owns the local Ray Head lifecycle. Use `run_qwen36_27b_swe_32gpu_arca.sh`
+for an existing 32-GPU Ray cluster:
+
+```bash
+# Default: colocated rollout and training on all 32 GPUs.
+bash examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh
+
+# Split the cluster into 16 training and 16 rollout GPUs.
+PLACEMENT_MODE=non_colocate \
+  bash examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh
+
+# Keep the same rollout configuration but skip training.
+ROLLOUT_ONLY=1 \
+  bash examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh
+```
+
+Each invocation allocates a new `RUN_ROOT`. An explicitly configured
+`RUN_ROOT` must not already exist; the launcher exits instead of mixing or
+overwriting artifacts from another run. The 32-GPU launcher stores trajectories
+under `${RUN_ROOT}/trajectories/`, rollout-only dumps under
+`${RUN_ROOT}/rollout_dumps/`, training checkpoints under
+`${RUN_ROOT}/checkpoints/`, and stdout in `${RUN_ROOT}/run.log`. Training saves
+a checkpoint every 100 steps by default; override the cadence with
+`SAVE_INTERVAL` or the destination with `SAVE_PATH`.
 
 ## New Arguments
 
@@ -158,29 +178,28 @@ All set in the launcher; tune per cluster.
 
 Env vars split by layer. `SLIME_AGENT_*` are the reusable agent library's
 contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs;
-`ADAPTER_*` are host-side deployment/reply-path addresses read only by
-`generate.py`. Keep new vars on the prefix that matches the layer that reads them.
+`THETA_*` are gateway routing credentials read only by `generate.py`. Keep new
+vars on the prefix that matches the layer that reads them.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SLIME_AGENT_SANDBOX_BACKEND` | `e2b` | Explicit provider: `e2b` or `arca`. |
-| `ADAPTER_PUBLIC_URL` | unset | Full sandbox-visible adapter URL, including scheme. Takes precedence over `ADAPTER_PUBLIC_HOST`; use the approved HTTPS gateway for ARCA. |
-| `ADAPTER_PUBLIC_HOST` | `${MASTER_ADDR}` | Public IP the sandbox uses to reach the Anthropic adapter. **Must be routable from inside the sandbox.** |
-| `ADAPTER_BIND_HOST` / `ADAPTER_PORT` | `0.0.0.0` / `18001` | Bind address of the Anthropic adapter on the host. |
+| `THETA_BASE_URL` | `https://antchat.alipay.com/api/anthropic` | Sandbox-visible Theta Anthropic gateway URL. |
+| `THETA_SERVICE_NAME` | launcher-specific | Registered Adapter service; Claude Code addresses it as `ckpt:<service>`. |
+| `THETA_API_KEY` | — | Gateway bearer token used by Claude Code. Required. |
+| `ADAPTER_BIND_HOST` / `ADAPTER_PORT` | `0.0.0.0` / `${HOST_PORTS%%,*}` | Local Adapter listener and the port registered with Theta. |
 | `E2B_API_KEY` | — | E2B (or compatible) API key. |
 | `SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY` | — | **Required.** Which metadata key the E2B gateway routes images by (e.g. `image`); each sample's `metadata.image` is passed under it. (Legacy `SWE_SANDBOX_IMAGE_METADATA_KEY` still accepted.) |
 | `SLIME_AGENT_NODE_TARBALL` | — | Host path to Node 22 tarball uploaded into each sandbox. |
 | `SLIME_AGENT_CC_TARBALL` | — | Host path to the Claude Code CLI npm tarball. |
-| `SLIME_ARCA_APP_NAME` | — | ARCA service-authorized application name. Required by ARCA. |
-| `SLIME_ARCA_BASE_URL` | — | ARCA SDK gateway URL. Required by ARCA. |
-| `SLIME_ARCA_API_KEY` | — | ARCA API key. Required by ARCA; propagated to Ray but not printed by the launcher. |
+| `SLIME_AGENT_ARCA_APP_NAME` | — | ARCA service-authorized application name. Required by ARCA. |
+| `SLIME_AGENT_ARCA_BASE_URL` | — | ARCA SDK gateway URL. Required by ARCA. |
+| `SLIME_AGENT_ARCA_API_KEY` | — | ARCA API key. Required by ARCA; propagated to Ray but not printed by the launcher. |
 | `SLIME_AGENT_ARCA_TEMPLATE_ID` | — | Base template controlling ARCA permission/network/probe policy. Required by ARCA. |
-| `SLIME_AGENT_ARCA_IMAGE_MAP` | — | Optional JSON object path mapping `local/<instance_id>` keys to complete ARCA-pullable image references. Required only when a dataset uses `local/` keys. |
+| `SLIME_AGENT_ARCA_IMAGE_REGISTRY` / `SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX` | ARCA SWE defaults | Components used to resolve `local/<instance_id>` ARCA image keys. |
 | `SLIME_AGENT_ARCA_TTL_MINUTES` | `40` | ARCA lease TTL in minutes. |
 | `SLIME_AGENT_ARCA_CPU` / `SLIME_AGENT_ARCA_MEMORY` / `SLIME_AGENT_ARCA_DISK` | `2` / `4` / `25` | ARCA `ResourceSpecification` fields. |
 | `SLIME_AGENT_ARCA_CREATE_TIMEOUT_SEC` | `150` | Timeout for the single ARCA create request. |
-| `SLIME_AGENT_ARCA_READY_TIMEOUT_SEC` | `120` | Bounded terminal readiness window after a sandbox ID is known. |
-| `SLIME_AGENT_ARCA_READY_POLL_INTERVAL_SEC` | `2` | Delay between terminal readiness probes. |
 | `SLIME_AGENT_CC_EXTRA_ARGS` | (see launcher) | Extra flags appended to the `claude` CLI invocation — registers the read-only `investigator` sub-agent, disables `WebFetch`/`WebSearch`, disables slash commands. |
 | `SLIME_AGENT_CC_EXTRA_ENVS` | unset | JSON object of extra env vars exported into the `claude` process — escape hatch for env-only knobs (`MAX_THINKING_TOKENS`, `BASH_MAX_TIMEOUT_MS`, ...). Merged last, so it can also override the built-in defaults. |
 | `SWE_AGENT_TIME_BUDGET_SEC` | `1800` | Wallclock budget for the in-sandbox agent CLI itself (think/edit/run). |
@@ -190,7 +209,7 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SWE_CC_PROMPT` | unset | Optional override for the user-turn prompt. Setting this to require sub-agent dispatch is the most reliable way to maximize fan-out. |
 
 The multi-node launcher serializes Ray's runtime environment into a mode-`0600`
-temporary file and removes it on shell exit, so `SLIME_ARCA_API_KEY` is not
+temporary file and removes it on shell exit, so `SLIME_AGENT_ARCA_API_KEY` is not
 embedded in the `ray job submit` command line or emitted by shell xtrace.
 
 `--rollout-max-response-len` is the per-turn generation cap passed to each
@@ -261,6 +280,5 @@ async with create_sandbox(image, metadata=metadata) as sb: ...
 ```
 
 ARCA uses only the SDK's async create, terminal, filesystem, and destroy APIs.
-If create returns without a sandbox ID, `AmbiguousCreate` stops the outer boot
-retry to avoid allocating a duplicate lease. Agent and evaluator sandboxes both
-use the same selected backend.
+If the ARCA lease becomes unsafe to retry, `SandboxLeaseError` stops the outer
+boot retry. Agent and evaluator sandboxes both use the same selected backend.
