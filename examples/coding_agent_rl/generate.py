@@ -506,6 +506,11 @@ async def _probe_adapter_connectivity(sb: Sandbox, adapter_url: str) -> dict[str
 
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
+    if base_sample.index is None:
+        raise ValueError("index is required for Code Agent rollout generation.")
+    if base_sample.rollout_id is None:
+        base_sample.rollout_id = base_sample.index
+
     state = _AdapterService(args)
     protocol = CONFIG.eval_protocol if evaluation else CONFIG.train_protocol
     md = swe.get_metadata(base_sample, protocol)

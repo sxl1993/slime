@@ -75,6 +75,7 @@ from slime.agent.adapters import common as adapters_common  # noqa: E402
 from slime.agent.aiohttp_threaded import run_app_in_thread  # noqa: E402
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessRunResult  # noqa: E402
 from slime.agent.harness import common as harness_common  # noqa: E402
+from slime.rollout._fanout_test_helpers import grpo_normalize_by_group_index  # noqa: E402
 from slime.utils.misc import SingletonMeta  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
@@ -89,6 +90,72 @@ def test_swe_config_defaults_trajectory_dir(monkeypatch):
     monkeypatch.delenv("SLIME_AGENT_TRAJECTORY_SAVE", raising=False)
 
     assert gen.SweConfig.from_env().trajectory_dir == "/personal/muchen"
+
+
+def test_code_agent_fanout_reward_post_process_normalizes_unique_trajectories_per_prompt():
+    args = SimpleNamespace(reward_key=None, grpo_std_normalization=False)
+    samples = [
+        Sample(group_index=0, rollout_id=10, reward=1.0),
+        Sample(group_index=0, rollout_id=10, reward=1.0),
+        Sample(group_index=0, rollout_id=11, reward=0.0),
+        Sample(group_index=1, index=20, rollout_id=20, reward=10.0),
+        Sample(group_index=1, index=21, rollout_id=21, reward=8.0),
+        Sample(group_index=1, index=21, rollout_id=21, reward=8.0),
+        Sample(group_index=1, index=22, rollout_id=22, reward=2.0),
+    ]
+
+    raw_rewards, normalized_rewards = grpo_normalize_by_group_index(args, samples)
+
+    assert raw_rewards == [1.0, 1.0, 0.0, 10.0, 8.0, 8.0, 2.0]
+    assert normalized_rewards == pytest.approx([0.5, 0.5, -0.5, 10 / 3, 4 / 3, 4 / 3, -14 / 3])
+
+
+def test_code_agent_fanout_reward_post_process_applies_grpo_std_normalization():
+    args = SimpleNamespace(reward_key=None, grpo_std_normalization=True)
+    samples = [
+        Sample(group_index=0, rollout_id=10, reward=1.0),
+        Sample(group_index=0, rollout_id=10, reward=1.0),
+        Sample(group_index=0, rollout_id=11, reward=0.0),
+    ]
+
+    _, normalized_rewards = grpo_normalize_by_group_index(args, samples)
+
+    assert normalized_rewards == pytest.approx([2**-0.5, 2**-0.5, -(2**-0.5)], rel=1e-5)
+
+
+def test_code_agent_fanout_reward_post_process_rejects_missing_group_index():
+    args = SimpleNamespace(reward_key=None, grpo_std_normalization=True)
+    samples = [Sample(group_index=None, rollout_id=10, reward=1.0)]
+
+    with pytest.raises(ValueError, match="group_index and rollout_id/index"):
+        grpo_normalize_by_group_index(args, samples)
+
+
+def test_code_agent_fanout_reward_post_process_rejects_missing_trajectory_id():
+    args = SimpleNamespace(reward_key=None, grpo_std_normalization=True)
+    samples = [Sample(group_index=0, index=None, rollout_id=None, reward=1.0)]
+
+    with pytest.raises(ValueError, match="group_index and rollout_id/index"):
+        grpo_normalize_by_group_index(args, samples)
+
+
+def test_code_agent_fanout_reward_post_process_rejects_inconsistent_segment_rewards():
+    args = SimpleNamespace(reward_key=None, grpo_std_normalization=True)
+    samples = [
+        Sample(group_index=0, rollout_id=10, reward=1.0),
+        Sample(group_index=0, rollout_id=10, reward=0.0),
+    ]
+
+    with pytest.raises(ValueError, match="inconsistent rewards"):
+        grpo_normalize_by_group_index(args, samples)
+
+
+def test_arca_32gpu_launcher_enables_fanout_reward_post_process():
+    launcher = (REPO_ROOT / "examples/coding_agent_rl/run_qwen36_27b_swe_32gpu_arca.sh").read_text()
+
+    assert (
+        "--custom-reward-post-process-path " "slime.rollout._fanout_test_helpers.grpo_normalize_by_group_index"
+    ) in launcher
 
 
 class _ThetaGateway:
@@ -536,7 +603,22 @@ def test_generate_aborts_on_missing_image():
         samples = await gen.generate(_args(), _base_sample(image=""), sampling_params={})
         assert len(samples) == 1
         assert samples[0].status == Sample.Status.ABORTED
+        assert samples[0].rollout_id == samples[0].index == 0
         assert samples[0].metadata.get("abort_reason") == "missing_image_or_workdir"
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+
+def test_generate_rejects_missing_sample_index():
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        _patch_generate(monkeypatch, tok, FakeSandbox.factory(on_launch=_anthropic_agent))
+        sample = _base_sample(image="")
+        sample.index = None
+
+        with pytest.raises(ValueError, match="index is required"):
+            await gen.generate(_args(), sample, sampling_params={})
 
     with pytest.MonkeyPatch.context() as mp:
         asyncio.run(run_case(mp))
