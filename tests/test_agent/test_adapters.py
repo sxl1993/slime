@@ -28,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, ScriptedTokenizer  # noqa: E402
 
 from slime.agent.adapters import anthropic, openai  # noqa: E402
-from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
+from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
@@ -150,6 +150,52 @@ def test_anthropic_translation_keeps_tool_results_thinking_and_tools():
     )
     assert tools == [
         {"type": "function", "function": {"name": "lookup", "description": "search", "parameters": {"type": "object"}}}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "tool_input", "expected_command"),
+    [
+        (
+            "Grep",
+            {
+                "pattern": "FunctionTypeSerializer",
+                "path": "/testbed/tests",
+                "output": "tests/migrations/test_writer.py",
+            },
+            "grep -R -l -- FunctionTypeSerializer /testbed/tests | sed -n 1,250p",
+        ),
+        (
+            "Glob",
+            {"pattern": "**/*.py", "path": "/testbed"},
+            "find /testbed -type f -name '*.py' | head -n 100",
+        ),
+    ],
+)
+def test_anthropic_lowers_legacy_search_tools_to_bash(name, tool_input, expected_command):
+    parsed = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": name, "input": tool_input}])
+
+    blocks, stop_reason, manager_message = anthropic._build_reply_parts(parsed, "stop")
+
+    assert stop_reason == "tool_use"
+    assert blocks[0]["name"] == "Bash"
+    assert blocks[0]["input"]["command"] == expected_command
+    assert manager_message["tool_calls"] == [
+        {"type": "function", "function": {"name": "Bash", "arguments": blocks[0]["input"]}}
+    ]
+
+
+def test_anthropic_keeps_supported_tools_unchanged():
+    tool_input = {"file_path": "/testbed/example.py"}
+    parsed = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": "Read", "input": tool_input}])
+
+    blocks, stop_reason, manager_message = anthropic._build_reply_parts(parsed, "stop")
+
+    assert stop_reason == "tool_use"
+    assert blocks[0]["name"] == "Read"
+    assert blocks[0]["input"] == tool_input
+    assert manager_message["tool_calls"] == [
+        {"type": "function", "function": {"name": "Read", "arguments": tool_input}}
     ]
 
 

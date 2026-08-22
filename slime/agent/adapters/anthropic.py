@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import shlex
 from typing import Any
 
 from aiohttp import web
@@ -198,6 +199,73 @@ def _tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] | None:
 # --- Reply building: parsed output -> Anthropic blocks + manager_message ---
 
 
+def _lower_search_tool(tool_use: dict[str, Any]) -> dict[str, Any]:
+    """Lower legacy Grep/Glob calls to Bash tools available in Claude Code."""
+    name = tool_use.get("name")
+    if name not in {"Grep", "Glob"}:
+        return tool_use
+
+    tool_input = tool_use.get("input")
+    args = tool_input if isinstance(tool_input, dict) else {}
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        command = f"printf '%s\\n' {shlex.quote(f'{name} requires a non-empty pattern')} >&2; exit 2"
+    elif name == "Glob":
+        path = args.get("path") if isinstance(args.get("path"), str) and args.get("path") else "."
+        normalized_pattern = pattern.replace("**/", "")
+        match_flag = "-path" if "/" in normalized_pattern else "-name"
+        match_pattern = f"*/{normalized_pattern}" if match_flag == "-path" else normalized_pattern
+        command = f"{shlex.join(['find', path, '-type', 'f', match_flag, match_pattern])} | head -n 100"
+    else:
+        path = args.get("path") if isinstance(args.get("path"), str) and args.get("path") else "."
+        output_mode = args.get("output_mode")
+        grep_args = ["grep", "-R"]
+        if output_mode == "content":
+            if args.get("-n", True) not in (False, "false", "False", "0"):
+                grep_args.append("-n")
+            for option in ("-B", "-A", "-C"):
+                if isinstance(args.get(option), (int, str)):
+                    grep_args.extend([option, str(args[option])])
+            if isinstance(args.get("context"), (int, str)):
+                grep_args.extend(["-C", str(args["context"])])
+        elif output_mode == "count":
+            grep_args.append("-c")
+        else:
+            grep_args.append("-l")
+        if args.get("-i") in (True, "true", "True", "1"):
+            grep_args.append("-i")
+        if args.get("-o") in (True, "true", "True", "1"):
+            grep_args.append("-o")
+        glob = args.get("glob")
+        if isinstance(glob, str) and glob:
+            grep_args.append(f"--include={glob}")
+        elif isinstance(args.get("type"), str) and args["type"]:
+            grep_args.append(f"--include=*.{args['type']}")
+        grep_args.extend(["--", pattern, path])
+
+        try:
+            offset = max(0, int(args.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            head_limit = max(0, int(args.get("head_limit", 250)))
+        except (TypeError, ValueError):
+            head_limit = 250
+        command = shlex.join(grep_args)
+        if head_limit:
+            command += f" | sed -n {offset + 1},{offset + head_limit}p"
+        elif offset:
+            command += f" | tail -n +{offset + 1}"
+
+    return {
+        "name": "Bash",
+        "input": {
+            "command": command,
+            "description": "Search file contents" if name == "Grep" else "Match file paths",
+        },
+    }
+
+
 def _build_reply_parts(
     parsed: ParsedModelOutput,
     finish: str,
@@ -216,6 +284,7 @@ def _build_reply_parts(
 
     manager_tcs: list[dict] = []
     for tu in parsed.tool_uses:
+        tu = _lower_search_tool(tu)
         tu_id = f"toolu_{secrets.token_hex(8)}"
         blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
         # tu_id is wire-only; tool_call_dict drops it so the leaf matches its echo
