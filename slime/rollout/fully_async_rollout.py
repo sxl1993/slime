@@ -192,12 +192,15 @@ class AsyncRolloutWorker:
                 return
             if not isinstance(result, list):
                 logger.warning(
-                    "fully-async: generate_and_rm_group returned %r, expected list[Sample]; dropping",
+                    "fully-async: generate_and_rm_group returned %r, expected list[Sample] or list[list[Sample]]; dropping",
                     type(result).__name__,
                 )
                 return
             # Aborted group → requeue, don't ship to training.
-            if any(getattr(s, "status", None) == Sample.Status.ABORTED for s in result):
+            samples = (
+                (sample for group in result for sample in group) if result and isinstance(result[0], list) else result
+            )
+            if any(getattr(sample, "status", None) == Sample.Status.ABORTED for sample in samples):
                 try:
                     self.data_buffer.add_samples([result])
                 except Exception:  # noqa: BLE001
@@ -249,7 +252,9 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             last_log = now
 
     # Order by sample.index for determinism (slime convention).
-    def _key(group: list[Sample]) -> int:
+    def _key(group: list[Sample] | list[list[Sample]]) -> int:
+        if group and isinstance(group[0], list):
+            group = group[0]
         for s in group:
             idx = getattr(s, "index", None)
             if idx is not None:

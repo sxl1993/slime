@@ -4,15 +4,17 @@ The module docstring of ``slime.rollout.fully_async_rollout`` promises that the
 worker's output queue "stays warm" across ``generate_rollout`` calls: each call
 takes ``rollout_batch_size`` completed groups and leaves the rest queued.
 
-Three behaviours are pinned here:
+Four behaviours are pinned here:
 
   1. ``_generate_rollout_async`` consumes exactly ``rollout_batch_size`` groups
      and leaves the surplus in the queue. (It used to drain the whole queue and
      slice — throwing away fully generated, reward-scored groups whose prompts
      had already been consumed from the data buffer.)
-  2. The task done-callback never blocks. It runs on the event-loop thread, so
+  2. An aborted sample inside a nested fan-out group is requeued instead of
+     being sent to training.
+  3. The task done-callback never blocks. It runs on the event-loop thread, so
      a bounded queue that filled up would freeze every in-flight generation.
-  3. Backpressure exists anyway: ``_loop`` stops pulling new prompts while a
+  4. Backpressure exists anyway: ``_loop`` stops pulling new prompts while a
      full pool of completed groups is already waiting to be consumed.
 """
 
@@ -44,7 +46,6 @@ import pytest
 
 import slime.rollout.fully_async_rollout as fa
 from slime.utils.types import Sample
-
 
 NUM_GPUS = 0
 
@@ -102,6 +103,21 @@ def test_rollout_takes_target_groups_and_leaves_surplus_queued(monkeypatch):
 
 
 @pytest.mark.unit
+def test_rollout_sorts_nested_fanout_groups_by_sample_index(monkeypatch):
+    worker = _make_worker(monkeypatch)
+    for gid, index in enumerate((30, 10, 20, 0)):
+        sample = Sample(index=index, rollout_id=index, prompt=f"p{index}")
+        sample.status = Sample.Status.COMPLETED
+        worker.output_queue.put((gid, [[sample]]))
+    monkeypatch.setattr(fa, "_get_global_worker", lambda args, data_buffer: worker)
+
+    args = SimpleNamespace(rollout_global_dataset=True, rollout_batch_size=4)
+    out = asyncio.run(fa._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert [group[0][0].index for group in out] == [0, 10, 20, 30]
+
+
+@pytest.mark.unit
 def test_get_completed_groups_limit(monkeypatch):
     worker = _make_worker(monkeypatch)
     for gid in range(5):
@@ -110,6 +126,23 @@ def test_get_completed_groups_limit(monkeypatch):
     assert [gid for gid, _ in worker.get_completed_groups(limit=2)] == [0, 1]
     assert [gid for gid, _ in worker.get_completed_groups()] == [2, 3, 4]
     assert worker.get_completed_groups(limit=3) == []
+
+
+@pytest.mark.unit
+def test_done_callback_requeues_nested_fanout_group_with_aborted_sample(monkeypatch):
+    data_buffer = _FakeDataBuffer([])
+    worker = _make_worker(monkeypatch, data_buffer=data_buffer)
+    sample = Sample(index=7, rollout_id=7, prompt="p7")
+    sample.status = Sample.Status.ABORTED
+
+    class _DoneTask:
+        def result(self):
+            return [[sample]]
+
+    worker._make_done_cb(0)(_DoneTask())
+
+    assert data_buffer.requeued == [[[sample]]]
+    assert worker.queue_size() == 0
 
 
 @pytest.mark.unit
