@@ -271,9 +271,15 @@ def _is_normalization_parameter(name: str) -> bool:
 
 
 def _freeze_sao_critic_attention_params(model: GPTModel) -> None:
+    frozen_names = []
+    frozen_params = []
     for name, param in model.named_parameters():
         if "self_attention" in name.split(".") and not _is_normalization_parameter(name):
             param.requires_grad = False
+            frozen_names.append(name)
+            frozen_params.append(param)
+    model._slime_sao_frozen_attention_param_names = tuple(frozen_names)
+    model._slime_sao_frozen_attention_params = tuple(frozen_params)
 
 
 def freeze_model_params(model: GPTModel, args: argparse.Namespace, role: str = "actor"):

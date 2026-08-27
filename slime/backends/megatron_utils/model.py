@@ -244,6 +244,101 @@ def _disable_distributed_optimizer_state_initialization(optimizer: MegatronOptim
             megatron_optimizer.init_state_fn = _noop_init_state_fn
 
 
+def _iter_unwrapped_model_chunks(model: Sequence[DDP]):
+    unwrapped_model = unwrap_model(model)
+    if isinstance(unwrapped_model, torch.nn.Module):
+        yield unwrapped_model
+    else:
+        yield from unwrapped_model
+
+
+def _iter_optimizer_parameters(optimizer: MegatronOptimizer):
+    optimizers = [optimizer, *(getattr(optimizer, "chained_optimizers", None) or [])]
+    seen_optimizers = set()
+    seen_parameters = set()
+    for current_optimizer in optimizers:
+        if id(current_optimizer) in seen_optimizers:
+            continue
+        seen_optimizers.add(id(current_optimizer))
+        param_groups = getattr(current_optimizer, "param_groups", None)
+        if param_groups is None:
+            inner_optimizer = getattr(current_optimizer, "optimizer", None)
+            param_groups = getattr(inner_optimizer, "param_groups", [])
+        for param_group in param_groups:
+            for parameter in param_group.get("params", []):
+                if id(parameter) not in seen_parameters:
+                    seen_parameters.add(id(parameter))
+                    yield parameter
+
+
+def _sao_freeze_category(name: str) -> str | None:
+    parts = name.split(".")
+    if any("norm" in part.lower() for part in parts):
+        return "normalization"
+    if "self_attention" in parts:
+        return None
+    if any("mlp" in part.lower() for part in parts):
+        return "MLP"
+    if any(token in part.lower() for part in parts for token in ("output_layer", "value_head", "value_output")):
+        return "value-output"
+    return "outside self-attention"
+
+
+def _get_local_rank() -> str:
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        return local_rank
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return str(torch.distributed.get_rank())
+    return "0"
+
+
+def validate_sao_critic_optimizer_parameters(
+    model: Sequence[DDP], optimizer: MegatronOptimizer, role: str = "critic"
+) -> tuple[int, int]:
+    """Validate SAO critic-specific frozen parameters against optimizer membership."""
+    frozen_names = []
+    frozen_parameters = []
+    for model_chunk in _iter_unwrapped_model_chunks(model):
+        frozen_names.extend(getattr(model_chunk, "_slime_sao_frozen_attention_param_names", ()))
+        frozen_parameters.extend(getattr(model_chunk, "_slime_sao_frozen_attention_params", ()))
+
+    unexpected_categories = [
+        f"{name} ({category})" for name in frozen_names if (category := _sao_freeze_category(name)) is not None
+    ]
+    if unexpected_categories:
+        raise RuntimeError(
+            "SAO-specific freeze unexpectedly includes normalization, MLP, or value-output parameter(s): "
+            + ", ".join(unexpected_categories)
+        )
+
+    if any(parameter.requires_grad for parameter in frozen_parameters):
+        raise RuntimeError("SAO-frozen attention parameter remains trainable")
+
+    optimizer_parameters = list(_iter_optimizer_parameters(optimizer))
+    optimizer_parameter_ids = {id(parameter) for parameter in optimizer_parameters}
+    optimizer_leaks = [
+        name
+        for name, parameter in zip(frozen_names, frozen_parameters, strict=True)
+        if id(parameter) in optimizer_parameter_ids
+    ]
+    if optimizer_leaks:
+        raise RuntimeError(
+            "SAO-frozen attention parameter is present in the critic optimizer: " + ", ".join(optimizer_leaks)
+        )
+
+    frozen_numel = sum(parameter.numel() for parameter in {id(p): p for p in frozen_parameters}.values())
+    optimizer_numel = sum(parameter.numel() for parameter in optimizer_parameters)
+    logger.info(
+        "SAO critic parameter diagnostics: role=%s local_rank=%s frozen_attention_numel=%d optimizer_numel=%d",
+        role,
+        _get_local_rank(),
+        frozen_numel,
+        optimizer_numel,
+    )
+    return frozen_numel, optimizer_numel
+
+
 @contextmanager
 def _patch_megatron_adam(adam_cls):
     import megatron.core.optimizer as megatron_optimizer
@@ -317,6 +412,8 @@ def setup_model_and_optimizer(
         )
     if args.use_stateless_adam:
         _disable_distributed_optimizer_state_initialization(optimizer)
+    if role == "critic" and getattr(args, "sao_critic_freeze_attention", False):
+        validate_sao_critic_optimizer_parameters(model, optimizer, role=role)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 
