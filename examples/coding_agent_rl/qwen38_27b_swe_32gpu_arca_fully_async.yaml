@@ -1,0 +1,125 @@
+# Qwen3.8-27B SWE coding-agent RL
+# Derived from run_qwen38_27b_swe_32gpu_arca_fully_async.sh.
+#
+# This is an ATinker/Slime flat config.  Paths below are container paths and
+# must be visible from both the train and rollout services.
+# ARCA/Theta credentials, Ray addresses, RUN_ROOT, and network variables stay
+# in the launcher/environment and are intentionally not stored here.
+
+# ATinker / Slime
+slime_root: /personal/muchen/slime-sao
+use-dynamic-batch-size: true
+
+# Model spec: scripts/models/qwen3.5-27B.sh
+spec:
+  - slime_plugins.models.qwen3_5
+  - get_qwen3_5_spec
+disable-bias-linear: true
+qk-layernorm: true
+group-query-attention: true
+num-attention-heads: 24
+num-query-groups: 4
+kv-channels: 256
+num-layers: 64
+hidden-size: 5120
+ffn-hidden-size: 17408
+normalization: RMSNorm
+apply-layernorm-1p: true
+position-embedding-type: rope
+norm-epsilon: 1e-6
+rotary-percent: 0.25
+swiglu: true
+untie-embeddings-and-output-weights: true
+vocab-size: 248320
+rotary-base: 10000000
+attention-output-gate: true
+
+# Cluster: 16 train GPUs + 16 rollout GPUs
+actor-num-nodes: 2
+actor-num-gpus-per-node: 8
+num-gpus-per-node: 8
+rollout-num-gpus: 16
+rollout-num-gpus-per-engine: 4
+
+# Checkpoint
+hf-checkpoint: /mnt/amedelastic-m/common/ckpt/muchen/Qwen3.8-27B
+ref-load: /mnt/amedelastic-m/common/ckpt/muchen/Qwen3.8-27B_torch_dist
+save: /mnt/amedelastic-m/common/ckpt/muchen/Qwen3.8-27B_slime-fully-async
+save-interval: 100
+
+# SWE coding-agent rollout
+rollout-function-path: slime.rollout.fully_async_rollout.generate_rollout_fully_async
+custom-generate-function-path: examples.coding_agent_rl.generate.generate
+prompt-data: /personal/muchen/code_agent_data/swe_verified_v5.jsonl
+input-key: prompt
+label-key: label
+metadata-key: metadata
+apply-chat-template: true
+num-rollout: 300
+rollout-batch-size: 8
+n-samples-per-prompt: 1
+rollout-max-context-len: 65536
+rollout-max-response-len: 8192
+rollout-temperature: 1.0
+rollout-stop-token-ids:
+  - 248046
+  - 248044
+num-steps-per-rollout: 1
+
+# Parallelism / performance
+tensor-model-parallel-size: 4
+sequence-parallel: true
+pipeline-model-parallel-size: 2
+context-parallel-size: 2
+recompute-granularity: full
+recompute-method: uniform
+recompute-num-layers: 1
+max-tokens-per-gpu: 8192
+qkv-format: thd
+
+# SAO
+advantage-estimator: sao
+sao-batch-size: 8
+sao-critic-update-ratio: 2
+sao-critic-freeze-attention: true
+sao-critic-warmup-steps: 10
+sao-gae-alpha: 1.5
+sao-skip-observation-gae: true
+sao-dis-clip-low: 0.8
+sao-dis-clip-high: 3.0
+kl-loss-coef: 0.0
+kl-loss-type: low_var_kl
+kl-coef: 0.0
+entropy-coef: 0.0
+eps-clip: 0.2
+eps-clip-high: 0.28
+
+# Optimizer
+optimizer: adam
+lr: 1e-6
+lr-decay-style: constant
+weight-decay: 0.1
+adam-beta1: 0.9
+adam-beta2: 0.98
+
+# SGLang
+sglang-mem-fraction-static: 0.8
+sglang-context-length: 65536
+sglang-server-concurrency: 4
+sglang-page-size: 256
+sglang-max-running-requests: 128
+router-disable-retries: true
+sglang-disable-custom-all-reduce: true
+sglang-tool-call-parser: qwen3_coder
+sglang-reasoning-parser: qwen3
+
+# Logging / miscellaneous
+attention-dropout: 0.0
+hidden-dropout: 0.0
+log-interval: 10
+log-memory-interval: 10
+log-device-memory-used: true
+accumulate-allreduce-grads-in-fp32: true
+attention-softmax-in-fp32: true
+attention-backend: flash
+update-weights-interval: 1
