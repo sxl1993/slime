@@ -403,5 +403,18 @@ def test_force_fp8_ue8m0_scale_argument(monkeypatch):
     assert configured.force_fp8_ue8m0_scale is True
 
 
+@pytest.mark.unit
+def test_sao_critic_freeze_attention_argument(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(["--rollout-batch-size", "1", "--sao-critic-freeze-attention"])
+
+    assert defaults.sao_critic_freeze_attention is False
+    assert configured.sao_critic_freeze_attention is True
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
