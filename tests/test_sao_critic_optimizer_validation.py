@@ -109,6 +109,37 @@ def _trainable_optimizer(model):
     )
 
 
+def _critic_args():
+    return types.SimpleNamespace(
+        moe_use_upcycling=False,
+        load="/tmp/checkpoint",
+        pretrained_checkpoint=None,
+        num_rollout=1,
+        use_stateless_adam=False,
+        enable_gloo_process_groups=False,
+        sao_critic_freeze_attention=True,
+        only_train_params_name_list=None,
+        freeze_params_name_list=None,
+        freeze_indexer=False,
+    )
+
+
+def _setup_model_and_optimizer(monkeypatch, model_module, model_provider, model, args, optimizer):
+    def provider():
+        model_provider.freeze_model_params(model, args, role="critic")
+        return model
+
+    monkeypatch.setattr(model_module, "get_model_provider_func", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(model_module, "get_model", lambda provider_func, *args, **kwargs: [provider_func()])
+    monkeypatch.setattr(
+        model_module,
+        "get_megatron_optimizer",
+        lambda **kwargs: optimizer() if callable(optimizer) else optimizer,
+    )
+    monkeypatch.setattr(model_module, "get_optimizer_param_scheduler", lambda args, optimizer: "scheduler")
+    return model_module.setup_model_and_optimizer(args, role="critic")
+
+
 @pytest.mark.unit
 def test_sao_critic_optimizer_diagnostics_report_local_counts_and_exclude_frozen(monkeypatch, caplog):
     monkeypatch.delenv("LOCAL_RANK", raising=False)
@@ -116,8 +147,12 @@ def test_sao_critic_optimizer_diagnostics_report_local_counts_and_exclude_frozen
     model = _freeze_critic_attention(monkeypatch)
     optimizer = _trainable_optimizer(model)
 
-    expected_frozen_numel = sum(parameter.numel() for parameter in model._slime_sao_frozen_attention_params)
-    expected_optimizer_numel = sum(parameter.numel() for parameter in optimizer.param_groups[0]["params"])
+    expected_frozen_numel = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if "self_attention" in name.split(".") and not any("norm" in part.lower() for part in name.split("."))
+    )
+    expected_optimizer_numel = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
     with caplog.at_level(logging.INFO, logger=model_module.logger.name):
         frozen_numel, optimizer_numel = model_module.validate_sao_critic_optimizer_parameters(
@@ -126,7 +161,7 @@ def test_sao_critic_optimizer_diagnostics_report_local_counts_and_exclude_frozen
 
     assert (frozen_numel, optimizer_numel) == (expected_frozen_numel, expected_optimizer_numel)
     assert "role=critic" in caplog.text
-    assert "local_rank=0" in caplog.text
+    assert "local_rank=unknown" in caplog.text
     assert f"frozen_attention_numel={expected_frozen_numel}" in caplog.text
     assert f"optimizer_numel={expected_optimizer_numel}" in caplog.text
 
@@ -134,11 +169,13 @@ def test_sao_critic_optimizer_diagnostics_report_local_counts_and_exclude_frozen
 @pytest.mark.unit
 def test_sao_critic_optimizer_validation_rejects_frozen_parameter_membership(monkeypatch):
     model_module = _load_model_module(monkeypatch)
-    model = _freeze_critic_attention(monkeypatch)
+    model_provider = _load_model_provider(monkeypatch)
+    model = _AttentionModel()
+    args = _critic_args()
     optimizer = types.SimpleNamespace(param_groups=[{"params": list(model.parameters())}])
 
     with pytest.raises(RuntimeError, match="SAO-frozen attention parameter"):
-        model_module.validate_sao_critic_optimizer_parameters([model], optimizer, role="critic")
+        _setup_model_and_optimizer(monkeypatch, model_module, model_provider, model, args, optimizer)
 
 
 @pytest.mark.unit
@@ -146,22 +183,34 @@ def test_sao_critic_optimizer_validation_rejects_frozen_parameter_membership(mon
     "bad_name",
     [
         "layers.0.self_attention.q_layernorm.weight",
+        "layers.0.self_attention.mlp.weight",
         "layers.0.mlp.weight",
         "output_layer.weight",
     ],
 )
 def test_sao_critic_optimizer_validation_rejects_unexpected_sao_freeze(monkeypatch, bad_name):
     model_module = _load_model_module(monkeypatch)
-    model = _freeze_critic_attention(monkeypatch)
-    bad_parameter = dict(model.named_parameters())[bad_name]
-    model._slime_sao_frozen_attention_param_names = (
-        *model._slime_sao_frozen_attention_param_names,
-        bad_name,
-    )
-    model._slime_sao_frozen_attention_params = (*model._slime_sao_frozen_attention_params, bad_parameter)
+    model_provider = _load_model_provider(monkeypatch)
+    model = _AttentionModel()
+    if bad_name == "layers.0.self_attention.mlp.weight":
+        model.layers[0].self_attention.mlp = torch.nn.Linear(2, 2, bias=False)
+    args = _critic_args()
+    original_freeze = model_provider._freeze_sao_critic_attention_params
+
+    def freeze_with_bad_parameter(model):
+        original_freeze(model)
+        bad_parameter = dict(model.named_parameters())[bad_name]
+        bad_parameter.requires_grad = False
+        model._slime_sao_frozen_attention_param_names = (
+            *model._slime_sao_frozen_attention_param_names,
+            bad_name,
+        )
+        model._slime_sao_frozen_attention_params = (*model._slime_sao_frozen_attention_params, bad_parameter)
+
+    monkeypatch.setattr(model_provider, "_freeze_sao_critic_attention_params", freeze_with_bad_parameter)
 
     with pytest.raises(RuntimeError, match="normalization|MLP|value-output"):
-        model_module.validate_sao_critic_optimizer_parameters([model], _trainable_optimizer(model), role="critic")
+        _setup_model_and_optimizer(monkeypatch, model_module, model_provider, model, args, _trainable_optimizer(model))
 
 
 @pytest.mark.unit
@@ -184,25 +233,22 @@ def test_existing_global_freeze_is_not_reported_as_sao_violation(monkeypatch):
 def test_setup_model_and_optimizer_runs_sao_validation_after_optimizer_creation(monkeypatch, caplog):
     monkeypatch.delenv("LOCAL_RANK", raising=False)
     model_module = _load_model_module(monkeypatch)
-    model = _freeze_critic_attention(monkeypatch)
-    optimizer = _trainable_optimizer(model)
-    monkeypatch.setattr(model_module, "get_model", lambda *args, **kwargs: [model])
-    monkeypatch.setattr(model_module, "get_megatron_optimizer", lambda **kwargs: optimizer)
-    monkeypatch.setattr(model_module, "get_optimizer_param_scheduler", lambda args, optimizer: "scheduler")
-    args = types.SimpleNamespace(
-        moe_use_upcycling=False,
-        load="/tmp/checkpoint",
-        pretrained_checkpoint=None,
-        num_rollout=1,
-        use_stateless_adam=False,
-        enable_gloo_process_groups=False,
-        sao_critic_freeze_attention=True,
-    )
+    model_provider = _load_model_provider(monkeypatch)
+    model = _AttentionModel()
+    args = _critic_args()
+    created_optimizers = []
+
+    def build_optimizer():
+        optimizer = _trainable_optimizer(model)
+        created_optimizers.append(optimizer)
+        return optimizer
 
     with caplog.at_level(logging.INFO, logger=model_module.logger.name):
-        returned_model, returned_optimizer, scheduler = model_module.setup_model_and_optimizer(args, role="critic")
+        returned_model, returned_optimizer, scheduler = _setup_model_and_optimizer(
+            monkeypatch, model_module, model_provider, model, args, build_optimizer
+        )
 
     assert returned_model == [model]
-    assert returned_optimizer is optimizer
+    assert returned_optimizer is created_optimizers[0]
     assert scheduler == "scheduler"
     assert "SAO critic parameter diagnostics" in caplog.text

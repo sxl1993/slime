@@ -275,22 +275,17 @@ def _sao_freeze_category(name: str) -> str | None:
     parts = name.split(".")
     if any("norm" in part.lower() for part in parts):
         return "normalization"
-    if "self_attention" in parts:
-        return None
     if any("mlp" in part.lower() for part in parts):
         return "MLP"
     if any(token in part.lower() for part in parts for token in ("output_layer", "value_head", "value_output")):
         return "value-output"
+    if "self_attention" in parts:
+        return None
     return "outside self-attention"
 
 
 def _get_local_rank() -> str:
-    local_rank = os.environ.get("LOCAL_RANK")
-    if local_rank is not None:
-        return local_rank
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return str(torch.distributed.get_rank())
-    return "0"
+    return os.environ.get("LOCAL_RANK", "unknown")
 
 
 def validate_sao_critic_optimizer_parameters(
