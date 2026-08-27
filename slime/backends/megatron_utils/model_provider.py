@@ -239,7 +239,7 @@ def _get_model_provider_func(
     return model_provider
 
 
-def wrap_model_provider_with_freeze(original_provider, args):
+def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
     def wrapped_provider(
         pre_process=True,
         post_process=True,
@@ -255,7 +255,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
                 provider_kwargs[key] = kwargs.get(key, None)
 
         model = original_provider(**provider_kwargs)
-        freeze_model_params(model, args)
+        freeze_model_params(model, args, role=role)
 
         return model
 
@@ -263,10 +263,20 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
 
 def get_model_provider_func(args, role="actor"):
-    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args, role=role)
 
 
-def freeze_model_params(model: GPTModel, args: argparse.Namespace):
+def _is_normalization_parameter(name: str) -> bool:
+    return any("norm" in part.lower() for part in name.split("."))
+
+
+def _freeze_sao_critic_attention_params(model: GPTModel) -> None:
+    for name, param in model.named_parameters():
+        if "self_attention" in name.split(".") and not _is_normalization_parameter(name):
+            param.requires_grad = False
+
+
+def freeze_model_params(model: GPTModel, args: argparse.Namespace, role: str = "actor"):
     if getattr(args, "only_train_params_name_list", None):
         for name, param in model.named_parameters():
             param.requires_grad = False
@@ -300,3 +310,6 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
         # Some pipeline stages may legitimately own no indexer weights, so an
         # empty local tuple is not itself an error.
         model._slime_frozen_indexer_param_names = tuple(frozen_indexer_params)
+
+    if role == "critic" and getattr(args, "sao_critic_freeze_attention", False):
+        _freeze_sao_critic_attention_params(model)

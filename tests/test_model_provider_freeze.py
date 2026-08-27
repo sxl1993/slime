@@ -84,6 +84,38 @@ class _Model(torch.nn.Module):
         self.output_layer = torch.nn.Linear(2, 2, bias=False)
 
 
+class _FullAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_qkv = torch.nn.Linear(2, 2, bias=False)
+        self.linear_proj = torch.nn.Linear(2, 2, bias=False)
+        self.q_layernorm = torch.nn.LayerNorm(2)
+        self.k_layernorm = torch.nn.LayerNorm(2)
+
+
+class _LinearAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_layernorm = torch.nn.LayerNorm(2)
+        self.linear_attn = torch.nn.Module()
+        self.linear_attn.conv1d = torch.nn.Conv1d(2, 2, 1, bias=False)
+        self.linear_attn.in_proj_qkv = torch.nn.Linear(2, 2, bias=False)
+        self.linear_attn.in_proj_z = torch.nn.Linear(2, 2, bias=False)
+        self.linear_attn.in_proj_b = torch.nn.Linear(2, 2, bias=False)
+        self.linear_attn.in_proj_a = torch.nn.Linear(2, 2, bias=False)
+        self.linear_attn.dt_bias = torch.nn.Parameter(torch.ones(2))
+        self.linear_attn.A_log = torch.nn.Parameter(torch.ones(2))
+        self.linear_attn.norm = torch.nn.LayerNorm(2)
+        self.linear_attn.out_proj = torch.nn.Linear(2, 2, bias=False)
+
+
+class _AttentionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_Layer(_FullAttention()), _Layer(_LinearAttention())])
+        self.output_layer = torch.nn.Linear(2, 1, bias=False)
+
+
 @pytest.mark.unit
 def test_freeze_indexer_covers_glm_and_upstream_dsa_names(monkeypatch):
     model_provider = _load_model_provider(monkeypatch)
@@ -121,6 +153,71 @@ def test_freeze_indexer_rejects_unrecognized_attention(monkeypatch):
 
     with pytest.raises(RuntimeError, match="no recognized DSA indexer"):
         model_provider.freeze_model_params(model, args)
+
+
+@pytest.mark.unit
+def test_sao_critic_attention_freeze_preserves_norms_and_non_attention_params(monkeypatch):
+    model_provider = _load_model_provider(monkeypatch)
+    model = _AttentionModel()
+    args = types.SimpleNamespace(
+        only_train_params_name_list=None,
+        freeze_params_name_list=None,
+        freeze_indexer=False,
+        sao_critic_freeze_attention=True,
+    )
+
+    model_provider.wrap_model_provider_with_freeze(
+        lambda pre_process=True, post_process=True: model,
+        args,
+        role="critic",
+    )()
+
+    frozen = {name for name, parameter in model.named_parameters() if not parameter.requires_grad}
+    assert frozen == {
+        "layers.0.self_attention.linear_qkv.weight",
+        "layers.0.self_attention.linear_proj.weight",
+        "layers.1.self_attention.linear_attn.conv1d.weight",
+        "layers.1.self_attention.linear_attn.in_proj_qkv.weight",
+        "layers.1.self_attention.linear_attn.in_proj_z.weight",
+        "layers.1.self_attention.linear_attn.in_proj_b.weight",
+        "layers.1.self_attention.linear_attn.in_proj_a.weight",
+        "layers.1.self_attention.linear_attn.dt_bias",
+        "layers.1.self_attention.linear_attn.A_log",
+        "layers.1.self_attention.linear_attn.out_proj.weight",
+    }
+
+    for name, parameter in model.named_parameters():
+        if name not in frozen:
+            assert parameter.requires_grad, name
+
+
+@pytest.mark.unit
+def test_sao_critic_attention_freeze_is_opt_in_and_critic_only(monkeypatch):
+    model_provider = _load_model_provider(monkeypatch)
+    args = types.SimpleNamespace(
+        only_train_params_name_list=None,
+        freeze_params_name_list=None,
+        freeze_indexer=False,
+        sao_critic_freeze_attention=True,
+    )
+
+    disabled_model = _AttentionModel()
+    disabled_args = types.SimpleNamespace(**vars(args))
+    disabled_args.sao_critic_freeze_attention = False
+    model_provider.wrap_model_provider_with_freeze(
+        lambda pre_process=True, post_process=True: disabled_model,
+        disabled_args,
+        role="critic",
+    )()
+    assert all(parameter.requires_grad for parameter in disabled_model.parameters())
+
+    actor_model = _AttentionModel()
+    model_provider.wrap_model_provider_with_freeze(
+        lambda pre_process=True, post_process=True: actor_model,
+        args,
+        role="actor",
+    )()
+    assert all(parameter.requires_grad for parameter in actor_model.parameters())
 
 
 if __name__ == "__main__":
