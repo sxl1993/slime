@@ -28,10 +28,6 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 
-from aiohttp import web
-
-from slime.agent.adapters.common import TurnRecord
-
 # ---------------------------------------------------------------------------
 # Tokenizers
 # ---------------------------------------------------------------------------
@@ -146,29 +142,43 @@ class FakeSGLangServer:
     Use as an async context manager; ``.url`` is the base url to hand the adapter.
     """
 
-    def __init__(self, turns: list[list[tuple[float, int]]], *, finish_reason: str = "stop") -> None:
+    def __init__(
+        self,
+        turns: list[list[tuple[float, int]]],
+        *,
+        finish_reason: str = "stop",
+        cached_tokens: list[int] | None = None,
+    ) -> None:
         self.turns = [list(t) for t in turns]
         self.finish_reason = finish_reason
+        self.cached_tokens = list(cached_tokens or [])
         self.requests: list[dict] = []
         self.routing_keys: list[str | None] = []
-        self._server: web.Application | None = None
+        self._server = None
         self._runner = None
 
-    async def _handle(self, request: web.Request) -> web.Response:
+    async def _handle(self, request):
+        from aiohttp import web
+
         self.routing_keys.append(request.headers.get("X-SMG-Routing-Key"))
-        self.requests.append(await request.json())
+        body = await request.json()
+        self.requests.append(body)
         assert self.turns, "unexpected /generate call (turn script exhausted)"
         pairs = self.turns.pop(0)
+        cached_tokens = self.cached_tokens.pop(0) if self.cached_tokens else 0
         return web.json_response(
             {
                 "meta_info": {
                     "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
                     "finish_reason": {"type": self.finish_reason},
+                    "cached_tokens": cached_tokens,
+                    "prompt_tokens": len(body["input_ids"]),
                 }
             }
         )
 
     async def __aenter__(self) -> FakeSGLangServer:
+        from aiohttp import web
         from aiohttp.test_utils import TestServer
 
         app = web.Application()
@@ -194,7 +204,9 @@ def fake_call_sglang_generate(scripted: list[tuple[str, str, list[float] | None]
     """
     queue = list(scripted)
 
-    async def _fake(prompt_ids, session, body, *, adapter, session_id=None) -> TurnRecord:
+    async def _fake(prompt_ids, session, body, *, adapter, session_id=None):
+        from slime.agent.adapters.common import TurnRecord
+
         assert queue, "unexpected sglang /generate call (response script exhausted)"
         text, finish, logprobs = queue.pop(0)
         output_ids = tokenizer.encode(text)
@@ -242,6 +254,10 @@ class FakeSandbox:
     ) -> None:
         self.image = image
         self.sandbox_id = f"fake-{image}"
+        self.work_user = "agent"
+        self.privileged_user = "root"
+        self.home_dir = "/home/agent"
+        self.cli_preinstalled = False
         self.on_launch = on_launch
         # ordered (substring -> (exit, stdout, stderr)) overrides, first match wins.
         self.responses = list(responses or [])
@@ -262,6 +278,9 @@ class FakeSandbox:
 
     async def __aexit__(self, *exc) -> None:
         return None
+
+    async def destroy(self) -> bool:
+        return True
 
     async def exec(self, cmd, *, user="root", env=None, timeout=120, check=False, idempotent=True):
         self.exec_log.append((cmd, user))

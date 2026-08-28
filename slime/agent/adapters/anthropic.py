@@ -19,12 +19,14 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import shlex
 from typing import Any
 
 from aiohttp import web
 
 from slime.agent.adapters.common import (
     BaseAdapter,
+    ContextWindowExceeded,
     Reply,
     flatten_content,
     manager_finish_reason,
@@ -34,6 +36,8 @@ from slime.agent.adapters.common import (
 from slime.agent.parsing import ParsedModelOutput
 
 logger = logging.getLogger(__name__)
+
+_TOOL_RESULT_TRUNCATION_MARKER = "\n...[tool result truncated]...\n"
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -45,18 +49,28 @@ class AnthropicAdapter(BaseAdapter):
     max_token_keys = ("max_tokens",)
     stop_keys = ("stop_sequences",)
 
+    def __init__(self, *, max_tool_result_chars: int | None = None, **kwargs) -> None:
+        if max_tool_result_chars is not None and max_tool_result_chars <= 0:
+            raise ValueError("max_tool_result_chars must be positive")
+        super().__init__(**kwargs)
+        self.max_tool_result_chars = max_tool_result_chars
+
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_post("/v1/messages", self._run_turn)
-        app.router.add_post("/v1/messages/count_tokens", _count_tokens)
+        app.router.add_post("/v1/messages/count_tokens", self._count_tokens)
 
     def _session_id(self, request: web.Request, body: dict) -> str:
-        return _request_session_id(request)
+        return _request_session_id(request, body)
 
     def _preprocess_body(self, body: dict) -> None:
         _fold_mid_list_system_into_user(body)
 
     def _translate(self, body: dict) -> tuple[list[dict], list[dict] | None]:
-        translated = _translate_messages(body.get("messages") or [], body.get("system"))
+        translated = _translate_messages(
+            body.get("messages") or [],
+            body.get("system"),
+            max_tool_result_chars=self.max_tool_result_chars,
+        )
         tools_schema = _tools_to_chat_tools(body.get("tools"))
         return translated, tools_schema
 
@@ -74,11 +88,51 @@ class AnthropicAdapter(BaseAdapter):
             return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
         return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok))
 
+    def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
+        return web.json_response(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        f"Prompt is too long: {error.prompt_tokens} input tokens plus "
+                        f"{error.output_tokens} requested output tokens exceeds the "
+                        f"{error.max_context_tokens} token context window"
+                    ),
+                },
+            },
+            status=400,
+        )
+
+    async def _count_tokens(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        self._preprocess_body(body)
+        _, _, prompt_ids = self._prepare_prompt(body)
+        return web.json_response({"input_tokens": len(prompt_ids)})
+
 
 # --- Translation (Anthropic wire -> chat-template messages) ---
 
 
-def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
+def _truncate_tool_result(content: str, max_chars: int | None) -> str:
+    if max_chars is None or len(content) <= max_chars:
+        return content
+    if max_chars <= len(_TOOL_RESULT_TRUNCATION_MARKER):
+        return content[:max_chars]
+
+    kept_chars = max_chars - len(_TOOL_RESULT_TRUNCATION_MARKER)
+    tail_chars = (kept_chars + 1) // 2
+    head_chars = kept_chars - tail_chars
+    tail = content[-tail_chars:] if tail_chars else ""
+    return content[:head_chars] + _TOOL_RESULT_TRUNCATION_MARKER + tail
+
+
+def _translate_messages(
+    msgs: list[dict],
+    system: Any,
+    *,
+    max_tool_result_chars: int | None = None,
+) -> list[dict]:
     """Anthropic messages + system -> chat-template messages. Pure function."""
     translated: list[dict] = []
     if system:
@@ -91,7 +145,8 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
             blocks = content if isinstance(content, list) else [{"type": "text", "text": flatten_content(content)}]
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    translated.append({"role": "tool", "content": flatten_content(b.get("content"))})
+                    tool_result = _truncate_tool_result(flatten_content(b.get("content")), max_tool_result_chars)
+                    translated.append({"role": "tool", "content": tool_result})
                 elif isinstance(b, dict) and b.get("type") == "text":
                     translated.append({"role": "user", "content": b.get("text", "")})
                 else:
@@ -144,6 +199,73 @@ def _tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] | None:
 # --- Reply building: parsed output -> Anthropic blocks + manager_message ---
 
 
+def _lower_search_tool(tool_use: dict[str, Any]) -> dict[str, Any]:
+    """Lower legacy Grep/Glob calls to Bash tools available in Claude Code."""
+    name = tool_use.get("name")
+    if name not in {"Grep", "Glob"}:
+        return tool_use
+
+    tool_input = tool_use.get("input")
+    args = tool_input if isinstance(tool_input, dict) else {}
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        command = f"printf '%s\\n' {shlex.quote(f'{name} requires a non-empty pattern')} >&2; exit 2"
+    elif name == "Glob":
+        path = args.get("path") if isinstance(args.get("path"), str) and args.get("path") else "."
+        normalized_pattern = pattern.replace("**/", "")
+        match_flag = "-path" if "/" in normalized_pattern else "-name"
+        match_pattern = f"*/{normalized_pattern}" if match_flag == "-path" else normalized_pattern
+        command = f"{shlex.join(['find', path, '-type', 'f', match_flag, match_pattern])} | head -n 100"
+    else:
+        path = args.get("path") if isinstance(args.get("path"), str) and args.get("path") else "."
+        output_mode = args.get("output_mode")
+        grep_args = ["grep", "-R"]
+        if output_mode == "content":
+            if args.get("-n", True) not in (False, "false", "False", "0"):
+                grep_args.append("-n")
+            for option in ("-B", "-A", "-C"):
+                if isinstance(args.get(option), (int, str)):
+                    grep_args.extend([option, str(args[option])])
+            if isinstance(args.get("context"), (int, str)):
+                grep_args.extend(["-C", str(args["context"])])
+        elif output_mode == "count":
+            grep_args.append("-c")
+        else:
+            grep_args.append("-l")
+        if args.get("-i") in (True, "true", "True", "1"):
+            grep_args.append("-i")
+        if args.get("-o") in (True, "true", "True", "1"):
+            grep_args.append("-o")
+        glob = args.get("glob")
+        if isinstance(glob, str) and glob:
+            grep_args.append(f"--include={glob}")
+        elif isinstance(args.get("type"), str) and args["type"]:
+            grep_args.append(f"--include=*.{args['type']}")
+        grep_args.extend(["--", pattern, path])
+
+        try:
+            offset = max(0, int(args.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            head_limit = max(0, int(args.get("head_limit", 250)))
+        except (TypeError, ValueError):
+            head_limit = 250
+        command = shlex.join(grep_args)
+        if head_limit:
+            command += f" | sed -n {offset + 1},{offset + head_limit}p"
+        elif offset:
+            command += f" | tail -n +{offset + 1}"
+
+    return {
+        "name": "Bash",
+        "input": {
+            "command": command,
+            "description": "Search file contents" if name == "Grep" else "Match file paths",
+        },
+    }
+
+
 def _build_reply_parts(
     parsed: ParsedModelOutput,
     finish: str,
@@ -162,6 +284,7 @@ def _build_reply_parts(
 
     manager_tcs: list[dict] = []
     for tu in parsed.tool_uses:
+        tu = _lower_search_tool(tu)
         tu_id = f"toolu_{secrets.token_hex(8)}"
         blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
         # tu_id is wire-only; tool_call_dict drops it so the leaf matches its echo
@@ -189,9 +312,19 @@ def _build_reply_parts(
 # --- Request framing: session id + wire response/stream rendering ---
 
 
-def _request_session_id(request: web.Request) -> str:
-    # Anthropic auth lands in Authorization: Bearer or X-Api-Key; the Messages
-    # body carries no sid hint. Bearer wins when both are present.
+def _request_session_id(request: web.Request, body: dict) -> str:
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict) and isinstance(user_id := metadata.get("user_id"), str):
+        try:
+            user = json.loads(user_id)
+        except json.JSONDecodeError:
+            user = None
+        if isinstance(user, dict) and isinstance(session_id := user.get("session_id"), str):
+            if session_id := session_id.strip():
+                return session_id
+
+    # Direct clients carry the sid in Anthropic auth. Theta rewrites these
+    # headers, so Claude Code metadata takes precedence when it is present.
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 
@@ -272,13 +405,6 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
     await out.write(f"event: message_stop\ndata: {json.dumps(mst_data, ensure_ascii=False)}\n\n".encode())
 
     return out
-
-
-# count_tokens runs every turn but the client uses it only as a hint, not a
-# hard budget, so returning 0 is fine.
-async def _count_tokens(request: web.Request) -> web.Response:
-    await request.read()
-    return web.json_response({"input_tokens": 0})
 
 
 # --- Anthropic-specific quirks: mid-list system folding ---
