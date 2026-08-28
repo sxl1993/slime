@@ -115,6 +115,38 @@ class TestMegatronRoleConfig:
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
 
+    def test_critic_lr_fallback_is_used_when_role_config_omits_lr(self):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {"name": "default", "role": "actor", "overrides": {"lr": "1e-6"}},
+                ]
+            }
+        )
+        args = _base_args(critic_lr=5e-6)
+
+        critic_args = parse_megatron_role_args(args, path, role="critic")
+
+        assert critic_args.lr == 5e-6
+
+    def test_explicit_critic_role_lr_overrides_fallback(self):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {"name": "default", "role": "critic", "overrides": {"lr": "7e-6"}},
+                ]
+            }
+        )
+        args = _base_args(critic_lr=5e-6)
+
+        critic_args = parse_megatron_role_args(args, path, role="critic")
+
+        assert critic_args.lr == 7e-6
+
     @pytest.mark.parametrize(
         "config",
         [

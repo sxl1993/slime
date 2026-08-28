@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.backends.megatron_utils.sao import compute_sao_dis_weights
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -780,6 +781,24 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
         )
 
+    elif args.advantage_estimator == "sao":
+        if values is None:
+            raise ValueError("SAO requires critic values")
+        old_rewards = rewards
+        token_level_rewards = [per_token_kl * (-args.kl_coef) for per_token_kl in kl]
+        advantages, returns = get_advantages_and_returns_batch(
+            total_lengths,
+            response_lengths,
+            values,
+            token_level_rewards,
+            args.gamma,
+            args.lambd,
+            loss_masks=loss_masks,
+            skip_observation=args.sao_skip_observation_gae,
+            length_adaptive_alpha=(args.sao_gae_alpha if args.sao_skip_observation_gae else None),
+            terminal_rewards=old_rewards,
+        )
+
     elif args.advantage_estimator == "reinforce_plus_plus":
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_reinforce_plus_plus_returns(
@@ -961,7 +980,12 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch.get("log_probs")
+    if args.advantage_estimator == "sao":
+        old_log_probs = batch.get("rollout_log_probs")
+        if old_log_probs is None:
+            raise ValueError("SAO requires rollout_log_probs")
+    else:
+        old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch.get("log_probs")
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -1031,7 +1055,16 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if args.advantage_estimator == "cispo":
+    if args.advantage_estimator == "sao":
+        _, sao_weights, sao_valid = compute_sao_dis_weights(
+            log_probs,
+            old_log_probs,
+            clip_low=args.sao_dis_clip_low,
+            clip_high=args.sao_dis_clip_high,
+        )
+        pg_loss = -sao_weights * advantages
+        pg_clipfrac = (~sao_valid).to(log_probs.dtype)
+    elif args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(
