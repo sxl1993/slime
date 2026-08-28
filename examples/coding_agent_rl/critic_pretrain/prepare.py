@@ -4,12 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
-from .data import CriticManifest, tokenizer_fingerprint, write_critic_artifact
+from .data import DEFAULT_MAX_SEQ_LENGTH, CriticManifest, tokenizer_fingerprint, write_critic_artifact
 
 DEFAULT_DATASET_NAME = "microsoft/Orchard"
 DEFAULT_DATASET_CONFIG = "swe"
 DEFAULT_DATASET_REVISION = "b642e9248ee3c0a87259193c5c5e6adc70322e9f"
-DEFAULT_MAX_SEQ_LENGTH = 98_304
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +35,7 @@ def _existing_manifest_is_compatible(path: Path, args, tokenizer) -> bool:
         and current.get("tokenizer_fingerprint") == tokenizer_fingerprint(tokenizer)
         and current.get("seed") == args.seed
         and current.get("max_per_instance") == args.max_per_instance
+        and current.get("max_seq_length") == args.max_seq_length
     )
 
 

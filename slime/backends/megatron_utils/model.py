@@ -807,7 +807,7 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
-) -> None:
+) -> float:
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -826,6 +826,9 @@ def train(
             ``num_microbatches``; consumed by ``train_one_step`` for loss
             scaling and LR scheduler increments. Equals per-step sample count
             in the common case (1 rollout = 1 sample).
+
+    Returns:
+        The last optimizer step's gradient norm.
     """
     args = get_args()
 
@@ -906,6 +909,7 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    last_grad_norm = float("nan")
     microbatch_pbar = tqdm(
         total=sum(num_microbatches),
         desc=f"{getattr(model[0], 'role', 'actor')} train",
@@ -931,6 +935,7 @@ def train(
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
         )
+        last_grad_norm = grad_norm
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -1033,6 +1038,7 @@ def train(
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+    return float(last_grad_norm)
 
 
 def save(

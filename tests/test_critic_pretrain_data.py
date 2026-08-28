@@ -156,8 +156,11 @@ def test_write_and_iterate_balanced_artifact(tmp_path: Path):
     assert manifest.lambd == 1.0
     assert manifest.max_per_instance == 4
     assert manifest.canary_count == 4
+    assert manifest.max_seq_length == 32
     assert (artifact_dir / "manifest.json").is_file()
     loaded = json.loads((artifact_dir / "manifest.json").read_text())
     assert loaded["schema_version"] == 1
+    assert loaded["max_seq_length"] == 32
     rows = list(iter_critic_records(artifact_dir, "train", limit=4))
     assert len(rows) == 4
+    assert rows[0].returns == [rows[0].reward] * rows[0].response_length

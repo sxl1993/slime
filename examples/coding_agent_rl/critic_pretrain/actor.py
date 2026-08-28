@@ -124,7 +124,7 @@ class CriticPretrainRayActor(MegatronTrainRayActor):
         self.args.loss_type = "custom_loss"
         self.args.custom_loss_function_path = "examples.coding_agent_rl.critic_pretrain.loss.critic_pretrain_loss"
         self.args.calculate_per_token_loss = False
-        megatron_train(
+        grad_norm = megatron_train(
             rollout_id,
             self.model,
             self.optimizer,
@@ -133,7 +133,34 @@ class CriticPretrainRayActor(MegatronTrainRayActor):
             rollout_data["num_microbatches"],
             rollout_data["global_batch_sizes"],
         )
-        return {}
+        return {"grad_norm": float(grad_norm)}
+
+    def reload_critic_checkpoint(self, path, step):
+        from slime.backends.megatron_utils.checkpoint import load_checkpoint
+
+        old_args = (
+            self.args.load,
+            self.args.ckpt_step,
+            self.args.no_load_optim,
+            self.args.no_load_rng,
+            self.args.finetune,
+        )
+        self.args.load = str(path)
+        self.args.ckpt_step = step
+        self.args.no_load_optim = True
+        self.args.no_load_rng = True
+        self.args.finetune = True
+        try:
+            iteration, _ = load_checkpoint(self.model, None, None, checkpointing_context={})
+            return iteration
+        finally:
+            (
+                self.args.load,
+                self.args.ckpt_step,
+                self.args.no_load_optim,
+                self.args.no_load_rng,
+                self.args.finetune,
+            ) = old_args
 
     def evaluate_critic(self, rollout_data_ref) -> dict[str, Any]:
         from .loss import ValueMetricAccumulator
@@ -162,6 +189,9 @@ if ray is not None:
 
         def async_evaluate(self, rollout_data_ref):
             return [actor.evaluate_critic.remote(rollout_data_ref) for actor in self._actor_handlers]
+
+        def reload_checkpoint(self, path, step):
+            return ray.get([actor.reload_critic_checkpoint.remote(path, step) for actor in self._actor_handlers])
 
 else:
 
