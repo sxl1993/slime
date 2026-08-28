@@ -26,8 +26,11 @@ from aiohttp import web
 from slime.agent.parsing import parse_model_output
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
 
-
 __all__ = ["TurnRecord"]
+
+
+_COMPACTION_MIN_DROP_TOKENS = 8192
+_COMPACTION_MIN_DROP_FRACTION = 0.25
 
 
 @dataclasses.dataclass
@@ -40,6 +43,10 @@ class Session:
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
+    last_prompt_tokens: int = 0
+    max_prompt_tokens: int = 0
+    compaction_count: int = 0
+    context_exceeded_count: int = 0
 
 
 @dataclasses.dataclass
@@ -53,6 +60,16 @@ class Reply:
     manager_message: dict
     finish_reason: str
     wire: Any
+
+
+class ContextWindowExceeded(Exception):
+    """The requested turn cannot fit its full output budget in the context."""
+
+    def __init__(self, *, prompt_tokens: int, output_tokens: int, max_context_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens = output_tokens
+        self.max_context_tokens = max_context_tokens
+        super().__init__(f"prompt={prompt_tokens} output_budget={output_tokens} max_context={max_context_tokens}")
 
 
 def _render_token_ids(
@@ -122,6 +139,16 @@ def manager_finish_reason(tool_uses: list[dict], raw_finish: str) -> str:
     """Finish reason stored on the manager turn: tool_calls if the turn called a
     tool, else the raw sglang finish."""
     return "tool_calls" if tool_uses else (raw_finish or "stop")
+
+
+def _is_prompt_compaction(previous_tokens: int, current_tokens: int) -> bool:
+    """Distinguish a real history compaction from minor prompt rewrites."""
+    dropped_tokens = previous_tokens - current_tokens
+    return (
+        previous_tokens > 0
+        and dropped_tokens >= _COMPACTION_MIN_DROP_TOKENS
+        and dropped_tokens / previous_tokens >= _COMPACTION_MIN_DROP_FRACTION
+    )
 
 
 class BaseAdapter:
@@ -205,6 +232,21 @@ class BaseAdapter:
     ) -> web.StreamResponse:
         raise NotImplementedError
 
+    def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
+        return web.json_response(
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": (
+                        f"Prompt is too long: {error.prompt_tokens} input tokens plus "
+                        f"{error.output_tokens} requested output tokens exceeds the "
+                        f"{error.max_context_tokens} token context window"
+                    ),
+                }
+            },
+            status=400,
+        )
+
     # -- session lifecycle ---------------------------------------------------
 
     def open_session(
@@ -242,6 +284,14 @@ class BaseAdapter:
         except Exception:
             self.logger.exception("[%s] sid=%s shutdown drain failed", self.log_prefix, sid)
 
+    def session_stats(self, sid: str) -> dict[str, int]:
+        session = self.store.get(sid)
+        return {
+            "compaction_count": int(getattr(session, "compaction_count", 0) or 0),
+            "max_prompt_tokens": int(getattr(session, "max_prompt_tokens", 0) or 0),
+            "context_exceeded_count": int(getattr(session, "context_exceeded_count", 0) or 0),
+        }
+
     async def finish_session(
         self,
         sid: str,
@@ -259,13 +309,14 @@ class BaseAdapter:
         Idempotent: a second call for an already-popped sid returns [].
         """
         await self.shutdown_session(sid, wait_timeout=wait_timeout)
+        metadata = {**(extra_metadata or {}), **self.session_stats(sid)}
         session = self.store.pop(sid, None)
         max_sample_tokens = int(getattr(session, "max_context_tokens", 0) or 0) if session is not None else 0
         samples = self.manager.get_trajectory(
             sid,
             base_sample=base_sample,
             reward=reward,
-            extra_metadata=extra_metadata,
+            extra_metadata=metadata,
             max_sample_tokens=max_sample_tokens,
         )
         for s in samples:
@@ -315,6 +366,17 @@ class BaseAdapter:
         except Exception:
             self.logger.exception("debug_callback failed (sid=%s)", sid)
 
+    def _prepare_prompt(self, body: dict) -> tuple[list[dict], list[dict] | None, list[int]]:
+        """Translate and render one wire request with the served chat template."""
+        translated, tools_schema = self._translate(body)
+        prompt_ids = _render_token_ids(
+            translated,
+            self.tokenizer,
+            tools=tools_schema,
+            add_generation_prompt=True,
+        )
+        return translated, tools_schema, prompt_ids
+
     async def _run_turn(self, request: web.Request) -> web.StreamResponse:
         """One full agent turn: translate -> sglang -> parse -> append -> respond.
 
@@ -338,10 +400,25 @@ class BaseAdapter:
         self.inflight.setdefault(sid, set()).add(task)
         t0 = time.monotonic()
         try:
-            translated, tools_schema = self._translate(body)
-            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+            translated, tools_schema, prompt_ids = self._prepare_prompt(body)
+            prompt_tokens = len(prompt_ids)
+            if _is_prompt_compaction(s.last_prompt_tokens, prompt_tokens):
+                s.compaction_count += 1
+                self.logger.info(
+                    "[%s] sid=%s prompt_compaction_detected previous_tokens=%d current_tokens=%d count=%d",
+                    self.log_prefix,
+                    sid,
+                    s.last_prompt_tokens,
+                    prompt_tokens,
+                    s.compaction_count,
+                )
+            s.last_prompt_tokens = prompt_tokens
+            s.max_prompt_tokens = max(s.max_prompt_tokens, prompt_tokens)
 
-            turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+            try:
+                turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+            except ContextWindowExceeded as error:
+                return self._context_limit_response(error)
 
             raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
             parsed = parse_model_output(
@@ -455,17 +532,22 @@ async def call_sglang_generate(
     sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
 
     if session.max_context_tokens > 0:
-        remaining_context = session.max_context_tokens - len(prompt_ids)
-        if remaining_context <= 0:
+        output_tokens = int(sp.get("max_new_tokens", 0) or 0)
+        if len(prompt_ids) + output_tokens > session.max_context_tokens:
+            session.context_exceeded_count = int(getattr(session, "context_exceeded_count", 0) or 0) + 1
             logger.warning(
-                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
+                "[%s] sid=%s insufficient context budget " "prompt_tokens=%d output_budget=%d max_context_tokens=%d",
                 adapter.log_prefix,
                 session_id,
                 len(prompt_ids),
+                output_tokens,
                 session.max_context_tokens,
             )
-            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
-        sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
+            raise ContextWindowExceeded(
+                prompt_tokens=len(prompt_ids),
+                output_tokens=output_tokens,
+                max_context_tokens=session.max_context_tokens,
+            )
 
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
@@ -515,6 +597,8 @@ async def call_sglang_generate(
         output_ids=output_ids,
         finish_reason=finish,
         output_log_probs=output_log_probs,
+        cached_tokens=int(meta.get("cached_tokens", 0) or 0),
+        prompt_tokens=int(meta.get("prompt_tokens", len(prompt_ids)) or len(prompt_ids)),
     )
 
 

@@ -25,10 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer  # noqa: E402
+from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, ScriptedTokenizer  # noqa: E402
 
 from slime.agent.adapters import anthropic, openai  # noqa: E402
-from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
+from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
@@ -79,10 +79,32 @@ async def _drain(adapter, sid) -> list[Sample]:
 # ===========================================================================
 
 
-def test_anthropic_session_id_prefers_bearer_then_api_key():
-    assert anthropic._request_session_id(_Headers({"X-Api-Key": "key"})) == "key"
-    assert anthropic._request_session_id(_Headers({"Authorization": "Bearer bsid", "X-Api-Key": "key"})) == "bsid"
-    assert anthropic._request_session_id(_Headers({})) == "default"
+def test_anthropic_session_id_prefers_claude_metadata_then_bearer_then_api_key():
+    metadata = {
+        "metadata": {
+            "user_id": json.dumps(
+                {
+                    "device_id": "device",
+                    "account_uuid": "",
+                    "session_id": "11111111-1111-4111-8111-111111111111",
+                }
+            )
+        }
+    }
+    theta_headers = _Headers({"Authorization": "Bearer theta-internal", "X-Api-Key": "theta-internal"})
+    assert anthropic._request_session_id(theta_headers, metadata) == "11111111-1111-4111-8111-111111111111"
+    assert anthropic._request_session_id(_Headers({"X-Api-Key": "key"}), {}) == "key"
+    assert anthropic._request_session_id(_Headers({"Authorization": "Bearer bsid", "X-Api-Key": "key"}), {}) == "bsid"
+    assert anthropic._request_session_id(_Headers({}), {}) == "default"
+
+
+def test_anthropic_session_id_ignores_malformed_claude_metadata():
+    request = _Headers({"Authorization": "Bearer direct-session"})
+    assert anthropic._request_session_id(request, {"metadata": {"user_id": "not-json"}}) == "direct-session"
+    assert (
+        anthropic._request_session_id(request, {"metadata": {"user_id": json.dumps({"session_id": "  "})}})
+        == "direct-session"
+    )
 
 
 def test_openai_session_id_prefers_bearer_then_body():
@@ -129,6 +151,67 @@ def test_anthropic_translation_keeps_tool_results_thinking_and_tools():
     assert tools == [
         {"type": "function", "function": {"name": "lookup", "description": "search", "parameters": {"type": "object"}}}
     ]
+
+
+@pytest.mark.parametrize(
+    ("name", "tool_input", "expected_command"),
+    [
+        (
+            "Grep",
+            {
+                "pattern": "FunctionTypeSerializer",
+                "path": "/testbed/tests",
+                "output": "tests/migrations/test_writer.py",
+            },
+            "grep -R -l -- FunctionTypeSerializer /testbed/tests | sed -n 1,250p",
+        ),
+        (
+            "Glob",
+            {"pattern": "**/*.py", "path": "/testbed"},
+            "find /testbed -type f -name '*.py' | head -n 100",
+        ),
+    ],
+)
+def test_anthropic_lowers_legacy_search_tools_to_bash(name, tool_input, expected_command):
+    parsed = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": name, "input": tool_input}])
+
+    blocks, stop_reason, manager_message = anthropic._build_reply_parts(parsed, "stop")
+
+    assert stop_reason == "tool_use"
+    assert blocks[0]["name"] == "Bash"
+    assert blocks[0]["input"]["command"] == expected_command
+    assert manager_message["tool_calls"] == [
+        {"type": "function", "function": {"name": "Bash", "arguments": blocks[0]["input"]}}
+    ]
+
+
+def test_anthropic_keeps_supported_tools_unchanged():
+    tool_input = {"file_path": "/testbed/example.py"}
+    parsed = ParsedModelOutput(reasoning="", text="", tool_uses=[{"name": "Read", "input": tool_input}])
+
+    blocks, stop_reason, manager_message = anthropic._build_reply_parts(parsed, "stop")
+
+    assert stop_reason == "tool_use"
+    assert blocks[0]["name"] == "Read"
+    assert blocks[0]["input"] == tool_input
+    assert manager_message["tool_calls"] == [
+        {"type": "function", "function": {"name": "Read", "arguments": tool_input}}
+    ]
+
+
+def test_anthropic_translation_bounds_large_tool_results_with_head_and_tail():
+    content = "0123456789" * 10
+    translated = anthropic._translate_messages(
+        [{"role": "user", "content": [{"type": "tool_result", "content": content}]}],
+        system=None,
+        max_tool_result_chars=50,
+    )
+
+    result = translated[0]["content"]
+    assert len(result) == 50
+    assert result.startswith(content[:8])
+    assert result.endswith(content[-10:])
+    assert "tool result truncated" in result
 
 
 def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
@@ -197,6 +280,51 @@ def test_anthropic_messages_nonstream_records_token_segments():
         assert s.loss_mask[-2:] == [1, 1]
         assert s.rollout_log_probs[-2:] == [-0.1, -0.2]
         assert s.response == "done now"
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_theta_metadata_isolates_concurrent_sessions():
+    async def run_case():
+        session_ids = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        )
+        async with FakeSGLangServer([[(-0.1, 101)], [(-0.2, 102)]]) as sglang:
+            tok = FakeTokenizer(outputs={(101,): "first", (102,): "second"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            for session_id in session_ids:
+                adapter.open_session(session_id)
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+
+            async def post(session_id: str):
+                return await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer theta-internal", "X-Api-Key": "theta-internal"},
+                    json={
+                        "model": "auto",
+                        "max_tokens": 7,
+                        "metadata": {
+                            "user_id": json.dumps(
+                                {"device_id": "device", "account_uuid": "", "session_id": session_id}
+                            )
+                        },
+                        "messages": [{"role": "user", "content": session_id}],
+                    },
+                )
+
+            try:
+                responses = await asyncio.gather(*(post(session_id) for session_id in session_ids))
+                bodies = [await response.json() for response in responses]
+            finally:
+                await client.close()
+            samples = [await _drain(adapter, session_id) for session_id in session_ids]
+
+        assert [response.status for response in responses] == [200, 200]
+        assert all(body["type"] == "message" for body in bodies)
+        assert set(sglang.routing_keys) == set(session_ids)
+        assert all(len(session_samples) == 1 for session_samples in samples)
 
     asyncio.run(run_case())
 
@@ -371,6 +499,134 @@ def test_anthropic_multiturn_wire_roundtrip_and_token_capture():
         for s in samples:
             assert len(s.loss_mask) == len(s.rollout_log_probs) == s.response_length
             assert sum(s.loss_mask) > 0
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_tracks_prompt_compaction_and_exports_session_stats():
+    async def run_case():
+        prompts = [[11] * 50000, [22] * 47000, [33] * 20000]
+        async with FakeSGLangServer([[(-0.1, 701)], [(-0.2, 702)], [(-0.3, 703)]]) as sglang:
+            tok = ScriptedTokenizer(
+                prompts=prompts,
+                outputs={(701,): "first", (702,): "minor rewrite", (703,): "summary"},
+            )
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-compact")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                body = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}]}
+                headers = {"Authorization": "Bearer sid-compact"}
+                first = await client.post("/v1/messages", headers=headers, json=body)
+                await first.json()
+                second = await client.post("/v1/messages", headers=headers, json=body)
+                await second.json()
+                third = await client.post("/v1/messages", headers=headers, json=body)
+                await third.json()
+                stats = adapter.session_stats("sid-compact")
+            finally:
+                await client.close()
+            samples = await adapter.finish_session(
+                "sid-compact",
+                base_sample=Sample(index=0, prompt=""),
+                reward=1.0,
+            )
+
+        assert first.status == 200 and second.status == 200 and third.status == 200
+        assert stats == {
+            "compaction_count": 1,
+            "max_prompt_tokens": 50000,
+            "context_exceeded_count": 0,
+        }
+        assert samples
+        assert all(s.metadata.get("compaction_count") == 1 for s in samples)
+        assert all(s.metadata.get("max_prompt_tokens") == 50000 for s in samples)
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_rejects_turn_when_full_response_budget_would_exceed_context():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 701)]]) as sglang:
+            tok = ScriptedTokenizer(prompts=[[11] * 8], outputs={(701,): "unexpected"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session(
+                "sid-context-guard",
+                sampling_defaults={"max_new_tokens": 4},
+                max_context_tokens=10,
+            )
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-context-guard"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "x"}]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+            stats = adapter.session_stats("sid-context-guard")
+            turns = adapter.manager.turn_count("sid-context-guard")
+            await adapter.drop_session("sid-context-guard")
+
+        assert response.status == 400
+        assert payload["type"] == "error"
+        assert payload["error"]["type"] == "invalid_request_error"
+        assert "Prompt is too long" in payload["error"]["message"]
+        assert sglang.requests == []
+        assert turns == 0
+        assert stats["context_exceeded_count"] == 1
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_count_tokens_uses_generation_prompt_rendering():
+    async def run_case():
+        tok = ScriptedTokenizer(prompts=[[21] * 7], outputs={})
+        adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url="http://unused")
+        client = TestClient(TestServer(adapter.app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/v1/messages/count_tokens",
+                json={"model": "m", "messages": [{"role": "user", "content": "count me"}]},
+            )
+            payload = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert payload == {"input_tokens": 7}
+        assert len(tok.rendered) == 1
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_exports_sglang_prefix_cache_usage_to_samples():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 701)]], cached_tokens=[3]) as sglang:
+            tok = ScriptedTokenizer(prompts=[[11, 12, 13, 14, 15]], outputs={(701,): "done"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-cache")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-cache"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "x"}]},
+                )
+                await response.json()
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-cache")
+
+        assert response.status == 200
+        assert len(samples) == 1
+        assert samples[0].prefix_cache_info.cached_tokens == 3
+        assert samples[0].prefix_cache_info.total_prompt_tokens == 5
 
     asyncio.run(run_case())
 

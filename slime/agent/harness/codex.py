@@ -13,9 +13,9 @@ import os
 import shlex
 from pathlib import Path
 
-from slime.agent.sandbox import Sandbox
+from slime.agent.sandbox import EXIT_TIME_BUDGET_EXCEEDED, Sandbox
 
-from .common import BaseHarness, HarnessContext, install_npm_cli, run_agent
+from .common import BaseHarness, HarnessContext, HarnessRunResult, install_npm_cli, run_agent
 
 
 class CodexHarness(BaseHarness):
@@ -66,7 +66,9 @@ class CodexHarness(BaseHarness):
             timeout=60,
         )
 
-    async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
+    async def launch_and_wait(
+        self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int
+    ) -> HarnessRunResult:
         # ``codex exec`` is the non-interactive entrypoint
         cmd = f"codex exec {self.exec_flags} {shlex.quote(prompt)}"
         extra = os.environ.get(self.extra_args_env, "").strip()
@@ -83,4 +85,15 @@ class CodexHarness(BaseHarness):
         extra_envs = os.environ.get(self.extra_envs_env, "").strip()
         if extra_envs:
             env.update(json.loads(extra_envs))
-        return await run_agent(sb, workdir=ctx.workdir, start_cmd=cmd, env=env, time_budget_sec=time_budget_sec)
+        exit_code, _output_tail = await run_agent(
+            sb, workdir=ctx.workdir, start_cmd=cmd, env=env, time_budget_sec=time_budget_sec
+        )
+        if exit_code == 0:
+            return HarnessRunResult(exit_code=0)
+        if exit_code == EXIT_TIME_BUDGET_EXCEEDED:
+            return HarnessRunResult(
+                exit_code=exit_code,
+                error_type="time_budget_exceeded",
+                terminal_reason="time_budget_exceeded",
+            )
+        return HarnessRunResult(exit_code=exit_code, error_type="unclassified_cli_error")

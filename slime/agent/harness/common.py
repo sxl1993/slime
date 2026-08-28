@@ -52,6 +52,17 @@ class HarnessContext:
     session_id: str
     adapter_url: str
     model_label: str = "slime-actor"
+    adapter_auth_token: str | None = None
+
+
+@dataclass(frozen=True)
+class HarnessRunResult:
+    """Normalized harness outcome safe for orchestration logs."""
+
+    exit_code: int
+    error_type: str | None = None
+    terminal_reason: str | None = None
+    error_message: str | None = None
 
 
 class BaseHarness(ABC, metaclass=SingletonABCMeta):
@@ -65,13 +76,26 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         """Install the harness CLI into the sandbox.
         npm-packaged harnesses delegate to install_npm_cli."""
 
+    async def verify_cli(self, sb: Sandbox) -> None:
+        """Verify a backend-provided CLI without mutating the sandbox."""
+        raise RuntimeError(f"{self.name} does not support a preinstalled CLI contract")
+
+    async def prepare_cli(self, sb: Sandbox) -> None:
+        """Install the CLI for legacy images or verify a preinstalled one."""
+        if sb.cli_preinstalled:
+            await self.verify_cli(sb)
+        else:
+            await self.install_cli(sb)
+
     @abstractmethod
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
         """Write any CLI config files into the sandbox."""
 
     @abstractmethod
-    async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
-        """Run the agent to completion and return its exit code.
+    async def launch_and_wait(
+        self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int
+    ) -> HarnessRunResult:
+        """Run the agent to completion and return its normalized outcome.
 
         A non-interactive CLI builds one shell command and hands it to
         run_agent. An interactive or long-running harness drives its own loop
@@ -85,41 +109,56 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         workdir: str,
         session_id: str,
         adapter_url: str,
+        adapter_auth_token: str | None = None,
+        model_label: str = "slime-actor",
         time_budget_sec: int,
         prompt: str,
-    ) -> int:
-        """Run the harness in the sandbox and return its exit code.
+    ) -> HarnessRunResult:
+        """Run the harness in the sandbox and return its normalized outcome.
 
-        Steps: ensure the agent user -> write config -> launch and wait.
+        Steps: prepare the backend work user -> write config -> launch and wait.
         Workspace prep (writing the problem statement etc.) is the caller's job
         and must run before this.
         """
-        await _sandbox.ensure_agent_user(sb, workdir)
+        await _sandbox.prepare_work_user(sb, workdir)
         ctx = HarnessContext(
             workdir=workdir,
             session_id=session_id,
             adapter_url=adapter_url,
+            adapter_auth_token=adapter_auth_token,
+            model_label=model_label,
         )
         await self.write_config(sb, ctx)
         return await self.launch_and_wait(sb, ctx, prompt, time_budget_sec)
 
 
-async def run_agent(sb: Sandbox, *, workdir: str, start_cmd: str, env: dict[str, str], time_budget_sec: int) -> int:
-    """Launch the agent (start_cmd) and run it to completion, returning its exit code."""
+async def run_agent(
+    sb: Sandbox,
+    *,
+    workdir: str,
+    start_cmd: str,
+    env: dict[str, str],
+    time_budget_sec: int,
+    tag: str = "run",
+    out_file: str | None = None,
+) -> tuple[int, str]:
+    """Launch the agent and return its exit code plus bounded failure output."""
     meta_dir = f"{workdir}/.harness"
-    await sb.exec(f"mkdir -p {meta_dir} && chown agent:agent {meta_dir}", user="root", check=True, timeout=30)
-    exit_code, _ = await exec_and_wait(
+    setup_cmd = f"mkdir -p {meta_dir}"
+    if sb.privileged_user != sb.work_user:
+        setup_cmd += f" && chown {sb.work_user}:{sb.work_user} {meta_dir}"
+    await sb.exec(setup_cmd, user=sb.privileged_user, check=True, timeout=30)
+    return await exec_and_wait(
         sb,
         cmd=start_cmd,
-        user="agent",
+        user=sb.work_user,
         env=env,
         workdir=workdir,
-        out_file=f"{meta_dir}/trajectory.jsonl",
+        out_file=out_file or f"{meta_dir}/trajectory.jsonl",
         time_budget_sec=time_budget_sec,
-        tag="run",
+        tag=tag,
         want_output=False,
     )
-    return exit_code
 
 
 async def install_npm_cli(
