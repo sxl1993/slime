@@ -141,7 +141,7 @@ def test_done_callback_requeues_nested_fanout_group_with_aborted_sample(monkeypa
 
     worker._make_done_cb(0)(_DoneTask())
 
-    assert data_buffer.requeued == [[[sample]]]
+    assert data_buffer.requeued == [[sample]]
     assert worker.queue_size() == 0
 
 
