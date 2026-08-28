@@ -28,9 +28,53 @@ def iter_record_batches(records: Iterable[Any], batch_size: int) -> Iterator[lis
 
 
 def total_optimizer_steps(record_count: int, global_batch_size: int) -> int:
+    if global_batch_size < 1:
+        raise ValueError("global_batch_size must be positive")
     if record_count < 1:
         return 0
     return math.ceil(record_count / global_batch_size)
+
+
+def selected_record_count(manifest: dict[str, Any], split: str) -> int:
+    split_manifest = manifest["splits"][split]
+    counts = (split_manifest["selected_resolved"], split_manifest["selected_unresolved"])
+    if counts[0] != counts[1]:
+        raise ValueError(f"critic artifact split={split} is not outcome-balanced: {counts}")
+    return sum(counts)
+
+
+def configure_critic_pretrain_schedule(args, train_limit: int) -> None:
+    """Use the selected corpus size to size Megatron's iteration scheduler."""
+    args.num_rollout = total_optimizer_steps(train_limit, args.global_batch_size)
+
+
+def validate_artifact_context(manifest: dict[str, Any], sequence_length: int) -> None:
+    artifact_length = manifest.get("max_seq_length")
+    if artifact_length != sequence_length:
+        raise ValueError(
+            f"critic artifact max_seq_length={artifact_length} does not match model seq_length={sequence_length}"
+        )
+
+
+def validate_gradient_states(states: list[dict[str, Any]]) -> None:
+    if not states or any("grad_norm" not in state for state in states):
+        raise ValueError("critic pretraining did not report a gradient norm for every worker")
+    if any(not math.isfinite(float(state["grad_norm"])) for state in states):
+        raise ValueError("critic pretraining produced a non-finite gradient norm")
+
+
+def validate_canary_metrics(metrics: dict[str, float | None]) -> None:
+    loss = metrics.get("trajectory_equal_mse")
+    resolved = metrics.get("resolved_mean")
+    unresolved = metrics.get("unresolved_mean")
+    if loss is None or not math.isfinite(float(loss)):
+        raise ValueError("canary produced a non-finite value loss")
+    if resolved is None or unresolved is None:
+        raise ValueError("canary requires both resolved and unresolved value means")
+    if not math.isfinite(float(resolved)) or not math.isfinite(float(unresolved)):
+        raise ValueError("canary produced non-finite value means")
+    if resolved <= unresolved:
+        raise ValueError(f"canary failed value separation: resolved={resolved}, unresolved={unresolved}")
 
 
 def should_save_checkpoint(value: float, best_value: float) -> bool:
@@ -62,14 +106,14 @@ def add_critic_pretrain_arguments(parser: argparse.ArgumentParser) -> argparse.A
     parser.add_argument("--critic-pretrain-eval-interval", type=int, default=100)
     parser.add_argument("--critic-pretrain-eval-batch-size", type=int, default=128)
     parser.add_argument("--critic-pretrain-mode", choices=("train", "eval"), default="train")
+    parser.add_argument("--critic-pretrain-canary", action="store_true")
     parser.add_argument("--critic-pretrain-eval-split", choices=("dev", "test"), default="dev")
     parser.add_argument("--critic-pretrain-selection-json", type=Path, required=True)
     return parser
 
 
 def _manifest_count(manifest: dict[str, Any], split: str) -> int:
-    split_manifest = manifest["splits"][split]
-    return min(split_manifest["selected_resolved"], split_manifest["selected_unresolved"])
+    return selected_record_count(manifest, split)
 
 
 def evaluate_split(group, artifact_dir: Path, split: str, parallel_config, batch_size: int) -> dict[str, float | None]:
@@ -114,16 +158,32 @@ def train(args) -> None:
     args.loss_type = "custom_loss"
     args.custom_loss_function_path = "examples.coding_agent_rl.critic_pretrain.loss.critic_pretrain_loss"
     args.calculate_per_token_loss = False
+    args.check_for_nan_in_loss_and_grad = False
     args.n_samples_per_prompt = 1
     args.rollout_batch_size = args.global_batch_size
 
     artifact_dir = Path(args.critic_pretrain_data)
     manifest = json.loads((artifact_dir / "manifest.json").read_text())
+    validate_artifact_context(manifest, args.seq_length)
     selected_train_count = _manifest_count(manifest, "train")
-    train_limit = args.critic_pretrain_train_limit or selected_train_count
-    train_limit = min(train_limit, selected_train_count)
+    requested_limit = args.critic_pretrain_train_limit
+    if getattr(args, "critic_pretrain_canary", False):
+        canary_count = int(manifest["canary_count"])
+        if selected_train_count < canary_count:
+            raise ValueError(
+                f"critic artifact has only {selected_train_count} selected training trajectories; "
+                f"canary needs {canary_count}"
+            )
+        if requested_limit is not None and requested_limit != canary_count:
+            raise ValueError(f"critic canary requires train limit {canary_count}, got {requested_limit}")
+        train_limit = canary_count
+    else:
+        train_limit = selected_train_count if requested_limit is None else min(requested_limit, selected_train_count)
     if train_limit < 1:
         raise ValueError("critic artifact has no selected training trajectories")
+
+    if args.critic_pretrain_mode == "train":
+        configure_critic_pretrain_schedule(args, train_limit)
 
     pgs = create_placement_groups(args)
     group = CriticPretrainGroup(
@@ -146,6 +206,7 @@ def train(args) -> None:
             args.critic_pretrain_eval_batch_size,
         )
         output = args.critic_pretrain_selection_json.parent / f"eval-{args.critic_pretrain_eval_split}.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
         logger.info("critic evaluation: %s", metrics)
         return
@@ -154,16 +215,16 @@ def train(args) -> None:
     logger.info("constant prior baseline: %s", baseline)
     best_value = float("inf")
     step = 0
+    final_metrics = None
+    final_step = total_optimizer_steps(train_limit, args.global_batch_size)
     for records in iter_record_batches(
         iter_critic_records(artifact_dir, "train", limit=train_limit),
         batch_size=args.global_batch_size,
     ):
         step += 1
         refs = build_critic_data_refs(args, parallel_config, records)
-        ray.get(group.async_train(step, refs))
-        if step % args.critic_pretrain_eval_interval == 0 or step == total_optimizer_steps(
-            train_limit, args.global_batch_size
-        ):
+        validate_gradient_states(ray.get(group.async_train(step, refs)))
+        if step % args.critic_pretrain_eval_interval == 0 or step == final_step:
             metrics = evaluate_split(
                 group,
                 artifact_dir,
@@ -185,6 +246,38 @@ def train(args) -> None:
                     ),
                 )
             logger.info("critic dev step=%d metrics=%s", step, metrics)
+            final_metrics = metrics
+
+    if getattr(args, "critic_pretrain_canary", False):
+        if final_metrics is None:
+            raise ValueError("critic canary did not produce final development metrics")
+        validate_canary_metrics(final_metrics)
+        selection_path = Path(args.critic_pretrain_selection_json)
+        checkpoint_root = Path(args.save)
+        if not (checkpoint_root / "latest_checkpointed_iteration.txt").is_file():
+            raise ValueError(f"critic canary did not produce a native checkpoint under {checkpoint_root}")
+        selection = json.loads(selection_path.read_text())
+        best_iteration = int(selection["best_iteration"])
+        loaded_iterations = group.reload_checkpoint(checkpoint_root, best_iteration)
+        if any(int(iteration) != best_iteration for iteration in loaded_iterations):
+            raise ValueError(
+                f"critic canary checkpoint reload returned {loaded_iterations}, expected {best_iteration}"
+            )
+        reloaded_metrics = evaluate_split(
+            group,
+            artifact_dir,
+            "dev",
+            parallel_config,
+            args.critic_pretrain_eval_batch_size,
+        )
+        if not math.isclose(
+            float(reloaded_metrics["trajectory_equal_mse"]),
+            float(selection["best_value"]),
+            rel_tol=1e-4,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"critic canary checkpoint changed evaluation loss after reload: {reloaded_metrics}")
+        validate_canary_metrics(reloaded_metrics)
 
 
 if __name__ == "__main__":

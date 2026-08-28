@@ -27,6 +27,7 @@ def make_record(index: int) -> CriticRecord:
         tokens=[1, 2, 3, 4],
         response_length=2,
         loss_mask=[1, 1],
+        returns=[float(index % 2 == 0)] * 2,
     )
 
 
@@ -35,7 +36,7 @@ def test_build_critic_train_data_expands_fixed_target():
     train_data = build_critic_train_data(records)
     assert train_data["response_lengths"] == [record.response_length for record in records]
     assert train_data["rollout_mask_sums"].tolist() == [sum(record.loss_mask) for record in records]
-    assert torch.all(train_data["returns"][0] == records[0].reward)
+    assert torch.equal(train_data["returns"][0], torch.tensor(records[0].returns))
 
 
 def test_build_critic_data_refs_partitions_each_sample_once():

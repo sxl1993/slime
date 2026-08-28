@@ -11,6 +11,7 @@ Outcome = Literal["resolved", "unresolved"]
 Split = Literal["train", "dev", "test"]
 _OUTCOMES: tuple[Outcome, Outcome] = ("resolved", "unresolved")
 _SPLITS: tuple[Split, Split, Split] = ("train", "dev", "test")
+DEFAULT_MAX_SEQ_LENGTH = 98_304
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class CriticRecord:
     tokens: list[int]
     response_length: int
     loss_mask: list[int]
+    returns: list[float]
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class CriticManifest:
     lambd: float
     seed: int
     max_per_instance: int
+    max_seq_length: int
     canary_count: int
     splits: dict[Split, SplitManifest]
     skipped: dict[str, int]
@@ -207,6 +210,7 @@ def normalize_orchard_row(
         tokens=[int(token) for token in tokens],
         response_length=response_length,
         loss_mask=[1 if value else 0 for value in full_mask[first_action_index:]],
+        returns=[1.0 if outcome == "resolved" else 0.0] * response_length,
     )
     if len(record.loss_mask) != record.response_length:
         return None, "template_error"
@@ -253,6 +257,11 @@ def _rows_from_parquet(path: Path) -> Iterator[CriticRecord]:
                 tokens=[int(token) for token in columns["tokens"][index]],
                 response_length=int(columns["response_length"][index]),
                 loss_mask=[int(value) for value in columns["loss_mask"][index]],
+                returns=(
+                    [float(value) for value in columns["returns"][index]]
+                    if "returns" in columns
+                    else [float(columns["reward"][index])] * int(columns["response_length"][index])
+                ),
             )
 
 
@@ -270,7 +279,7 @@ def write_critic_artifact(
     dataset_revision: str,
     mask_generator: Any | None = None,
     shard_size: int = 256,
-    max_seq_length: int = 98_304,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     seed: int = 17,
     max_per_instance: int = 4,
     canary_count: int = 4096,
@@ -278,6 +287,8 @@ def write_critic_artifact(
     """Write deterministic, balanced split/outcome Parquet shards."""
     if shard_size < 1:
         raise ValueError("shard_size must be positive")
+    if max_seq_length < 1:
+        raise ValueError("max_seq_length must be positive")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if mask_generator is None:
@@ -369,6 +380,7 @@ def write_critic_artifact(
         lambd=1.0,
         seed=seed,
         max_per_instance=max_per_instance,
+        max_seq_length=max_seq_length,
         canary_count=canary_count,
         splits=splits,
         skipped=skipped,
@@ -409,12 +421,18 @@ def build_critic_train_data(records: Sequence[CriticRecord]) -> dict[str, Any]:
 
     if not records:
         raise ValueError("at least one critic record is required")
+
+    def target_tensor(record: CriticRecord):
+        if len(record.returns) != record.response_length:
+            raise ValueError("critic returns must match response_length")
+        return torch.tensor(record.returns, dtype=torch.float32)
+
     return {
         "tokens": [torch.tensor(record.tokens, dtype=torch.long) for record in records],
         "loss_masks": [torch.tensor(record.loss_mask, dtype=torch.int) for record in records],
         "total_lengths": [len(record.tokens) for record in records],
         "response_lengths": [record.response_length for record in records],
-        "returns": [torch.full((record.response_length,), record.reward, dtype=torch.float32) for record in records],
+        "returns": [target_tensor(record) for record in records],
         "rollout_mask_sums": torch.tensor([sum(record.loss_mask) for record in records], dtype=torch.float32),
     }
 
