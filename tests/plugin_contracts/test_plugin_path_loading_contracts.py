@@ -212,6 +212,20 @@ def test_dynamic_filter_can_fall_back_to_zero_std_groups_at_target_capacity():
     assert should_drop_dynamic_filter_output(output, remaining_batch_size=2, target_data_size=2) is False
 
 
+def test_dynamic_filter_supports_fan_out_sample_groups():
+    fn = load_function("slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std")
+    output = call_dynamic_filter(
+        fn,
+        make_args(),
+        [
+            [make_sample(0, reward=0.0), make_sample(0, reward=0.0)],
+            [make_sample(1, reward=1.0)],
+        ],
+    )
+
+    assert bool(output.keep)
+
+
 def test_strict_dynamic_filter_still_drops_at_target_capacity():
     fn = load_function("slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std")
     output = call_dynamic_filter(fn, make_args(), [make_sample(0, reward=0.0), make_sample(1, reward=0.0)])

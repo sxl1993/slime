@@ -1,5 +1,6 @@
 """Unit tests for SglangConfig multi-model parsing with update_weights."""
 
+import logging
 import sys
 import tempfile
 from argparse import Namespace
@@ -434,6 +435,28 @@ class TestZeroGpuRolloutConfig:
         assert groups[1].sglang_overrides["encoder_urls"] == ["http://encoder"]
         assert init_handles == ["regular-init-1"]
         assert ray_get_calls == [["encoder-init-0"], ["encoder-url-ref"]]
+
+
+class TestRouterHealthCheckCompatibility:
+    def test_disables_health_check_when_supported(self, caplog):
+        from slime.ray.rollout import _disable_router_health_check
+
+        caplog.set_level(logging.WARNING)
+        router_args = Namespace(disable_health_check=False)
+        _disable_router_health_check(router_args)
+
+        assert router_args.disable_health_check is True
+        assert "router health checks remain enabled" not in caplog.text
+
+    def test_warns_when_health_check_cannot_be_disabled(self, caplog):
+        from slime.ray.rollout import _disable_router_health_check
+
+        caplog.set_level(logging.WARNING)
+        router_args = Namespace()
+        _disable_router_health_check(router_args)
+
+        assert not hasattr(router_args, "disable_health_check")
+        assert "router health checks remain enabled" in caplog.text
 
 
 class TestGetModelUrl:
