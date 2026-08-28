@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from slime.backends.megatron_utils.sao import compute_explained_variance
 from slime.observability import logging_utils
 from slime.observability.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.observability.timer import Timer
@@ -296,6 +297,45 @@ def log_rollout_data(
             rollout_data["correct_entropy"] = [correct_entropy_value.item()] * num_correct_responses
         else:
             rollout_data["correct_entropy"] = [0] * num_correct_responses
+
+
+def log_critic_final_explained_variance(
+    rollout_id: int,
+    args: Namespace,
+    rollout_data: RolloutBatch,
+) -> None:
+    """Report explained variance for the final critic values of an SAO rollout."""
+    from megatron.core import mpu
+    from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+    if mpu.get_tensor_model_parallel_rank() != 0 or not mpu.is_pipeline_last_stage():
+        return
+
+    values = torch.cat(rollout_data["values"], dim=0)
+    returns = torch.cat(rollout_data["returns"], dim=0)
+    loss_masks = torch.cat(
+        [
+            slice_log_prob_with_cp(loss_mask, total_length, response_length)
+            for loss_mask, total_length, response_length in zip(
+                rollout_data["loss_masks"],
+                rollout_data["total_lengths"],
+                rollout_data["response_lengths"],
+                strict=True,
+            )
+        ],
+        dim=0,
+    )
+    explained_variance = compute_explained_variance(
+        values,
+        returns,
+        loss_masks,
+        process_group=mpu.get_data_parallel_group(with_context_parallel=True),
+    )
+
+    log_dict = {"critic_final/explained_variance": explained_variance.item()}
+    logger.info(f"critic_final {rollout_id}: {log_dict}")
+    log_dict["rollout/step"] = compute_rollout_step(args, rollout_id)
+    logging_utils.log(args, log_dict, step_key="rollout/step")
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:

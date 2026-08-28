@@ -63,7 +63,7 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        if release_train or (rollout_id + 1) % args.update_weights_interval == 0:
+        if actor_trains and (release_train or (rollout_id + 1) % args.update_weights_interval == 0):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None

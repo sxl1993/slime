@@ -889,6 +889,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
             reset_arg(parser, "--lr", type=float, default=1e-6)
+            parser.add_argument(
+                "--critic-lr",
+                type=float,
+                default=None,
+                help="Learning rate for the critic; SAO defaults to 5e-6 when not explicitly set.",
+            )
 
             parser.add_argument(
                 "--num-critic-only-steps",
@@ -958,6 +964,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
+                    "sao",
                 ],
                 default="grpo",
                 help=(
@@ -1012,12 +1019,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument("--sao-batch-size", type=int, default=128)
+            parser.add_argument("--sao-critic-update-ratio", type=int, default=2)
+            parser.add_argument("--sao-critic-warmup-steps", type=int, default=10)
             parser.add_argument(
                 "--sao-critic-freeze-attention",
                 action="store_true",
                 default=False,
                 help="Freeze critic attention parameters while keeping normalization and value parameters trainable.",
             )
+            parser.add_argument("--sao-gae-alpha", type=float, default=1.5)
+            parser.add_argument(
+                "--sao-skip-observation-gae",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+            )
+            parser.add_argument("--sao-dis-clip-low", type=float, default=0.8)
+            parser.add_argument("--sao-dis-clip-high", type=float, default=3.0)
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",
@@ -1677,6 +1695,8 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         setattr(role_args, key, value)
 
     if role == "critic":
+        if "lr" not in overrides and getattr(role_args, "critic_lr", None) is not None:
+            role_args.lr = role_args.critic_lr
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0
         role_args.use_opd = False
@@ -1916,7 +1936,26 @@ def slime_validate_args(args):
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    if args.advantage_estimator == "sao":
+        if args.n_samples_per_prompt != 1:
+            raise ValueError("SAO requires --n-samples-per-prompt 1")
+        if args.sao_batch_size <= 0:
+            raise ValueError("--sao-batch-size must be positive")
+        if args.sao_critic_update_ratio <= 0:
+            raise ValueError("--sao-critic-update-ratio must be positive")
+        if args.sao_critic_warmup_steps < 0:
+            raise ValueError("--sao-critic-warmup-steps must be non-negative")
+        if args.sao_dis_clip_low < 0 or args.sao_dis_clip_high < 0:
+            raise ValueError("SAO DIS clip bounds must be non-negative")
+        if args.use_tis:
+            raise ValueError("SAO already applies DIS and cannot be combined with --use-tis")
+        args.rollout_batch_size = args.sao_batch_size
+        args.use_rollout_logprobs = True
+        args.num_critic_only_steps = max(args.num_critic_only_steps, args.sao_critic_warmup_steps)
+        if getattr(args, "critic_lr", None) is None:
+            args.critic_lr = 5e-6
+
+    args.use_critic = args.advantage_estimator in {"ppo", "sao"}
     # Critic always uses the same GPU count as actor.
     args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     args.critic_num_nodes = args.actor_num_nodes

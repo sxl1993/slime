@@ -16,6 +16,8 @@ end-to-end variants (real torch.distributed) live in
 
 from __future__ import annotations
 
+from argparse import Namespace
+
 # Import the helpers BEFORE the slime imports so the megatron stub lands
 # in sys.modules first. pytest's prepend importmode puts this file's
 # directory (``tests/``) on sys.path, which is what makes the bare-name
@@ -29,9 +31,11 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_sum_of_sample_mean,
 )
 from slime.observability.train_metric_utils import (  # noqa: E402
+    log_critic_final_explained_variance,
     reduce_train_step_metrics,
     rollout_log_metric_contribution,
 )
+from slime.observability import train_metric_utils  # noqa: E402
 
 NUM_GPUS = 0
 
@@ -50,6 +54,42 @@ def mock_dp_with_cp_group(monkeypatch):
 
     monkeypatch.setattr(dist, "all_reduce", lambda tensor, group=None, op=None: None)
     return object()  # opaque sentinel — only used as the ``group`` argument
+
+
+@pytest.mark.unit
+def test_critic_final_explained_variance_slices_complete_masks_for_cp(monkeypatch):
+    from megatron.core import mpu as _mpu
+
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(_mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(_mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(
+        _mpu,
+        "get_data_parallel_group",
+        lambda with_context_parallel=False: None,
+        raising=False,
+    )
+
+    logged_metrics = []
+    monkeypatch.setattr(
+        train_metric_utils.logging_utils,
+        "log",
+        lambda args, metrics, step_key: logged_metrics.append(metrics),
+    )
+
+    rollout_data = {
+        "values": [torch.tensor([0.0, 100.0, 2.0])],
+        "returns": [torch.tensor([0.0, 999.0, 2.0])],
+        "loss_masks": [torch.tensor([1, 0, 0, 0, 0, 0, 1])],
+        "total_lengths": [8],
+        "response_lengths": [7],
+    }
+    args = Namespace(wandb_always_use_train_step=False)
+
+    log_critic_final_explained_variance(3, args, rollout_data)
+
+    assert logged_metrics == [{"critic_final/explained_variance": 1.0, "rollout/step": 3}]
 
 
 # ---------------------------------------------------------------------------

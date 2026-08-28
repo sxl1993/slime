@@ -12,13 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 class TrainProfiler:
-    def __init__(self, args):
+    def __init__(self, args, name="train_overall"):
         self.args = args
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler:
-            self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
+        if args.use_pytorch_profiler and (
+            not args.profile_ranks or torch.distributed.get_rank() in args.profile_ranks
+        ):
+            self._torch_profiler_overall = _create_torch_profiler(args, name=name)
 
         if args.record_memory_history:
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)

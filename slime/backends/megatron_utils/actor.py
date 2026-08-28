@@ -29,6 +29,7 @@ from slime.utils.reloadable_process_group import (
     reload_process_groups,
 )
 from slime.utils.routing_replay import RoutingReplay
+from slime.utils.sao import run_critic_updates
 from slime.utils.types import RolloutBatch
 
 from ...utils.tensor_backper import TensorBackuper
@@ -80,7 +81,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
 
-        self.prof = TrainProfiler(args)
+        self.prof = TrainProfiler(args, name=f"train_{role}")
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -350,6 +351,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
+            self.prof.step(rollout_id=rollout_id)
         else:
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
@@ -361,26 +363,42 @@ class MegatronTrainRayActor(TrainRayActor):
         return result
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
-        """Train critic and return CPU values (used as old-values for the next actor train)."""
+        """Train critic and return values for the next actor train."""
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
 
-        # Compute current critic values (used as old_values for value loss and for actor advantages).
+        # Compute pre-update critic values (used as old_values for the value loss).
         rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
 
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
-        train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-            global_batch_sizes,
-        )
+        critic_updates = self.args.sao_critic_update_ratio if self.args.advantage_estimator == "sao" else 1
+
+        def update_critic():
+            train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                global_batch_sizes,
+            )
+
+        def refresh_values():
+            rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
+
+        if self.args.advantage_estimator == "sao":
+            run_critic_updates(update_critic, refresh_values, update_count=critic_updates)
+            train_metric_utils.log_critic_final_explained_variance(
+                rollout_id,
+                self.args,
+                rollout_data,
+            )
+        else:
+            update_critic()
 
         if mpu.is_pipeline_last_stage() and "values" in rollout_data:
             from slime.backends.megatron_utils.data import tensors_to_cpu

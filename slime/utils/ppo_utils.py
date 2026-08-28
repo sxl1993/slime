@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from slime.backends.megatron_utils.sao import compute_skip_observation_gae
+
 
 @torch.compile(dynamic=True)
 def compute_approx_kl(
@@ -481,6 +483,11 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    *,
+    loss_masks=None,
+    skip_observation: bool = False,
+    length_adaptive_alpha: float | None = None,
+    terminal_rewards=None,
 ):
     """
     Batched GAE with CP support.
@@ -523,6 +530,47 @@ def get_advantages_and_returns_batch(
         else:
             full_values_list = values_list
             full_rewards_list = rewards_list
+
+        if skip_observation or terminal_rewards is not None:
+            if loss_masks is None:
+                raise ValueError("loss_masks are required for SAO GAE")
+            if len(loss_masks) != B:
+                raise ValueError("loss_masks must contain one mask per sample")
+            # Unlike values and rewards, loss_masks arrive in complete
+            # response-space form. They are not CP-local chunks.
+            full_loss_masks_list = loss_masks
+            if terminal_rewards is not None:
+                if len(terminal_rewards) != B:
+                    raise ValueError("terminal_rewards must contain one reward per sample")
+                full_rewards_list = [reward.clone() for reward in full_rewards_list]
+                for i, reward in enumerate(terminal_rewards):
+                    action_indices = full_loss_masks_list[i][: response_lengths[i]].bool().nonzero(as_tuple=False)
+                    if action_indices.numel() == 0:
+                        raise ValueError("cannot place a terminal reward without an action token")
+                    full_rewards_list[i][action_indices[-1, 0]] += reward
+
+            if skip_observation:
+                advantages_list = []
+                returns_list = []
+                for i, (total_len, resp_len) in enumerate(zip(total_lengths, response_lengths, strict=False)):
+                    sample_lambda = lambd
+                    if length_adaptive_alpha is not None:
+                        sample_lambda = max(0.0, 1.0 - length_adaptive_alpha / max(resp_len, 1))
+                    sample_advantages, sample_returns = compute_skip_observation_gae(
+                        full_rewards_list[i][:resp_len],
+                        full_values_list[i][:resp_len],
+                        full_loss_masks_list[i][:resp_len],
+                        gamma=gamma,
+                        lambda_=sample_lambda,
+                    )
+                    if cp_size > 1:
+                        from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+                        sample_advantages = slice_log_prob_with_cp(sample_advantages, total_len, resp_len)
+                        sample_returns = slice_log_prob_with_cp(sample_returns, total_len, resp_len)
+                    advantages_list.append(sample_advantages)
+                    returns_list.append(sample_returns)
+                return advantages_list, returns_list
 
         # pad to max_len for batched GAE
         max_len = max(response_lengths)
