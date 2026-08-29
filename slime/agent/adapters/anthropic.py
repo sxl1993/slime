@@ -27,12 +27,14 @@ from aiohttp import web
 from slime.agent.adapters.common import (
     BaseAdapter,
     ContextWindowExceeded,
+    IncrementalStream,
     Reply,
     flatten_content,
     manager_finish_reason,
     sid_from_bearer,
     tool_call_dict,
 )
+from slime.agent.adapters.anthropic_stream import AnthropicStreamResponse, QwenAnthropicStreamParser
 from slime.agent.parsing import ParsedModelOutput
 
 logger = logging.getLogger(__name__)
@@ -85,8 +87,34 @@ class AnthropicAdapter(BaseAdapter):
     async def _respond(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
         blocks, stop_reason = reply.wire
         if stream:
-            return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
+            return await _render_stream(request, body, blocks, stop_reason, in_tok, out_tok)
         return web.json_response(_render_response(body, blocks, stop_reason, in_tok, out_tok))
+
+    async def _start_incremental_stream(
+        self,
+        request: web.Request,
+        body: dict,
+        input_tokens: int,
+        tools_schema: list[dict] | None,
+    ) -> IncrementalStream | None:
+        stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
+        if not stream:
+            return None
+        if self.reasoning_parser not in {None, "qwen3"} or self.tool_parser not in {None, "qwen3_coder"}:
+            return None
+
+        response = await _start_stream(request, input_tokens, body.get("model", "slime-actor"))
+        parser = QwenAnthropicStreamParser(
+            tools_schema=tools_schema,
+            canonicalize_tool=_lower_search_tool,
+            deferred_tool_names=frozenset({"Grep", "Glob"}),
+        )
+        return AnthropicStreamResponse(
+            response=response,
+            parser=parser,
+            input_tokens=input_tokens,
+            model=body.get("model", "slime-actor"),
+        )
 
     def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
         return web.json_response(
@@ -341,10 +369,7 @@ def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: i
     }
 
 
-async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.StreamResponse:
-    """Stream blocks back as an Anthropic Messages SSE response: message_start,
-    (content_block_start, content_block_delta, content_block_stop)*N,
-    message_delta, message_stop."""
+async def _start_stream(request, in_tok, model="slime-actor") -> web.StreamResponse:
     out = web.StreamResponse(
         status=200,
         headers={
@@ -361,7 +386,7 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
             "id": f"msg_{secrets.token_hex(12)}",
             "type": "message",
             "role": "assistant",
-            "model": "slime-actor",
+            "model": model,
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -369,6 +394,16 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
         },
     }
     await out.write(f"event: message_start\ndata: {json.dumps(ms_data, ensure_ascii=False)}\n\n".encode())
+    return out
+
+
+async def _render_stream(request, body, blocks, stop_reason, in_tok, out_tok) -> web.StreamResponse:
+    response = await _start_stream(request, in_tok, body.get("model", "slime-actor"))
+    return await _finish_stream(response, blocks, stop_reason, in_tok, out_tok)
+
+
+async def _finish_stream(out, blocks, stop_reason, in_tok, out_tok) -> web.StreamResponse:
+    """Finish an Anthropic Messages SSE response after generation completes."""
 
     for idx, block in enumerate(blocks):
         bt = block["type"]

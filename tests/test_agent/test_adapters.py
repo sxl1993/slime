@@ -421,7 +421,18 @@ def test_openai_chat_completions_nonstream_records_token_segments():
 
 def test_anthropic_messages_streams_blocks():
     async def run_case():
-        async with FakeSGLangServer([[(-0.1, 301)]]) as sglang:
+        chunks = [
+            {
+                "text": "streamed",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
             tok = FakeTokenizer(outputs={(301,): "streamed"})
             adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
             adapter.open_session("sid-as")
@@ -453,19 +464,40 @@ def test_anthropic_messages_streams_blocks():
     asyncio.run(run_case())
 
 
-def test_anthropic_stream_stays_live_while_sglang_generation_is_pending(monkeypatch):
+def test_anthropic_stream_emits_content_before_terminal_chunk():
     async def run_case():
-        generate_gate = asyncio.Event()
-        async with FakeSGLangServer([[(-0.1, 301)]], generate_gate=generate_gate) as sglang:
-            tok = FakeTokenizer(outputs={(301,): "streamed"})
+        stream_gate = asyncio.Event()
+        chunks = [
+            {"text": "working", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "working done",
+                "meta_info": {"output_token_logprobs": [[-0.1, 301], [-0.2, 302]]},
+            },
+            {
+                "text": "working done!",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302], [-0.3, 303]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            },
+        ]
+        async with FakeSGLangServer(
+            [],
+            stream_chunks=[chunks],
+            stream_pause_after=2,
+            stream_gate=stream_gate,
+        ) as sglang:
+            tok = FakeTokenizer(outputs={(301, 302, 303): "working done!"})
             adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
-            adapter.open_session("sid-heartbeat")
+            adapter.open_session("sid-early-content")
             client = TestClient(TestServer(adapter.app))
             await client.start_server()
             request_task = asyncio.create_task(
                 client.post(
                     "/v1/messages",
-                    headers={"Authorization": "Bearer sid-heartbeat", "Accept": "text/event-stream"},
+                    headers={"Authorization": "Bearer sid-early-content", "Accept": "text/event-stream"},
                     json={
                         "model": "m",
                         "stream": True,
@@ -475,26 +507,129 @@ def test_anthropic_stream_stays_live_while_sglang_generation_is_pending(monkeypa
                 )
             )
             try:
-                await asyncio.wait_for(sglang.generate_started.wait(), timeout=1)
                 response = await asyncio.wait_for(asyncio.shield(request_task), timeout=1)
-                message_start = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
-                ping = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
-                generate_gate.set()
+                frames = [await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)]
+                while True:
+                    frame = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                    frames.append(frame)
+                    events = _parse_sse(frame.decode())
+                    if events and events[0][0] == "content_block_delta":
+                        delta = events[0][1]["delta"]
+                        if delta.get("text"):
+                            break
+                assert not stream_gate.is_set()
+                stream_gate.set()
                 remainder = await response.text()
             finally:
-                generate_gate.set()
+                stream_gate.set()
                 if not request_task.done():
-                    await request_task
+                    request_task.cancel()
+                    await asyncio.gather(request_task, return_exceptions=True)
                 await client.close()
-            await _drain(adapter, "sid-heartbeat")
+            await _drain(adapter, "sid-early-content")
 
-        return _parse_sse((message_start + ping).decode() + remainder)
+        return _parse_sse(b"".join(frames).decode() + remainder)
 
-    monkeypatch.setattr(anthropic, "_STREAM_PING_INTERVAL_SECONDS", 0.01, raising=False)
     events = asyncio.run(run_case())
 
     assert events[0][0] == "message_start"
-    assert events[1] == ("ping", {"type": "ping"})
+    assert all(name != "ping" for name, _ in events)
+    deltas = [payload["delta"] for name, payload in events if name == "content_block_delta"]
+    assert any(delta == {"type": "text_delta", "text": "working"} for delta in deltas)
+    assert events[-1][0] == "message_stop"
+
+
+def test_anthropic_streams_long_write_input_before_tool_closes():
+    async def run_case():
+        stream_gate = asyncio.Event()
+        prefix = "<tool_call><function=Write>" "<parameter=file_path>/tmp/a.py</parameter>" "<parameter=content>"
+        final_text = prefix + "a" * 128 + "</parameter></function></tool_call>"
+        chunks = [
+            {"text": prefix + "a" * 64, "meta_info": {"output_token_logprobs": [[-0.1, 311]]}},
+            {
+                "text": prefix + "a" * 128,
+                "meta_info": {"output_token_logprobs": [[-0.1, 311], [-0.2, 312]]},
+            },
+            {
+                "text": final_text,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 311], [-0.2, 312], [-0.3, 313]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            },
+        ]
+        async with FakeSGLangServer(
+            [],
+            stream_chunks=[chunks],
+            stream_pause_after=2,
+            stream_gate=stream_gate,
+        ) as sglang:
+            tokenizer = FakeTokenizer(outputs={(311, 312, 313): final_text})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+                tool_parser="qwen3_coder",
+            )
+            adapter.open_session("sid-long-write")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            request_task = asyncio.create_task(
+                client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-long-write", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 512,
+                        "messages": [{"role": "user", "content": "write"}],
+                        "tools": [
+                            {
+                                "name": "Write",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_path": {"type": "string"},
+                                        "content": {"type": "string"},
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+            try:
+                response = await asyncio.wait_for(asyncio.shield(request_task), timeout=1)
+                frames = []
+                while True:
+                    frame = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                    frames.append(frame)
+                    events = _parse_sse(frame.decode())
+                    if events and events[0][0] == "content_block_delta":
+                        delta = events[0][1]["delta"]
+                        if delta.get("type") == "input_json_delta" and delta.get("partial_json"):
+                            break
+                assert not stream_gate.is_set()
+                stream_gate.set()
+                remainder = await response.text()
+            finally:
+                stream_gate.set()
+                if not request_task.done():
+                    request_task.cancel()
+                    await asyncio.gather(request_task, return_exceptions=True)
+                await client.close()
+            await _drain(adapter, "sid-long-write")
+        return _parse_sse(b"".join(frames).decode() + remainder)
+
+    events = asyncio.run(run_case())
+
+    partial_json = "".join(
+        payload["delta"]["partial_json"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"]["type"] == "input_json_delta"
+    )
+    assert json.loads(partial_json) == {"file_path": "/tmp/a.py", "content": "a" * 128}
     assert events[-1][0] == "message_stop"
 
 
@@ -543,11 +678,33 @@ def test_anthropic_stream_reports_sglang_failure_as_sse_error():
     assert samples == []
 
 
-def test_anthropic_stream_disconnect_aborts_pending_sglang_request(monkeypatch):
+def test_anthropic_stream_disconnect_aborts_pending_sglang_request():
     async def run_case():
-        generate_gate = asyncio.Event()
-        async with FakeSGLangServer([[(-0.1, 301)]], generate_gate=generate_gate) as sglang:
-            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+        stream_gate = asyncio.Event()
+        chunks = [
+            {"text": "working", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "working done",
+                "meta_info": {"output_token_logprobs": [[-0.1, 301], [-0.2, 302]]},
+            },
+            {
+                "text": "working done!",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302], [-0.3, 303]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            },
+        ]
+        async with FakeSGLangServer(
+            [],
+            stream_chunks=[chunks],
+            stream_pause_after=2,
+            stream_gate=stream_gate,
+        ) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301, 302, 303): "working done!"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
             adapter.open_session("sid-disconnect")
             client = TestClient(TestServer(adapter.app))
             await client.start_server()
@@ -562,17 +719,20 @@ def test_anthropic_stream_disconnect_aborts_pending_sglang_request(monkeypatch):
                         "messages": [{"role": "user", "content": "x"}],
                     },
                 )
-                await response.content.readuntil(b"\n\n")
-                await asyncio.wait_for(sglang.generate_started.wait(), timeout=1)
+                while True:
+                    frame = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                    events = _parse_sse(frame.decode())
+                    if events and events[0][0] == "content_block_delta":
+                        break
                 response.close()
+                stream_gate.set()
                 await asyncio.wait_for(sglang.abort_started.wait(), timeout=1)
             finally:
-                generate_gate.set()
+                stream_gate.set()
                 await client.close()
 
             return sglang.requests, sglang.abort_requests
 
-    monkeypatch.setattr(anthropic, "_STREAM_PING_INTERVAL_SECONDS", 0.01)
     requests, abort_requests = asyncio.run(run_case())
 
     assert len(requests) == 1
