@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -671,11 +672,203 @@ def test_anthropic_stream_reports_sglang_failure_as_sse_error():
 
     assert status == 200
     assert events[0][0] == "message_start"
+    assert all(name != "message_stop" for name, _ in events)
     assert events[-1] == (
         "error",
         {"type": "error", "error": {"type": "api_error", "message": "SGLang generation failed"}},
     )
     assert samples == []
+
+
+def test_anthropic_stream_rejects_revised_cumulative_tokens():
+    async def run_case():
+        chunks = [
+            {"text": "a", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "ab",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.9, 999], [-0.2, 302]],
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            adapter.open_session("sid-revised-tokens")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-revised-tokens"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            turn_count = adapter.manager.turn_count("sid-revised-tokens")
+        return events, sglang.requests, sglang.abort_requests, turn_count
+
+    events, requests, abort_requests, turn_count = asyncio.run(run_case())
+
+    assert events[-1][0] == "error"
+    assert all(name != "message_stop" for name, _ in events)
+    assert abort_requests == [{"rid": requests[0]["rid"]}]
+    assert turn_count == 0
+
+
+def test_anthropic_stream_rejects_missing_terminal_chunk():
+    async def run_case():
+        chunks = [{"text": "a", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}}]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            adapter.open_session("sid-no-terminal")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-no-terminal"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            turn_count = adapter.manager.turn_count("sid-no-terminal")
+        return events, turn_count
+
+    events, turn_count = asyncio.run(run_case())
+
+    assert events[-1][0] == "error"
+    assert all(name != "message_stop" for name, _ in events)
+    assert turn_count == 0
+
+
+def test_anthropic_stream_rejects_terminal_text_decode_mismatch():
+    async def run_case():
+        chunks = [
+            {
+                "text": "server text",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301]],
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301,): "locally decoded text"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-text-mismatch")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-text-mismatch"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            turn_count = adapter.manager.turn_count("sid-text-mismatch")
+        return events, turn_count
+
+    events, turn_count = asyncio.run(run_case())
+
+    assert events[-1][0] == "error"
+    assert all(name != "message_stop" for name, _ in events)
+    assert turn_count == 0
+
+
+def test_anthropic_stream_records_trajectory_only_after_message_stop():
+    async def run_case():
+        stream_gate = asyncio.Event()
+        chunks = [
+            {"text": "working", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "working done",
+                "meta_info": {"output_token_logprobs": [[-0.1, 301], [-0.2, 302]]},
+            },
+            {
+                "text": "working done!",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302], [-0.3, 303]],
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+        ]
+        async with FakeSGLangServer(
+            [], stream_chunks=[chunks], stream_pause_after=2, stream_gate=stream_gate
+        ) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301, 302, 303): "working done!"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-atomic")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            response = await client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer sid-atomic"},
+                json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+            )
+            try:
+                while True:
+                    frame = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                    events = _parse_sse(frame.decode())
+                    if events and events[0][0] == "content_block_delta":
+                        break
+                before_stop = adapter.manager.turn_count("sid-atomic")
+                stream_gate.set()
+                remainder = await response.text()
+                after_stop = adapter.manager.turn_count("sid-atomic")
+            finally:
+                stream_gate.set()
+                await client.close()
+        return before_stop, after_stop, _parse_sse(frame.decode() + remainder)
+
+    before_stop, after_stop, events = asyncio.run(run_case())
+
+    assert before_stop == 0
+    assert events[-1][0] == "message_stop"
+    assert after_stop == 1
+
+
+def test_anthropic_stream_logs_one_content_free_summary(caplog):
+    async def run_case():
+        text = "DISTINCTIVE_TOOL_PARAMETER_VALUE"
+        chunks = [
+            {"text": text[:12], "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": text,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302]],
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301, 302): text})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-summary")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-summary"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                await response.text()
+            finally:
+                await client.close()
+
+    caplog.set_level(logging.INFO, logger=anthropic.__name__)
+    asyncio.run(run_case())
+
+    summaries = [
+        record.getMessage() for record in caplog.records if "event=anthropic_stream_summary" in record.getMessage()
+    ]
+    assert len(summaries) == 1
+    assert "DISTINCTIVE_TOOL_PARAMETER_VALUE" not in summaries[0]
 
 
 def test_anthropic_stream_disconnect_aborts_pending_sglang_request():
@@ -731,12 +924,14 @@ def test_anthropic_stream_disconnect_aborts_pending_sglang_request():
                 stream_gate.set()
                 await client.close()
 
-            return sglang.requests, sglang.abort_requests
+            turn_count = adapter.manager.turn_count("sid-disconnect")
+            return sglang.requests, sglang.abort_requests, turn_count
 
-    requests, abort_requests = asyncio.run(run_case())
+    requests, abort_requests, turn_count = asyncio.run(run_case())
 
     assert len(requests) == 1
     assert abort_requests == [{"rid": requests[0]["rid"]}]
+    assert turn_count == 0
 
 
 def test_openai_chat_completions_streams_chunks_until_done():

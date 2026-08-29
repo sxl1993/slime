@@ -114,6 +114,9 @@ class AnthropicAdapter(BaseAdapter):
             parser=parser,
             input_tokens=input_tokens,
             model=body.get("model", "slime-actor"),
+            logger=self.logger,
+            log_prefix=self.log_prefix,
+            sid=self._session_id(request, body),
         )
 
     def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
