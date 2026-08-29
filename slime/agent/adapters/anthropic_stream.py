@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable
@@ -18,6 +19,48 @@ if TYPE_CHECKING:
 
 class StreamProtocolError(RuntimeError):
     pass
+
+
+class StreamParityError(RuntimeError):
+    pass
+
+
+def normalize_blocks(blocks: list[dict]) -> list[dict]:
+    normalized = []
+    for block in blocks:
+        block_type = block["type"]
+        if block_type == "thinking":
+            normalized.append({"type": "thinking", "thinking": block.get("thinking", "")})
+        elif block_type == "text":
+            normalized.append({"type": "text", "text": block.get("text", "")})
+        elif block_type == "tool_use":
+            normalized.append({"type": "tool_use", "name": block.get("name"), "input": block.get("input") or {}})
+        else:
+            raise StreamParityError(f"unsupported Anthropic block type: {block_type}")
+    return normalized
+
+
+def validate_block_parity(streamed: list[dict], canonical: list[dict]) -> None:
+    if normalize_blocks(streamed) != normalize_blocks(canonical):
+        raise StreamParityError(
+            f"streamed blocks differ from canonical blocks: "
+            f"streamed={_block_summary(streamed)} canonical={_block_summary(canonical)}"
+        )
+
+
+def _block_summary(blocks: list[dict]) -> list[dict]:
+    summary = []
+    for block in blocks:
+        block_type = block.get("type")
+        item = {"type": block_type}
+        if block_type == "thinking":
+            item["length"] = len(block.get("thinking", ""))
+        elif block_type == "text":
+            item["length"] = len(block.get("text", ""))
+        elif block_type == "tool_use":
+            item["name"] = block.get("name")
+        summary.append(item)
+    return summary
 
 
 class DeltaKind(enum.Enum):
@@ -140,6 +183,12 @@ class QwenAnthropicStreamParser:
     def push(self, cumulative_text: str) -> list[SemanticDelta]:
         stable = self._tracker.push(cumulative_text)
         return self._consume(stable, final=False)
+
+    @property
+    def state(self) -> str:
+        if self._state is _TopState.TOOL:
+            return f"{self._state.value}.{self._tool_state.value}"
+        return self._state.value
 
     def finish(self, final_text: str) -> tuple[list[SemanticDelta], StreamSnapshot]:
         deltas = self._consume(self._tracker.finish(final_text), final=True)
@@ -521,11 +570,17 @@ class AnthropicStreamResponse:
         parser: QwenAnthropicStreamParser,
         input_tokens: int,
         model: str,
+        logger: logging.Logger,
+        log_prefix: str,
+        sid: str,
     ) -> None:
         self.response = response
         self.parser = parser
         self.input_tokens = input_tokens
         self.model = model
+        self.logger = logger
+        self.log_prefix = log_prefix
+        self.sid = sid
         self.started_at = time.monotonic()
         self.first_chunk_ms: float | None = None
         self.first_content_delta_ms: float | None = None
@@ -533,6 +588,8 @@ class AnthropicStreamResponse:
         self.stream_chunks = 0
         self.content_delta_count = 0
         self.latest_text = ""
+        self.rid = "-"
+        self._summary_logged = False
         self._next_block_index = 0
         self._open_block_index: int | None = None
         self._open_block_kind: DeltaKind | None = None
@@ -543,6 +600,7 @@ class AnthropicStreamResponse:
         if self.first_chunk_ms is None:
             self.first_chunk_ms = (now - self.started_at) * 1000
         self.stream_chunks = progress.chunk_index
+        self.rid = progress.rid
         self.latest_text = progress.text
         await self._write_deltas(self._coalesce(self.parser.push(progress.text)))
 
@@ -553,10 +611,21 @@ class AnthropicStreamResponse:
         input_tokens: int,
         output_tokens: int,
     ) -> web.StreamResponse:
-        deltas, _ = self.parser.finish(raw_output)
+        if self.latest_text != raw_output:
+            raise StreamParityError(
+                f"terminal SGLang text differs from local decode: "
+                f"sglang_length={len(self.latest_text)} decoded_length={len(raw_output)}"
+            )
+        deltas, snapshot = self.parser.finish(raw_output)
         await self._write_deltas(self._coalesce(deltas))
         await self._close_block()
-        _, stop_reason = reply.wire
+        canonical_blocks, stop_reason = reply.wire
+        streamed_blocks = self._snapshot_blocks(snapshot)
+        if not streamed_blocks and canonical_blocks == [{"type": "text", "text": ""}]:
+            await self._open_block(DeltaKind.TEXT, {"type": "text", "text": ""})
+            await self._close_block()
+            streamed_blocks = [{"type": "text", "text": ""}]
+        validate_block_parity(streamed_blocks, canonical_blocks)
         await _write_event(
             self.response,
             "message_delta",
@@ -568,11 +637,30 @@ class AnthropicStreamResponse:
         )
         await _write_event(self.response, "message_stop", {"type": "message_stop"})
         await self.response.write_eof()
+        self._log_summary("success", output_tokens=output_tokens)
         return self.response
+
+    def _snapshot_blocks(self, snapshot: StreamSnapshot) -> list[dict]:
+        blocks: list[dict] = []
+        if snapshot.reasoning:
+            blocks.append({"type": "thinking", "thinking": snapshot.reasoning})
+        if snapshot.text:
+            blocks.append({"type": "text", "text": snapshot.text})
+        for index, tool_use in enumerate(snapshot.tool_uses):
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": self._tool_ids.get(index, ""),
+                    "name": tool_use.get("name"),
+                    "input": tool_use.get("input") or {},
+                }
+            )
+        return blocks
 
     async def fail(self, error: Exception) -> web.StreamResponse:
         from slime.agent.adapters.common import ContextWindowExceeded
 
+        self._log_summary("failure", output_tokens=0, error=error)
         if isinstance(error, ContextWindowExceeded):
             error_type = "invalid_request_error"
             message = str(error)
@@ -586,6 +674,28 @@ class AnthropicStreamResponse:
         )
         await self.response.write_eof()
         return self.response
+
+    def _log_summary(self, outcome: str, *, output_tokens: int, error: Exception | None = None) -> None:
+        if self._summary_logged:
+            return
+        self._summary_logged = True
+        self.logger.info(
+            "[%s] sid=%s rid=%s event=anthropic_stream_summary outcome=%s "
+            "first_chunk_ms=%.1f first_content_delta_ms=%.1f last_content_delta_ms=%.1f "
+            "stream_chunks=%d content_delta_count=%d output_tokens=%d parser_state=%s exception_type=%s",
+            self.log_prefix,
+            self.sid,
+            self.rid,
+            outcome,
+            self.first_chunk_ms if self.first_chunk_ms is not None else -1.0,
+            self.first_content_delta_ms if self.first_content_delta_ms is not None else -1.0,
+            self.last_content_delta_ms if self.last_content_delta_ms is not None else -1.0,
+            self.stream_chunks,
+            self.content_delta_count,
+            output_tokens,
+            self.parser.state,
+            type(error).__name__ if error is not None else "-",
+        )
 
     @staticmethod
     def _coalesce(deltas: list[SemanticDelta]) -> list[SemanticDelta]:

@@ -170,3 +170,45 @@ def test_deferred_tool_emits_only_its_canonical_form():
     assert snapshot.tool_uses == ({"name": "Bash", "input": {"command": "grep needle"}},)
     assert [delta.tool_name for delta in deltas if delta.kind is DeltaKind.TOOL_START] == ["Bash"]
     assert json.loads(_tool_input_json(deltas, 0)) == {"command": "grep needle"}
+
+
+def test_streamed_blocks_match_canonical_blocks_semantically():
+    streamed = [
+        {"type": "thinking", "thinking": "inspect"},
+        {"type": "text", "text": "done"},
+        {"type": "tool_use", "id": "toolu_stream", "name": "Write", "input": {"b": 2, "a": 1}},
+    ]
+    canonical = [
+        {"type": "thinking", "thinking": "inspect"},
+        {"type": "text", "text": "done"},
+        {"type": "tool_use", "id": "toolu_final", "name": "Write", "input": {"a": 1, "b": 2}},
+    ]
+    _MODULE.validate_block_parity(streamed, canonical)
+
+
+@pytest.mark.parametrize(
+    "streamed,canonical",
+    [
+        (
+            [{"type": "text", "text": "streamed"}],
+            [{"type": "text", "text": "canonical"}],
+        ),
+        (
+            [{"type": "tool_use", "name": "Read", "input": {}}],
+            [{"type": "tool_use", "name": "Write", "input": {}}],
+        ),
+        (
+            [
+                {"type": "tool_use", "name": "Read", "input": {"path": "a"}},
+                {"type": "tool_use", "name": "Write", "input": {"path": "b"}},
+            ],
+            [
+                {"type": "tool_use", "name": "Write", "input": {"path": "b"}},
+                {"type": "tool_use", "name": "Read", "input": {"path": "a"}},
+            ],
+        ),
+    ],
+)
+def test_streamed_block_semantic_mismatch_fails(streamed, canonical):
+    with pytest.raises(_MODULE.StreamParityError, match="streamed blocks differ"):
+        _MODULE.validate_block_parity(streamed, canonical)
