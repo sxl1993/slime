@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, ScriptedTokenizer  # noqa: E402
 
 from slime.agent.adapters import anthropic, openai  # noqa: E402
+from slime.agent.adapters.common import GenerationProgress, Session, call_sglang_generate  # noqa: E402
 from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
@@ -248,6 +250,60 @@ def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
 # ===========================================================================
 
 
+def test_generation_progress_reports_validated_cumulative_chunks():
+    async def run_case():
+        chunks = [
+            {"text": "a", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "ab",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 1,
+                },
+            },
+        ]
+        progress: list[GenerationProgress] = []
+
+        async def capture(item: GenerationProgress) -> None:
+            progress.append(item)
+
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            turn = await call_sglang_generate(
+                [11],
+                Session(),
+                {},
+                adapter=adapter,
+                session_id="sid-progress",
+                progress_callback=capture,
+            )
+        return progress, turn
+
+    progress, turn = asyncio.run(run_case())
+
+    assert [item.text for item in progress] == ["a", "ab"]
+    assert [item.chunk_index for item in progress] == [1, 2]
+    assert [item.finish_reason for item in progress] == [None, "stop"]
+    assert turn.output_ids == [301, 302]
+    assert turn.output_log_probs == [-0.1, -0.2]
+
+
+def test_non_stream_generate_does_not_request_sglang_sse():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.4, 401)]]) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            turn = await call_sglang_generate([12], Session(), {}, adapter=adapter)
+        return sglang.requests, turn
+
+    requests, turn = asyncio.run(run_case())
+
+    assert "stream" not in requests[0]
+    assert turn.output_ids == [401]
+    assert turn.output_log_probs == [-0.4]
+
+
 def test_anthropic_messages_nonstream_records_token_segments():
     async def run_case():
         async with FakeSGLangServer([[(-0.1, 101), (-0.2, 102)]]) as sglang:
@@ -395,6 +451,132 @@ def test_anthropic_messages_streams_blocks():
         assert any(d["delta"].get("text") == "streamed" for d in deltas)
 
     asyncio.run(run_case())
+
+
+def test_anthropic_stream_stays_live_while_sglang_generation_is_pending(monkeypatch):
+    async def run_case():
+        generate_gate = asyncio.Event()
+        async with FakeSGLangServer([[(-0.1, 301)]], generate_gate=generate_gate) as sglang:
+            tok = FakeTokenizer(outputs={(301,): "streamed"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-heartbeat")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            request_task = asyncio.create_task(
+                client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-heartbeat", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+            )
+            try:
+                await asyncio.wait_for(sglang.generate_started.wait(), timeout=1)
+                response = await asyncio.wait_for(asyncio.shield(request_task), timeout=1)
+                message_start = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                ping = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
+                generate_gate.set()
+                remainder = await response.text()
+            finally:
+                generate_gate.set()
+                if not request_task.done():
+                    await request_task
+                await client.close()
+            await _drain(adapter, "sid-heartbeat")
+
+        return _parse_sse((message_start + ping).decode() + remainder)
+
+    monkeypatch.setattr(anthropic, "_STREAM_PING_INTERVAL_SECONDS", 0.01, raising=False)
+    events = asyncio.run(run_case())
+
+    assert events[0][0] == "message_start"
+    assert events[1] == ("ping", {"type": "ping"})
+    assert events[-1][0] == "message_stop"
+
+
+def test_anthropic_stream_reports_sglang_failure_as_sse_error():
+    async def run_case():
+        async def fail_generate(_request):
+            return web.Response(status=503, text="upstream unavailable")
+
+        sglang_app = web.Application()
+        sglang_app.router.add_post("/generate", fail_generate)
+        sglang = TestServer(sglang_app)
+        await sglang.start_server()
+        adapter = anthropic.AnthropicAdapter(
+            tokenizer=FakeTokenizer(),
+            sglang_url=str(sglang.make_url("")).rstrip("/"),
+        )
+        adapter.open_session("sid-stream-error")
+        client = TestClient(TestServer(adapter.app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer sid-stream-error"},
+                json={
+                    "model": "m",
+                    "stream": True,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "x"}],
+                },
+            )
+            raw = await response.text()
+        finally:
+            await client.close()
+            await sglang.close()
+        samples = await _drain(adapter, "sid-stream-error")
+        return response.status, _parse_sse(raw), samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    assert events[0][0] == "message_start"
+    assert events[-1] == (
+        "error",
+        {"type": "error", "error": {"type": "api_error", "message": "SGLang generation failed"}},
+    )
+    assert samples == []
+
+
+def test_anthropic_stream_disconnect_aborts_pending_sglang_request(monkeypatch):
+    async def run_case():
+        generate_gate = asyncio.Event()
+        async with FakeSGLangServer([[(-0.1, 301)]], generate_gate=generate_gate) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            adapter.open_session("sid-disconnect")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-disconnect"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                await response.content.readuntil(b"\n\n")
+                await asyncio.wait_for(sglang.generate_started.wait(), timeout=1)
+                response.close()
+                await asyncio.wait_for(sglang.abort_started.wait(), timeout=1)
+            finally:
+                generate_gate.set()
+                await client.close()
+
+            return sglang.requests, sglang.abort_requests
+
+    monkeypatch.setattr(anthropic, "_STREAM_PING_INTERVAL_SECONDS", 0.01)
+    requests, abort_requests = asyncio.run(run_case())
+
+    assert len(requests) == 1
+    assert abort_requests == [{"rid": requests[0]["rid"]}]
 
 
 def test_openai_chat_completions_streams_chunks_until_done():
