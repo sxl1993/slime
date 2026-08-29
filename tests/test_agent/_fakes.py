@@ -25,6 +25,8 @@ checkpoint required. The code under test stays real; only these edges are faked:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from collections.abc import Awaitable, Callable
 
@@ -148,12 +150,24 @@ class FakeSGLangServer:
         *,
         finish_reason: str = "stop",
         cached_tokens: list[int] | None = None,
+        generate_gate: asyncio.Event | None = None,
+        stream_chunks: list[list[dict]] | None = None,
+        stream_pause_after: int | None = None,
+        stream_gate: asyncio.Event | None = None,
     ) -> None:
         self.turns = [list(t) for t in turns]
         self.finish_reason = finish_reason
         self.cached_tokens = list(cached_tokens or [])
         self.requests: list[dict] = []
         self.routing_keys: list[str | None] = []
+        self.generate_gate = generate_gate
+        self.generate_started = asyncio.Event()
+        self.stream_chunks = [list(chunks) for chunks in (stream_chunks or [])]
+        self.stream_pause_after = stream_pause_after
+        self.stream_gate = stream_gate
+        self.stream_chunk_written = asyncio.Event()
+        self.abort_requests: list[dict] = []
+        self.abort_started = asyncio.Event()
         self._server = None
         self._runner = None
 
@@ -163,19 +177,44 @@ class FakeSGLangServer:
         self.routing_keys.append(request.headers.get("X-SMG-Routing-Key"))
         body = await request.json()
         self.requests.append(body)
-        assert self.turns, "unexpected /generate call (turn script exhausted)"
-        pairs = self.turns.pop(0)
-        cached_tokens = self.cached_tokens.pop(0) if self.cached_tokens else 0
-        return web.json_response(
-            {
-                "meta_info": {
-                    "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
-                    "finish_reason": {"type": self.finish_reason},
-                    "cached_tokens": cached_tokens,
-                    "prompt_tokens": len(body["input_ids"]),
+        self.generate_started.set()
+        if self.generate_gate is not None:
+            await self.generate_gate.wait()
+        if body.get("stream") is not True:
+            assert self.turns, "unexpected /generate call (turn script exhausted)"
+            pairs = self.turns.pop(0)
+            cached_tokens = self.cached_tokens.pop(0) if self.cached_tokens else 0
+            return web.json_response(
+                {
+                    "meta_info": {
+                        "output_token_logprobs": [[lp, tid] for lp, tid in pairs],
+                        "finish_reason": {"type": self.finish_reason},
+                        "cached_tokens": cached_tokens,
+                        "prompt_tokens": len(body["input_ids"]),
+                    }
                 }
-            }
-        )
+            )
+
+        assert self.stream_chunks, "unexpected streaming /generate call (chunk script exhausted)"
+        chunks = self.stream_chunks.pop(0)
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        for index, chunk in enumerate(chunks, start=1):
+            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            if self.stream_pause_after == index:
+                self.stream_chunk_written.set()
+                if self.stream_gate is not None:
+                    await self.stream_gate.wait()
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    async def _handle_abort(self, request):
+        from aiohttp import web
+
+        self.abort_requests.append(await request.json())
+        self.abort_started.set()
+        return web.json_response({"ok": True})
 
     async def __aenter__(self) -> FakeSGLangServer:
         from aiohttp import web
@@ -183,6 +222,7 @@ class FakeSGLangServer:
 
         app = web.Application()
         app.router.add_post("/generate", self._handle)
+        app.router.add_post("/abort_request", self._handle_abort)
         self._server = TestServer(app)
         await self._server.start_server()
         self.url = str(self._server.make_url("")).rstrip("/")
@@ -204,14 +244,24 @@ def fake_call_sglang_generate(scripted: list[tuple[str, str, list[float] | None]
     """
     queue = list(scripted)
 
-    async def _fake(prompt_ids, session, body, *, adapter, session_id=None):
-        from slime.agent.adapters.common import TurnRecord
+    async def _fake(prompt_ids, session, body, *, adapter, session_id=None, progress_callback=None):
+        from slime.agent.adapters.common import GenerationProgress, TurnRecord
 
         assert queue, "unexpected sglang /generate call (response script exhausted)"
         text, finish, logprobs = queue.pop(0)
         output_ids = tokenizer.encode(text)
         lp = list(logprobs) if logprobs is not None else [0.0] * len(output_ids)
         assert len(lp) == len(output_ids), "scripted logprobs length must match encoded response"
+        if progress_callback is not None:
+            await progress_callback(
+                GenerationProgress(
+                    rid="fake",
+                    chunk_index=1,
+                    text=text,
+                    output_token_logprobs=tuple(zip(lp, output_ids, strict=True)),
+                    finish_reason=finish,
+                )
+            )
         return TurnRecord(
             prompt_ids=list(prompt_ids),
             output_ids=output_ids,

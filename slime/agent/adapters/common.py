@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiohttp
@@ -27,7 +28,7 @@ from aiohttp import web
 from slime.agent.parsing import parse_model_output
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
 
-__all__ = ["TurnRecord"]
+__all__ = ["GenerationProgress", "TurnRecord"]
 
 
 _COMPACTION_MIN_DROP_TOKENS = 8192
@@ -62,6 +63,18 @@ class Reply:
     manager_message: dict
     finish_reason: str
     wire: Any
+
+
+@dataclasses.dataclass(frozen=True)
+class GenerationProgress:
+    rid: str
+    chunk_index: int
+    text: str
+    output_token_logprobs: tuple[tuple[float, int], ...]
+    finish_reason: str | None
+
+
+ProgressCallback = Callable[[GenerationProgress], Awaitable[None]]
 
 
 class ContextWindowExceeded(Exception):
@@ -231,6 +244,25 @@ class BaseAdapter:
         in_tok: int,
         out_tok: int,
         stream: bool,
+    ) -> web.StreamResponse:
+        raise NotImplementedError
+
+    async def _start_stream(
+        self,
+        request: web.Request,
+        in_tok: int,
+    ) -> web.StreamResponse | None:
+        return None
+
+    async def _stream_error(self, response: web.StreamResponse, error: Exception) -> web.StreamResponse:
+        raise NotImplementedError
+
+    async def _finish_stream(
+        self,
+        response: web.StreamResponse,
+        reply: Reply,
+        in_tok: int,
+        out_tok: int,
     ) -> web.StreamResponse:
         raise NotImplementedError
 
@@ -417,10 +449,21 @@ class BaseAdapter:
             s.last_prompt_tokens = prompt_tokens
             s.max_prompt_tokens = max(s.max_prompt_tokens, prompt_tokens)
 
+            stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
+            stream_response = await self._start_stream(request, prompt_tokens) if stream else None
+
             try:
                 turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
             except ContextWindowExceeded as error:
+                if stream_response is not None:
+                    return await self._stream_error(stream_response, error)
                 return self._context_limit_response(error)
+            except ConnectionResetError:
+                raise
+            except Exception as error:
+                if stream_response is not None:
+                    return await self._stream_error(stream_response, error)
+                raise
 
             raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
             parsed = parse_model_output(
@@ -433,13 +476,14 @@ class BaseAdapter:
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
-            stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
-
             # Flush the response before recording the trajectory: a client that
             # disconnected during generation makes _respond raise here, and we
             # must not record a turn the client never received.
             try:
-                response = await self._respond(request, body, reply, in_tok, out_tok, stream)
+                if stream_response is not None:
+                    response = await self._finish_stream(stream_response, reply, in_tok, out_tok)
+                else:
+                    response = await self._respond(request, body, reply, in_tok, out_tok, stream)
             except (ConnectionResetError, asyncio.CancelledError) as e:
                 self.logger.warning(
                     "[%s] sid=%s client disconnected before response flush: %s after %.1fs",
@@ -518,6 +562,14 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
     return sp
 
 
+async def _abort_sglang_request(sglang_url: str, rid: str) -> int:
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{sglang_url}/abort_request", json={"rid": rid}) as response:
+            await response.read()
+            return response.status
+
+
 async def call_sglang_generate(
     prompt_ids: list[int],
     session: Any,
@@ -525,11 +577,9 @@ async def call_sglang_generate(
     *,
     adapter: BaseAdapter,
     session_id: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> TurnRecord:
-    """POST one turn to sglang /generate and pack the reply into a TurnRecord.
-
-    Module-level (not a method) so tests can monkeypatch it.
-    """
+    """POST one turn to SGLang and capture its terminal token metadata."""
     logger = adapter.logger
     sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
 
@@ -567,20 +617,27 @@ async def call_sglang_generate(
     headers = {"X-Request-ID": rid}
     if session_id and session_id != "default":
         headers["X-SMG-Routing-Key"] = session_id
+    payload = {
+        "rid": rid,
+        "input_ids": prompt_ids,
+        "sampling_params": sp,
+        "return_logprob": True,
+    }
+    if progress_callback is not None:
+        payload["stream"] = True
+
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    first_chunk_ms: float | None = None
+    stream_chunks = 0
+    response_status = 0
+    data: dict[str, Any] | None = None
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
-            f"{sglang_url}/generate",
-            json={
-                "rid": rid,
-                "input_ids": prompt_ids,
-                "sampling_params": sp,
-                "return_logprob": True,
-            },
-            headers=headers,
-        ) as r:
-            if r.status >= 400:
-                text = await r.text()
+        async with aiohttp.ClientSession(timeout=timeout) as client, client.post(
+            f"{sglang_url}/generate", json=payload, headers=headers
+        ) as response:
+            response_status = response.status
+            if response.status >= 400:
+                text = await response.text()
                 upstream_worker_url = _UPSTREAM_GENERATE_URL_RE.search(text)
                 logger.warning(
                     "[%s] sid=%s rid=%s stage=adapter event=sglang_request_end "
@@ -591,76 +648,160 @@ async def call_sglang_generate(
                     rid,
                     sglang_url,
                     upstream_worker_url.group(0).removesuffix("/generate") if upstream_worker_url else "-",
-                    r.status,
+                    response.status,
                     (time.monotonic() - request_started) * 1000,
-                    r.status,
+                    response.status,
                     text,
                 )
-                raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
-            data = await r.json(content_type=None)
-        meta = data.get("meta_info") or {}
-        output_token_logprobs = meta.get("output_token_logprobs") or []
-        output_ids = [x[1] for x in output_token_logprobs]
-        output_log_probs = [float(x[0]) for x in output_token_logprobs]
-        finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
-        logger.debug(
-            "[%s] sid=%s rid=%s stage=adapter event=sglang_request_end outcome=success "
-            "router_url=%s http_status=%d duration_ms=%.1f output_tokens=%d",
-            adapter.log_prefix,
-            session_id,
-            rid,
-            sglang_url,
-            r.status,
-            (time.monotonic() - request_started) * 1000,
-            len(output_ids),
-        )
-    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-        # free the sglang slot eagerly on client cancel/timeout, else the
-        # orphaned generation keeps occupying KV until its own length cap
-        logger.warning(
-            "[%s] sid=%s rid=%s stage=adapter event=sglang_request_failed outcome=exception "
-            "router_url=%s duration_ms=%.1f exception_type=%s error=%s",
-            adapter.log_prefix,
-            session_id,
-            rid,
-            sglang_url,
-            (time.monotonic() - request_started) * 1000,
-            type(e).__name__,
-            str(e)[:200],
-        )
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                async with s2.post(f"{sglang_url}/abort_request", json={"rid": rid}) as abort_response:
-                    logger.debug(
-                        "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=completed "
-                        "router_url=%s http_status=%d",
-                        adapter.log_prefix,
-                        session_id,
-                        rid,
-                        sglang_url,
-                        abort_response.status,
+                raise RuntimeError(f"sglang upstream {response.status}: {text[:400]}")
+
+            if progress_callback is None:
+                data = await response.json(content_type=None)
+            else:
+                previous_pairs: tuple[tuple[float, int], ...] = ()
+                previous_text = ""
+                terminal_seen = False
+                async for raw_line in response.content:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    encoded = line.removeprefix("data:").strip()
+                    if not encoded or encoded == "[DONE]":
+                        continue
+                    if terminal_seen:
+                        raise aiohttp.ClientPayloadError("sglang stream emitted data after its terminal chunk")
+                    try:
+                        chunk = json.loads(encoded)
+                    except json.JSONDecodeError as error:
+                        raise aiohttp.ClientPayloadError(f"invalid sglang SSE chunk: {encoded[:200]}") from error
+                    if not isinstance(chunk, dict):
+                        raise aiohttp.ClientPayloadError("sglang SSE chunk must be a JSON object")
+                    if chunk.get("error"):
+                        raise aiohttp.ClientPayloadError(f"sglang stream error: {str(chunk['error'])[:200]}")
+                    text = chunk.get("text")
+                    if not isinstance(text, str):
+                        raise aiohttp.ClientPayloadError("sglang SSE chunk text must be a string")
+                    if len(text) < len(previous_text):
+                        raise aiohttp.ClientPayloadError("sglang cumulative text length rolled back")
+
+                    meta = chunk.get("meta_info") or {}
+                    raw_pairs = meta.get("output_token_logprobs") or []
+                    try:
+                        pairs = tuple((float(pair[0]), int(pair[1])) for pair in raw_pairs)
+                    except (IndexError, TypeError, ValueError) as error:
+                        raise aiohttp.ClientPayloadError("invalid cumulative output token logprobs") from error
+                    if len(pairs) < len(previous_pairs) or pairs[: len(previous_pairs)] != previous_pairs:
+                        raise aiohttp.ClientPayloadError("sglang cumulative output token logprobs were revised")
+
+                    finish_info = meta.get("finish_reason") or {}
+                    finish_reason = finish_info.get("type") if isinstance(finish_info, dict) else None
+                    finish_reason = str(finish_reason) if finish_reason else None
+                    stream_chunks += 1
+                    if first_chunk_ms is None:
+                        first_chunk_ms = (time.monotonic() - request_started) * 1000
+                    await progress_callback(
+                        GenerationProgress(
+                            rid=rid,
+                            chunk_index=stream_chunks,
+                            text=text,
+                            output_token_logprobs=pairs,
+                            finish_reason=finish_reason,
+                        )
                     )
-        except Exception as abort_error:
-            logger.warning(
-                "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=exception "
-                "router_url=%s exception_type=%s error=%s",
-                adapter.log_prefix,
-                session_id,
-                rid,
-                sglang_url,
-                type(abort_error).__name__,
-                str(abort_error)[:200],
-            )
+                    previous_pairs = pairs
+                    previous_text = text
+                    if finish_reason is not None:
+                        terminal_seen = True
+                        data = chunk
+
+                if data is None:
+                    raise aiohttp.ClientPayloadError("sglang stream ended without a terminal chunk")
+    except asyncio.CancelledError as error:
+        await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
+        raise
+    except Exception as error:
+        await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
         raise
 
+    if not isinstance(data, dict):
+        raise aiohttp.ClientPayloadError("sglang response must be a JSON object")
+    meta = data.get("meta_info") or {}
+    finish_info = meta.get("finish_reason") or {}
+    finish = finish_info.get("type") if isinstance(finish_info, dict) else None
+    if not finish:
+        raise aiohttp.ClientPayloadError("sglang response did not contain a finish reason")
+    try:
+        output_token_logprobs = tuple(
+            (float(pair[0]), int(pair[1])) for pair in (meta.get("output_token_logprobs") or [])
+        )
+    except (IndexError, TypeError, ValueError) as error:
+        raise aiohttp.ClientPayloadError("invalid terminal output token logprobs") from error
+    output_ids = [token_id for _, token_id in output_token_logprobs]
+    output_log_probs = [logprob for logprob, _ in output_token_logprobs]
+    logger.debug(
+        "[%s] sid=%s rid=%s stage=adapter event=sglang_request_end outcome=success "
+        "router_url=%s http_status=%d duration_ms=%.1f first_chunk_ms=%.1f "
+        "stream_chunks=%d output_tokens=%d",
+        adapter.log_prefix,
+        session_id,
+        rid,
+        sglang_url,
+        response_status,
+        (time.monotonic() - request_started) * 1000,
+        first_chunk_ms or 0.0,
+        stream_chunks,
+        len(output_ids),
+    )
     return TurnRecord(
         prompt_ids=list(prompt_ids),
         output_ids=output_ids,
-        finish_reason=finish,
+        finish_reason=str(finish),
         output_log_probs=output_log_probs,
         cached_tokens=int(meta.get("cached_tokens", 0) or 0),
         prompt_tokens=int(meta.get("prompt_tokens", len(prompt_ids)) or len(prompt_ids)),
     )
+
+
+async def _abort_after_failure(
+    adapter: BaseAdapter,
+    session_id: str | None,
+    rid: str,
+    sglang_url: str,
+    request_started: float,
+    error: BaseException,
+) -> None:
+    adapter.logger.warning(
+        "[%s] sid=%s rid=%s stage=adapter event=sglang_request_failed outcome=exception "
+        "router_url=%s duration_ms=%.1f exception_type=%s error=%s",
+        adapter.log_prefix,
+        session_id,
+        rid,
+        sglang_url,
+        (time.monotonic() - request_started) * 1000,
+        type(error).__name__,
+        str(error)[:200],
+    )
+    try:
+        status = await asyncio.shield(_abort_sglang_request(sglang_url, rid))
+        adapter.logger.debug(
+            "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=completed " "router_url=%s http_status=%d",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            status,
+        )
+    except Exception as abort_error:
+        adapter.logger.warning(
+            "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=exception "
+            "router_url=%s exception_type=%s error=%s",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            type(abort_error).__name__,
+            str(abort_error)[:200],
+        )
 
 
 async def _health(request: web.Request) -> web.Response:
