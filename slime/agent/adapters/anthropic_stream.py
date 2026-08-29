@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import json
+from collections.abc import Callable
 from typing import Any
 
 
@@ -77,12 +79,33 @@ class _TopState(enum.Enum):
     FAILED = "failed"
 
 
+class _ToolState(enum.Enum):
+    EXPECT_FUNCTION = "expect_function"
+    FUNCTION_NAME = "function_name"
+    EXPECT_PARAMETER_OR_FUNCTION_END = "expect_parameter_or_function_end"
+    PARAMETER_NAME = "parameter_name"
+    PARAMETER_VALUE = "parameter_value"
+    EXPECT_TOOL_END = "expect_tool_end"
+
+
 class QwenAnthropicStreamParser:
     _THINK_START = "<think>"
     _THINK_END = "</think>"
     _TOOL_START = "<tool_call>"
 
-    def __init__(self, *, tools_schema: list[dict] | None) -> None:
+    _FUNCTION_START = "<function="
+    _FUNCTION_END = "</function>"
+    _PARAMETER_START = "<parameter="
+    _PARAMETER_END = "</parameter>"
+    _TOOL_END = "</tool_call>"
+
+    def __init__(
+        self,
+        *,
+        tools_schema: list[dict] | None,
+        canonicalize_tool: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        deferred_tool_names: frozenset[str] = frozenset(),
+    ) -> None:
         self._tracker = CumulativeTextTracker()
         self._state = _TopState.PREAMBLE
         self._buffer = ""
@@ -92,6 +115,20 @@ class QwenAnthropicStreamParser:
         self._pending_text_whitespace = ""
         self._tool_uses: list[dict[str, Any]] = []
         self._tools_schema = list(tools_schema or [])
+        self._canonicalize_tool = canonicalize_tool
+        self._deferred_tool_names = deferred_tool_names
+        self._tool_state = _ToolState.EXPECT_FUNCTION
+        self._tool_index = 0
+        self._tool_name: str | None = None
+        self._parameter_name: str | None = None
+        self._parameter_type: dict[str, Any] = {}
+        self._parameter_buffer: list[str] = []
+        self._pending_parameter_newline = ""
+        self._parameter_had_leading_newline = False
+        self._parameter_leading_checked = False
+        self._json_started = False
+        self._parameter_count = 0
+        self._current_input: dict[str, Any] = {}
 
     def push(self, cumulative_text: str) -> list[SemanticDelta]:
         stable = self._tracker.push(cumulative_text)
@@ -99,8 +136,15 @@ class QwenAnthropicStreamParser:
 
     def finish(self, final_text: str) -> tuple[list[SemanticDelta], StreamSnapshot]:
         deltas = self._consume(self._tracker.finish(final_text), final=True)
-        if self._state is _TopState.TOOL and not self._buffer:
+        if self._state is _TopState.TOOL and not self._tools_schema and not self._buffer:
             self._state = _TopState.POST_TOOL
+        elif self._state is _TopState.TOOL:
+            detail = "parameter" if self._tool_state is _ToolState.PARAMETER_VALUE else self._tool_state.value
+            raise StreamProtocolError(f"stream ended in incomplete tool {detail}")
+        if self._state is _TopState.POST_TOOL and self._buffer.strip():
+            raise StreamProtocolError("stream ended after a tool with unexpected text")
+        if self._state is _TopState.POST_TOOL:
+            self._buffer = ""
         if self._state not in {
             _TopState.TEXT,
             _TopState.POST_TOOL,
@@ -129,7 +173,7 @@ class QwenAnthropicStreamParser:
         self._buffer += text
         deltas: list[SemanticDelta] = []
         while self._buffer:
-            before = (self._state, len(self._buffer))
+            before = (self._state, self._tool_state, len(self._buffer))
             if self._state is _TopState.PREAMBLE:
                 if self._buffer.startswith(self._THINK_START):
                     self._buffer = self._buffer[len(self._THINK_START) :]
@@ -175,13 +219,262 @@ class QwenAnthropicStreamParser:
                     if retained:
                         break
             elif self._state is _TopState.TOOL:
-                break
+                if not self._consume_tool(deltas, final=final):
+                    break
+            elif self._state is _TopState.POST_TOOL:
+                if not self._consume_post_tool(final=final):
+                    break
             else:
                 raise StreamProtocolError(f"cannot consume text in parser state {self._state.value}")
 
-            if before == (self._state, len(self._buffer)):
+            if before == (self._state, self._tool_state, len(self._buffer)):
                 raise StreamProtocolError(f"parser made no progress in state {self._state.value}")
         return deltas
+
+    def _consume_tool(self, deltas: list[SemanticDelta], *, final: bool) -> bool:
+        if self._tool_state is _ToolState.EXPECT_FUNCTION:
+            stripped = self._buffer.lstrip()
+            self._buffer = stripped
+            if self._buffer.startswith(self._FUNCTION_START):
+                self._buffer = self._buffer[len(self._FUNCTION_START) :]
+                self._tool_state = _ToolState.FUNCTION_NAME
+                return True
+            if not final and self._FUNCTION_START.startswith(self._buffer):
+                return False
+            raise StreamProtocolError("expected <function= after <tool_call>")
+
+        if self._tool_state is _ToolState.FUNCTION_NAME:
+            end = self._buffer.find(">")
+            if end < 0:
+                if final:
+                    raise StreamProtocolError("stream ended in incomplete tool function name")
+                return False
+            name = self._buffer[:end]
+            if name not in self._known_tool_names():
+                raise StreamProtocolError(f"unknown tool: {name}")
+            self._buffer = self._buffer[end + 1 :]
+            self._tool_name = name
+            self._tool_index = len(self._tool_uses)
+            self._tool_state = _ToolState.EXPECT_PARAMETER_OR_FUNCTION_END
+            if name not in self._deferred_tool_names:
+                deltas.append(
+                    SemanticDelta(
+                        DeltaKind.TOOL_START,
+                        tool_index=self._tool_index,
+                        tool_name=name,
+                    )
+                )
+            return True
+
+        if self._tool_state is _ToolState.EXPECT_PARAMETER_OR_FUNCTION_END:
+            self._buffer = self._buffer.lstrip()
+            if self._buffer.startswith(self._PARAMETER_START):
+                self._buffer = self._buffer[len(self._PARAMETER_START) :]
+                self._tool_state = _ToolState.PARAMETER_NAME
+                return True
+            if self._buffer.startswith(self._FUNCTION_END):
+                self._buffer = self._buffer[len(self._FUNCTION_END) :]
+                if self._tool_name not in self._deferred_tool_names:
+                    self._emit_tool_input(deltas, "}" if self._json_started else "{}")
+                self._tool_state = _ToolState.EXPECT_TOOL_END
+                return True
+            markers = (self._PARAMETER_START, self._FUNCTION_END)
+            if not final and any(marker.startswith(self._buffer) for marker in markers):
+                return False
+            raise StreamProtocolError("expected tool parameter or </function>")
+
+        if self._tool_state is _ToolState.PARAMETER_NAME:
+            end = self._buffer.find(">")
+            if end < 0:
+                if final:
+                    raise StreamProtocolError("stream ended in incomplete parameter name")
+                return False
+            name = self._buffer[:end]
+            if not name:
+                raise StreamProtocolError("tool parameter name is empty")
+            self._buffer = self._buffer[end + 1 :]
+            self._parameter_name = name
+            self._parameter_type = self._parameter_schema(self._tool_name or "", name)
+            self._parameter_buffer = []
+            self._pending_parameter_newline = ""
+            self._parameter_had_leading_newline = False
+            self._parameter_leading_checked = False
+            prefix = ("{" if self._parameter_count == 0 else ",") + json.dumps(name, ensure_ascii=False) + ":"
+            if self._tool_name not in self._deferred_tool_names:
+                self._emit_tool_input(deltas, prefix)
+                if self._is_string_parameter():
+                    self._emit_tool_input(deltas, '"')
+            self._json_started = True
+            self._tool_state = _ToolState.PARAMETER_VALUE
+            return True
+
+        if self._tool_state is _ToolState.PARAMETER_VALUE:
+            end = self._buffer.find(self._PARAMETER_END)
+            if end >= 0:
+                self._consume_parameter_fragment(self._buffer[:end], deltas)
+                self._buffer = self._buffer[end + len(self._PARAMETER_END) :]
+                self._finish_parameter(deltas)
+                self._tool_state = _ToolState.EXPECT_PARAMETER_OR_FUNCTION_END
+                return True
+            if final:
+                raise StreamProtocolError("stream ended in incomplete tool parameter")
+            retained = self._proper_marker_suffix(self._buffer, (self._PARAMETER_END,))
+            emit_to = len(self._buffer) - retained
+            self._consume_parameter_fragment(self._buffer[:emit_to], deltas)
+            self._buffer = self._buffer[emit_to:]
+            return emit_to > 0
+
+        if self._tool_state is _ToolState.EXPECT_TOOL_END:
+            self._buffer = self._buffer.lstrip()
+            if self._buffer.startswith(self._TOOL_END):
+                self._buffer = self._buffer[len(self._TOOL_END) :]
+                self._finish_tool(deltas)
+                self._state = _TopState.POST_TOOL
+                return True
+            if not final and self._TOOL_END.startswith(self._buffer):
+                return False
+            raise StreamProtocolError("expected </tool_call> after </function>")
+
+        raise StreamProtocolError(f"unsupported tool parser state {self._tool_state.value}")
+
+    def _consume_post_tool(self, *, final: bool) -> bool:
+        rest = self._buffer.lstrip()
+        if not rest:
+            if final:
+                self._buffer = ""
+                return True
+            return False
+        if rest.startswith(self._TOOL_START):
+            self._buffer = rest[len(self._TOOL_START) :]
+            self._reset_tool()
+            self._state = _TopState.TOOL
+            return True
+        if not final and self._TOOL_START.startswith(rest):
+            return False
+        raise StreamProtocolError("text after a completed tool cannot preserve Anthropic block order")
+
+    def _known_tool_names(self) -> set[str]:
+        return {
+            str(tool.get("function", {}).get("name"))
+            for tool in self._tools_schema
+            if tool.get("function", {}).get("name")
+        }
+
+    def _parameter_schema(self, tool_name: str, parameter_name: str) -> dict[str, Any]:
+        for tool in self._tools_schema:
+            function = tool.get("function", {})
+            if function.get("name") == tool_name:
+                properties = function.get("parameters", {}).get("properties", {})
+                schema = properties.get(parameter_name, {})
+                return schema if isinstance(schema, dict) else {}
+        return {}
+
+    def _is_string_parameter(self) -> bool:
+        value_type = str(self._parameter_type.get("type", "string")).lower()
+        return value_type in {"string", "str", "text", "varchar", "char", "enum"}
+
+    def _consume_parameter_fragment(self, fragment: str, deltas: list[SemanticDelta]) -> None:
+        if not fragment:
+            return
+        if not self._parameter_leading_checked:
+            self._parameter_leading_checked = True
+            if fragment.startswith("\n"):
+                fragment = fragment[1:]
+                self._parameter_had_leading_newline = True
+
+        candidate = self._pending_parameter_newline + fragment
+        self._pending_parameter_newline = ""
+        if self._parameter_had_leading_newline and candidate.endswith("\n"):
+            candidate, self._pending_parameter_newline = candidate[:-1], "\n"
+        if not candidate:
+            return
+        self._parameter_buffer.append(candidate)
+        if self._is_string_parameter() and self._tool_name not in self._deferred_tool_names:
+            self._emit_tool_input(deltas, json.dumps(candidate, ensure_ascii=False)[1:-1])
+
+    def _finish_parameter(self, deltas: list[SemanticDelta]) -> None:
+        name = self._parameter_name
+        if name is None:
+            raise StreamProtocolError("parameter closed without a name")
+        raw = "".join(self._parameter_buffer)
+        if self._is_string_parameter():
+            value: Any = raw
+            if self._tool_name not in self._deferred_tool_names:
+                self._emit_tool_input(deltas, '"')
+        else:
+            value = self._convert_complete_value(raw, self._parameter_type)
+            if self._tool_name not in self._deferred_tool_names:
+                self._emit_tool_input(deltas, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        self._current_input[name] = value
+        self._parameter_count += 1
+        self._parameter_name = None
+        self._pending_parameter_newline = ""
+
+    def _finish_tool(self, deltas: list[SemanticDelta]) -> None:
+        name = self._tool_name
+        if name is None:
+            raise StreamProtocolError("tool closed without a function name")
+        tool_use = {"name": name, "input": dict(self._current_input)}
+        if name in self._deferred_tool_names:
+            if self._canonicalize_tool is not None:
+                tool_use = self._canonicalize_tool(tool_use)
+            deltas.append(
+                SemanticDelta(
+                    DeltaKind.TOOL_START,
+                    tool_index=self._tool_index,
+                    tool_name=str(tool_use.get("name") or "tool"),
+                )
+            )
+            self._emit_tool_input(
+                deltas,
+                json.dumps(tool_use.get("input") or {}, ensure_ascii=False, separators=(",", ":")),
+            )
+        deltas.append(SemanticDelta(DeltaKind.TOOL_STOP, tool_index=self._tool_index))
+        self._tool_uses.append(tool_use)
+
+    def _reset_tool(self) -> None:
+        self._tool_state = _ToolState.EXPECT_FUNCTION
+        self._tool_name = None
+        self._parameter_name = None
+        self._parameter_type = {}
+        self._parameter_buffer = []
+        self._pending_parameter_newline = ""
+        self._parameter_had_leading_newline = False
+        self._parameter_leading_checked = False
+        self._json_started = False
+        self._parameter_count = 0
+        self._current_input = {}
+
+    def _emit_tool_input(self, deltas: list[SemanticDelta], text: str) -> None:
+        if text:
+            deltas.append(SemanticDelta(DeltaKind.TOOL_INPUT, text=text, tool_index=self._tool_index))
+
+    @staticmethod
+    def _convert_complete_value(raw: str, schema: dict[str, Any]) -> Any:
+        value_type = str(schema.get("type", "string")).lower()
+        if raw.lower() == "null":
+            return None
+        if value_type in {"string", "str", "text", "varchar", "char", "enum"}:
+            return raw
+        if value_type in {"boolean", "bool", "binary"}:
+            return raw.lower() == "true"
+        if value_type.startswith(("int", "uint", "long", "short", "unsigned")):
+            try:
+                return int(raw)
+            except ValueError:
+                return raw
+        if value_type.startswith(("num", "float")):
+            try:
+                number = float(raw)
+            except ValueError:
+                return raw
+            return int(number) if number.is_integer() and "." not in raw and "e" not in raw.lower() else number
+        if value_type in {"object", "array", "arr"} or value_type.startswith(("dict", "list")):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+        return raw
 
     def _emit_reasoning(self, text: str) -> list[SemanticDelta]:
         if not text:
