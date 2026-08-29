@@ -540,7 +540,9 @@ def test_anthropic_stream_emits_content_before_terminal_chunk():
     assert events[-1][0] == "message_stop"
 
 
-def test_anthropic_streams_long_write_input_before_tool_closes():
+def test_anthropic_streams_long_write_input_before_tool_closes(monkeypatch):
+    monkeypatch.delitem(sys.modules, "transformers", raising=False)
+
     async def run_case():
         stream_gate = asyncio.Event()
         prefix = "<tool_call><function=Write>" "<parameter=file_path>/tmp/a.py</parameter>" "<parameter=content>"
