@@ -5,8 +5,15 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import secrets
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from aiohttp import web
+
+if TYPE_CHECKING:
+    from slime.agent.adapters.common import GenerationProgress, Reply
 
 
 class StreamProtocolError(RuntimeError):
@@ -497,3 +504,175 @@ class QwenAnthropicStreamParser:
             return []
         self._text_parts.append(emitted)
         return [SemanticDelta(DeltaKind.TEXT, text=emitted)]
+
+
+async def _write_event(response: web.StreamResponse, name: str, payload: dict) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    await response.write(f"event: {name}\ndata: {encoded}\n\n".encode())
+
+
+class AnthropicStreamResponse:
+    """Translate semantic model deltas into one Anthropic SSE response."""
+
+    def __init__(
+        self,
+        *,
+        response: web.StreamResponse,
+        parser: QwenAnthropicStreamParser,
+        input_tokens: int,
+        model: str,
+    ) -> None:
+        self.response = response
+        self.parser = parser
+        self.input_tokens = input_tokens
+        self.model = model
+        self.started_at = time.monotonic()
+        self.first_chunk_ms: float | None = None
+        self.first_content_delta_ms: float | None = None
+        self.last_content_delta_ms: float | None = None
+        self.stream_chunks = 0
+        self.content_delta_count = 0
+        self.latest_text = ""
+        self._next_block_index = 0
+        self._open_block_index: int | None = None
+        self._open_block_kind: DeltaKind | None = None
+        self._tool_ids: dict[int, str] = {}
+
+    async def on_progress(self, progress: GenerationProgress) -> None:
+        now = time.monotonic()
+        if self.first_chunk_ms is None:
+            self.first_chunk_ms = (now - self.started_at) * 1000
+        self.stream_chunks = progress.chunk_index
+        self.latest_text = progress.text
+        await self._write_deltas(self._coalesce(self.parser.push(progress.text)))
+
+    async def finish(
+        self,
+        reply: Reply,
+        raw_output: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> web.StreamResponse:
+        deltas, _ = self.parser.finish(raw_output)
+        await self._write_deltas(self._coalesce(deltas))
+        await self._close_block()
+        _, stop_reason = reply.wire
+        await _write_event(
+            self.response,
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            },
+        )
+        await _write_event(self.response, "message_stop", {"type": "message_stop"})
+        await self.response.write_eof()
+        return self.response
+
+    async def fail(self, error: Exception) -> web.StreamResponse:
+        from slime.agent.adapters.common import ContextWindowExceeded
+
+        if isinstance(error, ContextWindowExceeded):
+            error_type = "invalid_request_error"
+            message = str(error)
+        else:
+            error_type = "api_error"
+            message = "SGLang generation failed"
+        await _write_event(
+            self.response,
+            "error",
+            {"type": "error", "error": {"type": error_type, "message": message}},
+        )
+        await self.response.write_eof()
+        return self.response
+
+    @staticmethod
+    def _coalesce(deltas: list[SemanticDelta]) -> list[SemanticDelta]:
+        coalesced: list[SemanticDelta] = []
+        for delta in deltas:
+            if (
+                coalesced
+                and delta.kind in {DeltaKind.REASONING, DeltaKind.TEXT, DeltaKind.TOOL_INPUT}
+                and coalesced[-1].kind is delta.kind
+                and coalesced[-1].tool_index == delta.tool_index
+            ):
+                previous = coalesced[-1]
+                coalesced[-1] = dataclasses.replace(previous, text=previous.text + delta.text)
+            else:
+                coalesced.append(delta)
+        return coalesced
+
+    async def _write_deltas(self, deltas: list[SemanticDelta]) -> None:
+        for delta in deltas:
+            if delta.kind is DeltaKind.REASONING:
+                await self._ensure_block(DeltaKind.REASONING, {"type": "thinking", "thinking": ""})
+                await self._write_content_delta({"type": "thinking_delta", "thinking": delta.text})
+            elif delta.kind is DeltaKind.TEXT:
+                await self._ensure_block(DeltaKind.TEXT, {"type": "text", "text": ""})
+                await self._write_content_delta({"type": "text_delta", "text": delta.text})
+            elif delta.kind is DeltaKind.TOOL_START:
+                await self._close_block()
+                tool_index = delta.tool_index if delta.tool_index is not None else len(self._tool_ids)
+                tool_id = f"toolu_{secrets.token_hex(12)}"
+                self._tool_ids[tool_index] = tool_id
+                await self._open_block(
+                    DeltaKind.TOOL_START,
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": delta.tool_name or "tool",
+                        "input": {},
+                    },
+                )
+            elif delta.kind is DeltaKind.TOOL_INPUT:
+                if self._open_block_kind is not DeltaKind.TOOL_START:
+                    raise StreamProtocolError("tool input arrived without an open tool block")
+                await self._write_content_delta({"type": "input_json_delta", "partial_json": delta.text})
+            elif delta.kind is DeltaKind.TOOL_STOP:
+                if self._open_block_kind is not DeltaKind.TOOL_START:
+                    raise StreamProtocolError("tool stop arrived without an open tool block")
+                await self._close_block()
+
+    async def _ensure_block(self, kind: DeltaKind, content_block: dict) -> None:
+        if self._open_block_kind is kind:
+            return
+        await self._close_block()
+        await self._open_block(kind, content_block)
+
+    async def _open_block(self, kind: DeltaKind, content_block: dict) -> None:
+        index = self._next_block_index
+        self._next_block_index += 1
+        self._open_block_index = index
+        self._open_block_kind = kind
+        await _write_event(
+            self.response,
+            "content_block_start",
+            {"type": "content_block_start", "index": index, "content_block": content_block},
+        )
+
+    async def _write_content_delta(self, delta: dict) -> None:
+        if self._open_block_index is None:
+            raise StreamProtocolError("content delta arrived without an open block")
+        now = time.monotonic()
+        elapsed_ms = (now - self.started_at) * 1000
+        if self.first_content_delta_ms is None:
+            self.first_content_delta_ms = elapsed_ms
+        self.last_content_delta_ms = elapsed_ms
+        self.content_delta_count += 1
+        await _write_event(
+            self.response,
+            "content_block_delta",
+            {"type": "content_block_delta", "index": self._open_block_index, "delta": delta},
+        )
+
+    async def _close_block(self) -> None:
+        if self._open_block_index is None:
+            return
+        await _write_event(
+            self.response,
+            "content_block_stop",
+            {"type": "content_block_stop", "index": self._open_block_index},
+        )
+        self._open_block_index = None
+        self._open_block_kind = None

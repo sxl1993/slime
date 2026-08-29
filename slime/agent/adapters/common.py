@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
 
 import aiohttp
 from aiohttp import web
@@ -75,6 +75,20 @@ class GenerationProgress:
 
 
 ProgressCallback = Callable[[GenerationProgress], Awaitable[None]]
+
+
+class IncrementalStream(Protocol):
+    async def on_progress(self, progress: GenerationProgress) -> None: ...
+
+    async def finish(
+        self,
+        reply: Reply,
+        raw_output: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> web.StreamResponse: ...
+
+    async def fail(self, error: Exception) -> web.StreamResponse: ...
 
 
 class ContextWindowExceeded(Exception):
@@ -247,24 +261,14 @@ class BaseAdapter:
     ) -> web.StreamResponse:
         raise NotImplementedError
 
-    async def _start_stream(
+    async def _start_incremental_stream(
         self,
         request: web.Request,
-        in_tok: int,
-    ) -> web.StreamResponse | None:
+        body: dict,
+        input_tokens: int,
+        tools_schema: list[dict] | None,
+    ) -> IncrementalStream | None:
         return None
-
-    async def _stream_error(self, response: web.StreamResponse, error: Exception) -> web.StreamResponse:
-        raise NotImplementedError
-
-    async def _finish_stream(
-        self,
-        response: web.StreamResponse,
-        reply: Reply,
-        in_tok: int,
-        out_tok: int,
-    ) -> web.StreamResponse:
-        raise NotImplementedError
 
     def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
         return web.json_response(
@@ -450,19 +454,33 @@ class BaseAdapter:
             s.max_prompt_tokens = max(s.max_prompt_tokens, prompt_tokens)
 
             stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
-            stream_response = await self._start_stream(request, prompt_tokens) if stream else None
+            controller = await self._start_incremental_stream(
+                request,
+                body,
+                prompt_tokens,
+                tools_schema,
+            )
 
             try:
-                turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+                turn = await call_sglang_generate(
+                    prompt_ids,
+                    s,
+                    body,
+                    adapter=self,
+                    session_id=sid,
+                    progress_callback=controller.on_progress if controller is not None else None,
+                )
             except ContextWindowExceeded as error:
-                if stream_response is not None:
-                    return await self._stream_error(stream_response, error)
+                if controller is not None:
+                    return await controller.fail(error)
                 return self._context_limit_response(error)
+            except asyncio.CancelledError:
+                raise
             except ConnectionResetError:
                 raise
             except Exception as error:
-                if stream_response is not None:
-                    return await self._stream_error(stream_response, error)
+                if controller is not None:
+                    return await controller.fail(error)
                 raise
 
             raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
@@ -480,8 +498,8 @@ class BaseAdapter:
             # disconnected during generation makes _respond raise here, and we
             # must not record a turn the client never received.
             try:
-                if stream_response is not None:
-                    response = await self._finish_stream(stream_response, reply, in_tok, out_tok)
+                if controller is not None:
+                    response = await controller.finish(reply, raw_output, in_tok, out_tok)
                 else:
                     response = await self._respond(request, body, reply, in_tok, out_tok, stream)
             except (ConnectionResetError, asyncio.CancelledError) as e:
@@ -495,6 +513,10 @@ class BaseAdapter:
                 if isinstance(e, asyncio.CancelledError):
                     raise
                 return web.Response(status=499, text="client disconnected")
+            except Exception as error:
+                if controller is not None:
+                    return await controller.fail(error)
+                raise
 
             self._run_debug_callback(
                 sid,
