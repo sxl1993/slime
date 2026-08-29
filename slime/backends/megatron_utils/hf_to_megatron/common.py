@@ -155,6 +155,9 @@ def load_model_hf_weights(
     reader = SafetensorReader(path)
     with torch.no_grad():
         for name, parameter in named_params_and_buffers(args, model):
+            # The scalar critic head is not present in the base HF checkpoint.
+            if name.endswith("output_layer.bias") and parameter.numel() == 1:
+                continue
             tensor = get_hf_tensor(name, reader, config)
             if name.endswith("output_layer.weight") and parameter.shape[0] == 1 and tensor.shape[0] != 1:
                 continue

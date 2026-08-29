@@ -23,8 +23,6 @@ def iter_record_batches(records: Iterable[Any], batch_size: int) -> Iterator[lis
         if len(batch) == batch_size:
             yield batch
             batch = []
-    if batch:
-        yield batch
 
 
 def total_optimizer_steps(record_count: int, global_batch_size: int) -> int:
@@ -32,7 +30,15 @@ def total_optimizer_steps(record_count: int, global_batch_size: int) -> int:
         raise ValueError("global_batch_size must be positive")
     if record_count < 1:
         return 0
-    return math.ceil(record_count / global_batch_size)
+    return record_count // global_batch_size
+
+
+def initial_training_step(start_rollout_ids: list[int]) -> int:
+    if not start_rollout_ids:
+        return 0
+    if any(rollout_id != start_rollout_ids[0] for rollout_id in start_rollout_ids):
+        raise ValueError(f"workers loaded different checkpoint iterations: {start_rollout_ids}")
+    return start_rollout_ids[0] - 1
 
 
 def selected_record_count(manifest: dict[str, Any], split: str) -> int:
@@ -81,6 +87,12 @@ def should_save_checkpoint(value: float, best_value: float) -> bool:
     return value < best_value
 
 
+def should_save_training_checkpoint(step: int, final_step: int, interval: int) -> bool:
+    if interval < 1:
+        raise ValueError("checkpoint save interval must be positive")
+    return step % interval == 0 or step == final_step
+
+
 def build_selection_payload(
     *, best_iteration: int, best_value: float, global_batch_size: int, train_limit: int | None
 ):
@@ -105,6 +117,7 @@ def add_critic_pretrain_arguments(parser: argparse.ArgumentParser) -> argparse.A
     parser.add_argument("--critic-pretrain-train-limit", type=int, default=None)
     parser.add_argument("--critic-pretrain-eval-interval", type=int, default=100)
     parser.add_argument("--critic-pretrain-eval-batch-size", type=int, default=128)
+    parser.add_argument("--critic-pretrain-eval-limit", type=int, default=512)
     parser.add_argument("--critic-pretrain-mode", choices=("train", "eval"), default="train")
     parser.add_argument("--critic-pretrain-canary", action="store_true")
     parser.add_argument("--critic-pretrain-eval-split", choices=("dev", "test"), default="dev")
@@ -116,12 +129,19 @@ def _manifest_count(manifest: dict[str, Any], split: str) -> int:
     return selected_record_count(manifest, split)
 
 
-def evaluate_split(group, artifact_dir: Path, split: str, parallel_config, batch_size: int) -> dict[str, float | None]:
+def evaluate_split(
+    group,
+    artifact_dir: Path,
+    split: str,
+    parallel_config,
+    batch_size: int,
+    limit: int | None,
+) -> dict[str, float | None]:
     """Evaluate a balanced artifact split without touching optimizer state."""
     import ray
 
     aggregate = ValueMetricAccumulator()
-    for records in iter_record_batches(iter_critic_records(artifact_dir, split), batch_size=batch_size):
+    for records in iter_record_batches(iter_critic_records(artifact_dir, split, limit=limit), batch_size=batch_size):
         refs = build_critic_data_refs(group.args, parallel_config, records)
         states = ray.get(group.async_evaluate(refs))
         for state in states:
@@ -130,9 +150,9 @@ def evaluate_split(group, artifact_dir: Path, split: str, parallel_config, batch
     return aggregate.compute()
 
 
-def _constant_prior_baseline(artifact_dir: Path, split: str) -> dict[str, float | None]:
+def _constant_prior_baseline(artifact_dir: Path, split: str, *, limit: int | None) -> dict[str, float | None]:
     metrics = ValueMetricAccumulator()
-    for record in iter_critic_records(artifact_dir, split):
+    for record in iter_critic_records(artifact_dir, split, limit=limit):
         import torch
 
         metrics.update(
@@ -194,7 +214,7 @@ def train(args) -> None:
         role="critic",
         actor_cls=CriticPretrainRayActor,
     )
-    group.create(rollout_manager=None)
+    start_rollout_ids = group.create(rollout_manager=None)
     parallel_config = group.get_train_parallel_config()
 
     if args.critic_pretrain_mode == "eval":
@@ -204,6 +224,7 @@ def train(args) -> None:
             args.critic_pretrain_eval_split,
             parallel_config,
             args.critic_pretrain_eval_batch_size,
+            args.critic_pretrain_eval_limit,
         )
         output = args.critic_pretrain_selection_json.parent / f"eval-{args.critic_pretrain_eval_split}.json"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -211,12 +232,12 @@ def train(args) -> None:
         logger.info("critic evaluation: %s", metrics)
         return
 
-    baseline = _constant_prior_baseline(artifact_dir, "dev")
+    baseline = _constant_prior_baseline(artifact_dir, "dev", limit=args.critic_pretrain_eval_limit)
     logger.info("constant prior baseline: %s", baseline)
     best_value = float("inf")
-    step = 0
+    step = initial_training_step(start_rollout_ids)
     final_metrics = None
-    final_step = total_optimizer_steps(train_limit, args.global_batch_size)
+    final_step = step + total_optimizer_steps(train_limit, args.global_batch_size)
     for records in iter_record_batches(
         iter_critic_records(artifact_dir, "train", limit=train_limit),
         batch_size=args.global_batch_size,
@@ -231,11 +252,11 @@ def train(args) -> None:
                 "dev",
                 parallel_config,
                 args.critic_pretrain_eval_batch_size,
+                args.critic_pretrain_eval_limit,
             )
             current = metrics["trajectory_equal_mse"]
             if current is not None and should_save_checkpoint(current, best_value):
                 best_value = current
-                group.save_model(step, force_sync=True)
                 write_selection_json(
                     args.critic_pretrain_selection_json,
                     build_selection_payload(
@@ -245,6 +266,8 @@ def train(args) -> None:
                         train_limit=train_limit,
                     ),
                 )
+            if should_save_training_checkpoint(step, final_step, args.save_interval):
+                group.save_model(step, force_sync=True)
             logger.info("critic dev step=%d metrics=%s", step, metrics)
             final_metrics = metrics
 
@@ -269,6 +292,7 @@ def train(args) -> None:
             "dev",
             parallel_config,
             args.critic_pretrain_eval_batch_size,
+            args.critic_pretrain_eval_limit,
         )
         if not math.isclose(
             float(reloaded_metrics["trajectory_equal_mse"]),

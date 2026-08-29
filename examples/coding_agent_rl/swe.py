@@ -5,6 +5,8 @@ effect):
 
   - "scaleswe" (default): scaleswe data shape (image_url + pre_commands +
     swepro/eval_cmd/f2p_script); custom "exit 0 == solved" grading.
+  - "lego": Lego-RL/Harbor task images with the task-native tests/test.sh
+    verifier; exit code 0 means solved.
   - "swebench": SWE-bench Verified v5 (remote_env_info.{image,base_commit,
     test_patch,FAIL_TO_PASS,PASS_TO_PASS,version,eval_script,log_parser,
     eval_type}); graded with swebench's
@@ -44,6 +46,7 @@ from swebench.harness.utils import make_test_spec  # type: ignore
 logger = logging.getLogger(__name__)
 
 PROTOCOL_SCALESWE = "scaleswe"
+PROTOCOL_LEGO = "lego"
 PROTOCOL_SWEBENCH = "swebench"
 _SWEBENCH_REQUIRED_FIELDS = (
     "instance_id",
@@ -86,6 +89,8 @@ class EvalResult(NamedTuple):
 def get_metadata(sample: Sample, protocol: str = PROTOCOL_SCALESWE) -> dict[str, Any]:
     if protocol == PROTOCOL_SWEBENCH:
         return _metadata_swebench(sample)
+    if protocol == PROTOCOL_LEGO:
+        return _metadata_lego(sample)
     return _metadata_scaleswe(sample)
 
 
@@ -116,6 +121,24 @@ def _metadata_scaleswe(sample: Sample) -> dict[str, Any]:
             "f2p_script": f2p_script,
             "pre_commands": m.get("pre_commands") or rem.get("pre_commands"),
         },
+    }
+
+
+def _metadata_lego(sample: Sample) -> dict[str, Any]:
+    """Lego-RL row shape: task-native metadata under ``metadata.lego``."""
+    m = sample.metadata or {}
+    lego = dict(m.get("lego") or {})
+    instance_id = lego.get("instance_id") or sample.label or "unknown"
+    lego["instance_id"] = instance_id
+    lego.setdefault("workdir", "/testbed")
+    lego.setdefault("test_cmd", "bash tests/test.sh")
+    return {
+        "protocol": PROTOCOL_LEGO,
+        "instance_id": instance_id,
+        "image": lego.get("image"),
+        "workdir": lego.get("workdir"),
+        "problem_statement": m.get("problem_statement") or _coerce_prompt(sample.prompt),
+        "grading": {"lego_task": lego},
     }
 
 
@@ -157,7 +180,18 @@ def _coerce_prompt(prompt) -> str:
 def evaluability_check(md: dict) -> str | None:
     if md.get("protocol") == PROTOCOL_SWEBENCH:
         return _evaluability_check_swebench(md)
+    if md.get("protocol") == PROTOCOL_LEGO:
+        return _evaluability_check_lego(md)
     return "protocol_row_mismatch:looks_swebench" if md.get("looks_swebench") else None
+
+
+def _evaluability_check_lego(md: dict) -> str | None:
+    task = md.get("grading", {}).get("lego_task") or {}
+    if not task.get("task_dir"):
+        return "missing_lego_task_dir"
+    if not task.get("test_cmd"):
+        return "missing_lego_test_cmd"
+    return None
 
 
 def _evaluability_check_swebench(md: dict) -> str | None:
@@ -259,7 +293,54 @@ async def run_evaluation(md: dict, *, diff_text: str, timeout_sec: int) -> EvalR
     reward."""
     if md.get("protocol") == PROTOCOL_SWEBENCH:
         return await _grade_swebench(md, diff_text, timeout_sec)
+    if md.get("protocol") == PROTOCOL_LEGO:
+        return await _grade_lego(md, diff_text, timeout_sec)
     return await _grade_scaleswe(md, diff_text, timeout_sec)
+
+
+# ---------------------------------------------------------------------------
+# Lego-RL grader
+# ---------------------------------------------------------------------------
+async def _grade_lego(md: dict, diff_text: str, timeout_sec: int) -> EvalResult:
+    """Run Lego's task-native verifier in a clean sandbox."""
+    instance_id = md["instance_id"]
+    image = md["image"]
+    workdir = md["workdir"]
+    task = md.get("grading", {}).get("lego_task") or {}
+    test_cmd = task.get("test_cmd", "bash tests/test.sh")
+
+    if not image:
+        logger.warning("[swe.lego] %s: missing image; reward=0", instance_id)
+        return EvalResult(0.0, True)
+
+    async with create_sandbox(
+        image,
+        metadata={"instance_id": str(instance_id), "role": "eval", "attempt": "1"},
+    ) as ev:
+        await agent_sandbox.prepare_work_user(ev, workdir)
+        applied = await _apply_diff(ev, workdir, diff_text)
+        if not applied:
+            logger.warning("[swe.lego] %s: model patch failed to apply", instance_id)
+            return EvalResult(0.0, False)
+        exit_code, log = await exec_and_wait(
+            ev,
+            cmd=test_cmd,
+            user=ev.work_user,
+            workdir=workdir,
+            time_budget_sec=timeout_sec,
+            tag=f"lego-{instance_id}",
+            want_output=True,
+        )
+
+    reward = 1.0 if exit_code == 0 else 0.0
+    logger.info(
+        "[swe.lego] %s: reward=%.0f verifier_exit_code=%s log_tail=%r",
+        instance_id,
+        reward,
+        exit_code,
+        (log or "")[-600:],
+    )
+    return EvalResult(reward, True)
 
 
 # ---------------------------------------------------------------------------

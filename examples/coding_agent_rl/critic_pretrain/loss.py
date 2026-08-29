@@ -31,30 +31,51 @@ def critic_pretrain_loss(
     """Regress response-aligned values to fixed terminal returns."""
     from slime.backends.megatron_utils.loss import get_values
 
-    values = get_values(
+    _, value_output = get_values(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
-    )["values"]
+    )
+    values = value_output["values"]
     targets = batch["returns"]
     masks = batch["loss_masks"]
     if not (len(values) == len(targets) == len(masks)):
         raise ValueError("critic values, returns, and masks must have the same number of trajectories")
 
     errors = []
-    for value, target, mask in zip(values, targets, masks, strict=True):
-        if value.shape != target.shape or target.shape != mask.shape:
+    local_targets = []
+    context_parallel_size = getattr(args, "context_parallel_size", 1)
+    for value, target, mask, total_length, response_length in zip(
+        values,
+        targets,
+        masks,
+        batch["total_lengths"],
+        batch["response_lengths"],
+        strict=True,
+    ):
+        if target.shape != mask.shape:
             raise ValueError(
                 f"critic target shape mismatch: values={tuple(value.shape)}, "
                 f"targets={tuple(target.shape)}, masks={tuple(mask.shape)}"
             )
-        errors.append((value - target).square())
+        target_for_loss = target
+        if context_parallel_size > 1:
+            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+            target_for_loss = slice_log_prob_with_cp(target, total_length, response_length)
+        if value.shape != target_for_loss.shape:
+            raise ValueError(
+                f"critic target shape mismatch: values={tuple(value.shape)}, "
+                f"targets={tuple(target_for_loss.shape)}, masks={tuple(mask.shape)}"
+            )
+        local_targets.append(target_for_loss)
+        errors.append((value - target_for_loss).square())
     flat_errors = torch.cat(errors, dim=0)
     loss = sum_of_sample_mean(flat_errors)
     value_mean = sum_of_sample_mean(torch.cat(values, dim=0)) / len(values)
-    target_mean = sum_of_sample_mean(torch.cat(targets, dim=0)) / len(targets)
+    target_mean = sum_of_sample_mean(torch.cat(local_targets, dim=0)) / len(local_targets)
     return loss, {
         "value_loss": loss.detach(),
         "value_mean": value_mean.detach(),

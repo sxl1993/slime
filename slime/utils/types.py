@@ -136,8 +136,10 @@ class Sample:
         # external API error, parsing error). Unlike ABORTED, FAILED samples may still contain partial
         # valid output and can be retried or handled gracefully.
         FAILED = "failed"
+        TERMINAL_FAILED = "terminal_failed"
 
     status: Status = Status.PENDING
+    retry_after_seconds: float | None = None
 
     metadata: dict = field(default_factory=dict)
     generate_function_path: str | None = None

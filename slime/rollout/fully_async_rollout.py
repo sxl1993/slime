@@ -7,20 +7,18 @@ in-flight sample to finish.
 
 Use with ``--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async``.
 Plug in per-sample logic via ``--custom-generate-function-path`` and
-per-sample reward via ``--custom-rm-path`` — the worker calls slime's stock
-:func:`generate_and_rm_group` which dispatches to those.
+per-sample reward via ``--custom-rm-path`` — the worker calls the stock
+per-sample or group entrypoint according to the selected estimator.
 
 Concurrency is sourced from ``args.sglang_server_concurrency`` and scaled by
 the number of sglang engines to match the per-sample semaphore cap in
 :mod:`slime.rollout.sglang_rollout`.
 
-The worker is intentionally oblivious to slime's higher-level pause /
-weight-update signalling (e.g. ``GenerateState.aborted``). Each in-flight
-generation short-circuits on those signals on its own and surfaces
-:data:`Sample.Status.ABORTED`; the only piece the worker owns is
-**redirecting ABORTED groups back to ``data_buffer``** instead of shipping
-them to training, so the next rollout (with refreshed weights) can pick
-them up.
+GRPO uses the shared
+:func:`slime.rollout.sglang_rollout.generate_and_rm_group` seam. SAO uses
+:func:`slime.rollout.sglang_rollout.generate_and_rm` once per prompt and does
+not apply group retry or group admission. This worker owns continuous
+background concurrency and queue backpressure for both paths.
 """
 
 from __future__ import annotations
@@ -32,7 +30,13 @@ import queue
 import threading
 import time
 
-from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    ensure_group_progress,
+    generate_and_rm,
+    generate_and_rm_group,
+    group_outcome,
+)
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_rollout_num_engines
 from slime.utils.types import Sample
@@ -74,8 +78,7 @@ atexit.register(_stop_global_worker)
 
 
 class AsyncRolloutWorker:
-    """Background thread + asyncio loop that continuously consumes groups
-    from ``data_buffer`` and runs :func:`generate_and_rm_group` on each."""
+    """Background worker for GRPO groups or individual SAO rollout units."""
 
     def __init__(self, args, data_buffer, concurrency: int = 10):
         self.args = args
@@ -120,6 +123,17 @@ class AsyncRolloutWorker:
                 break
         return completed
 
+    def get_completed_rollouts(self, limit: int | None = None) -> list[tuple[int, list[Sample]]]:
+        """Pop completed SAO rollout units from the persistent output queue."""
+        completed: list[tuple[int, list[Sample]]] = []
+        while limit is None or len(completed) < limit:
+            try:
+                rollout_id, samples = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+            completed.append((rollout_id, samples if isinstance(samples, list) else [samples]))
+        return completed
+
     def queue_size(self) -> int:
         return self.output_queue.qsize()
 
@@ -146,25 +160,39 @@ class AsyncRolloutWorker:
                     active_tasks -= done
 
                 # Top up. The qsize gate is the queue's backpressure: once a
-                # full pool of completed groups is waiting, stop pulling new
+                # full pool of completed results is waiting, stop pulling new
                 # prompts until the training side drains some.
                 while (
                     len(active_tasks) < max_concurrent and self.output_queue.qsize() < max_concurrent and self.running
                 ):
-                    groups = self.data_buffer.get_samples(1)
-                    if not groups:
+                    prompts = self.data_buffer.get_samples(1)
+                    if not prompts:
                         break
-                    for group in groups:
+                    for prompt_samples in prompts:
                         gid = gid_counter
                         gid_counter += 1
-                        task = asyncio.create_task(
-                            generate_and_rm_group(
-                                self.args,
-                                group,
-                                sampling_params=self.state.sampling_params.copy(),
-                                evaluation=False,
+                        if getattr(self.args, "advantage_estimator", None) == "sao":
+                            if len(prompt_samples) != 1:
+                                logger.warning(
+                                    "fully-async SAO expected one sample per prompt, got %d", len(prompt_samples)
+                                )
+                                continue
+                            task = asyncio.create_task(
+                                _generate_sao_rollout(
+                                    self.args,
+                                    prompt_samples[0],
+                                    sampling_params=self.state.sampling_params.copy(),
+                                )
                             )
-                        )
+                        else:
+                            task = asyncio.create_task(
+                                generate_and_rm_group(
+                                    self.args,
+                                    prompt_samples,
+                                    sampling_params=self.state.sampling_params.copy(),
+                                    evaluation=False,
+                                )
+                            )
                         task.add_done_callback(self._make_done_cb(gid))
                         active_tasks.add(task)
 
@@ -190,24 +218,40 @@ class AsyncRolloutWorker:
             except Exception:  # noqa: BLE001
                 logger.exception("fully-async: process task raised")
                 return
+            if getattr(self.args, "advantage_estimator", None) == "sao":
+                if isinstance(result, Sample):
+                    samples = [result]
+                elif isinstance(result, list) and all(isinstance(sample, Sample) for sample in result):
+                    samples = result
+                else:
+                    logger.warning("fully-async SAO: rollout returned %r; dropping", type(result).__name__)
+                    return
+                self.output_queue.put((gid, samples))
+                return
             if not isinstance(result, list):
                 logger.warning(
                     "fully-async: generate_and_rm_group returned %r, expected list[Sample] or list[list[Sample]]; dropping",
                     type(result).__name__,
                 )
                 return
-            # Aborted group → requeue, don't ship to training.
             groups = result if result and isinstance(result[0], list) else [result]
-            samples = (sample for group in groups for sample in group)
-            if any(getattr(sample, "status", None) == Sample.Status.ABORTED for sample in samples):
+            outcome = group_outcome(result)
+            if outcome == "terminal" or outcome == "retryable":
+                return
+            if outcome == "interrupted":
                 try:
                     self.data_buffer.add_samples(groups)
                 except Exception:  # noqa: BLE001
-                    logger.exception("fully-async: failed to requeue aborted group")
+                    logger.exception("fully-async: failed to requeue interrupted group")
                 return
             self.output_queue.put((gid, result))
 
         return _cb
+
+
+async def _generate_sao_rollout(args, sample: Sample, sampling_params: dict) -> Sample | list[Sample]:
+    """Generate exactly one SAO rollout unit without group scheduling."""
+    return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=False)
 
 
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[list[Sample]]:
@@ -222,18 +266,33 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         worker.queue_size(),
     )
 
-    collected: dict[int, list[Sample]] = {}
+    is_sao = getattr(args, "advantage_estimator", None) == "sao"
+    collected: dict[int, list[Sample] | list[list[Sample]]] = {}
     started = time.time()
+    last_progress = time.monotonic()
     last_log = started
     LOG_EVERY = 30.0
 
     while len(collected) < target:
+        if is_sao:
+            if time.monotonic() - last_progress >= 5400.0:
+                raise RuntimeError(f"rollout {rollout_id} produced no completed rollout")
+        else:
+            ensure_group_progress(last_progress, rollout_id)
         # Pull only what this rollout still needs; the surplus stays queued for
         # the next rollout (that is the "queue stays warm" contract).
         drained = 0
-        for gid, group in worker.get_completed_groups(limit=target - len(collected)):
-            collected[gid] = group
+        completed = (
+            worker.get_completed_rollouts(limit=target - len(collected))
+            if is_sao
+            else worker.get_completed_groups(limit=target - len(collected))
+        )
+        for gid, result in completed:
+            collected[gid] = result
             drained += 1
+
+        if drained:
+            last_progress = time.monotonic()
 
         if not drained:
             await asyncio.sleep(0.05)
@@ -251,10 +310,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             last_log = now
 
     # Order by sample.index for determinism (slime convention).
-    def _key(group: list[Sample] | list[list[Sample]]) -> int:
-        if group and isinstance(group[0], list):
-            group = group[0]
-        for s in group:
+    def _key(result: list[Sample] | list[list[Sample]]) -> int:
+        if result and isinstance(result[0], list):
+            result = result[0]
+        for s in result:
             idx = getattr(s, "index", None)
             if idx is not None:
                 return int(idx)
