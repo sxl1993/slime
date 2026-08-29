@@ -66,6 +66,24 @@ def _assert_full_parameter_training(model) -> tuple[int, int]:
     return sum(parameter.numel() for parameter in parameters), len(parameters)
 
 
+def restore_critic_values_for_evaluation(values, rollout_data, *, allgather_cp: bool = False):
+    """Restore CP-local values to full response sequences for metric reporting."""
+    if allgather_cp or mpu.get_context_parallel_world_size() == 1:
+        return values
+
+    from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+
+    return [
+        all_gather_with_cp(value, int(total_length), int(response_length))
+        for value, total_length, response_length in zip(
+            values,
+            rollout_data["total_lengths"],
+            rollout_data["response_lengths"],
+            strict=True,
+        )
+    ]
+
+
 try:
     import ray
     from megatron.core import mpu
@@ -176,6 +194,13 @@ class CriticPretrainRayActor(MegatronTrainRayActor):
             data_iterator,
             rollout_data["num_microbatches"],
         )["values"]
+        values = restore_critic_values_for_evaluation(
+            values,
+            rollout_data,
+            allgather_cp=getattr(self.args, "allgather_cp", False),
+        )
+        if mpu.get_tensor_model_parallel_rank() != 0 or mpu.get_context_parallel_rank() != 0:
+            return {}
         metrics = ValueMetricAccumulator()
         metrics.update(values, rollout_data["returns"], rollout_data["loss_masks"])
         return metrics.__dict__

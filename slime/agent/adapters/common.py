@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -31,6 +32,7 @@ __all__ = ["TurnRecord"]
 
 _COMPACTION_MIN_DROP_TOKENS = 8192
 _COMPACTION_MIN_DROP_FRACTION = 0.25
+_UPSTREAM_GENERATE_URL_RE = re.compile(r"https?://[^()\s]+/generate")
 
 
 @dataclasses.dataclass
@@ -551,7 +553,20 @@ async def call_sglang_generate(
 
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
-    headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
+    request_started = time.monotonic()
+    logger.debug(
+        "[%s] sid=%s rid=%s stage=adapter event=sglang_request_start router_url=%s "
+        "prompt_tokens=%d max_new_tokens=%s",
+        adapter.log_prefix,
+        session_id,
+        rid,
+        sglang_url,
+        len(prompt_ids),
+        sp.get("max_new_tokens"),
+    )
+    headers = {"X-Request-ID": rid}
+    if session_id and session_id != "default":
+        headers["X-SMG-Routing-Key"] = session_id
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
@@ -566,11 +581,18 @@ async def call_sglang_generate(
         ) as r:
             if r.status >= 400:
                 text = await r.text()
+                upstream_worker_url = _UPSTREAM_GENERATE_URL_RE.search(text)
                 logger.warning(
-                    "[%s] sid=%s rid=%s sglang upstream %d: %.200s",
+                    "[%s] sid=%s rid=%s stage=adapter event=sglang_request_end "
+                    "outcome=http_error router_url=%s upstream_worker_url=%s http_status=%d duration_ms=%.1f "
+                    "error_type=upstream_http sglang upstream %d: %.200s",
                     adapter.log_prefix,
                     session_id,
                     rid,
+                    sglang_url,
+                    upstream_worker_url.group(0).removesuffix("/generate") if upstream_worker_url else "-",
+                    r.status,
+                    (time.monotonic() - request_started) * 1000,
                     r.status,
                     text,
                 )
@@ -581,15 +603,54 @@ async def call_sglang_generate(
         output_ids = [x[1] for x in output_token_logprobs]
         output_log_probs = [float(x[0]) for x in output_token_logprobs]
         finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
+        logger.debug(
+            "[%s] sid=%s rid=%s stage=adapter event=sglang_request_end outcome=success "
+            "router_url=%s http_status=%d duration_ms=%.1f output_tokens=%d",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            r.status,
+            (time.monotonic() - request_started) * 1000,
+            len(output_ids),
+        )
     except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         # free the sglang slot eagerly on client cancel/timeout, else the
         # orphaned generation keeps occupying KV until its own length cap
-        logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
+        logger.warning(
+            "[%s] sid=%s rid=%s stage=adapter event=sglang_request_failed outcome=exception "
+            "router_url=%s duration_ms=%.1f exception_type=%s error=%s",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            (time.monotonic() - request_started) * 1000,
+            type(e).__name__,
+            str(e)[:200],
+        )
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
-        except Exception:
-            pass
+                async with s2.post(f"{sglang_url}/abort_request", json={"rid": rid}) as abort_response:
+                    logger.debug(
+                        "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=completed "
+                        "router_url=%s http_status=%d",
+                        adapter.log_prefix,
+                        session_id,
+                        rid,
+                        sglang_url,
+                        abort_response.status,
+                    )
+        except Exception as abort_error:
+            logger.warning(
+                "[%s] sid=%s rid=%s stage=adapter event=abort_request outcome=exception "
+                "router_url=%s exception_type=%s error=%s",
+                adapter.log_prefix,
+                session_id,
+                rid,
+                sglang_url,
+                type(abort_error).__name__,
+                str(abort_error)[:200],
+            )
         raise
 
     return TurnRecord(

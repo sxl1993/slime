@@ -38,7 +38,7 @@ import aiohttp
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness
+from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessRunResult
 from slime.agent.sandbox import Sandbox, SandboxCreateRateLimitError, SandboxLeaseError, create_sandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
@@ -679,6 +679,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     base_sample,
                     invalid_reason,
                     instance_id,
+                    status=_agent_failure_status(run_result),
                     extra_metadata={
                         **session_stats,
                         **trajectory_metadata,
@@ -731,6 +732,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
         return _abort_result(base_sample, "wall_clock_timeout", instance_id)
+    except SandboxCreateRateLimitError as e:
+        return _abort_result(
+            base_sample,
+            "exception:SandboxCreateRateLimitError",
+            instance_id,
+            status=Sample.Status.FAILED,
+            retry_after_seconds=e.retry_after,
+        )
     except Exception as e:
         logger.warning(
             "[coding_agent_rl] %s: rollout failed: %s\n%s",
@@ -784,9 +793,11 @@ def _abort_result(
     reason: str,
     instance_id: str,
     *,
+    status: Sample.Status = Sample.Status.TERMINAL_FAILED,
+    retry_after_seconds: float | None = None,
     extra_metadata: dict[str, Any] | None = None,
 ) -> list[Sample]:
-    """Mark ``sample`` aborted in place and return it in the list shape this
+    """Mark ``sample`` failed and return it in the list shape this
     fan-out generate function always yields."""
     sample.tokens = [0, 0]
     sample.response = ""
@@ -795,7 +806,8 @@ def _abort_result(
     sample.rollout_log_probs = [0.0]
     sample.reward = 0.0
     sample.remove_sample = True
-    sample.status = Sample.Status.ABORTED
+    sample.status = status
+    sample.retry_after_seconds = retry_after_seconds
     sample.metadata = {
         **(sample.metadata or {}),
         **(extra_metadata or {}),
@@ -804,8 +816,15 @@ def _abort_result(
         "trainable": False,
         "invalid_reason": reason,
     }
-    logger.warning("[coding_agent_rl] %s aborted: %s", instance_id, reason)
+    logger.warning("[coding_agent_rl] %s failed status=%s reason=%s", instance_id, status.value, reason)
     return [sample]
+
+
+def _agent_failure_status(result: HarnessRunResult) -> Sample.Status:
+    message = (result.error_message or "").lower()
+    if result.error_type == "server_error" and "session closed" not in message:
+        return Sample.Status.FAILED
+    return Sample.Status.TERMINAL_FAILED
 
 
 def _eval_result(

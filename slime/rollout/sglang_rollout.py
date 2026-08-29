@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -32,11 +33,70 @@ from slime.utils.types import Sample
 
 from .rm_hub import async_rm, batched_async_rm
 
-__all__ = ["generate_rollout", "get_model_url"]
+__all__ = ["ensure_group_progress", "generate_and_rm_group", "generate_rollout", "get_model_url", "group_outcome"]
 
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+_GROUP_FAILURE_RETRIES = 1
+_GROUP_MAX_ATTEMPTS = 3
+_GROUP_RETRY_DELAY_SECONDS = 5.0
+_GROUP_MAX_RETRY_DELAY_SECONDS = 60.0
+_GROUP_NO_PROGRESS_SECONDS = 5400.0
+
+
+def _flatten_group(group: list[Sample] | list[list[Sample]]) -> list[Sample]:
+    if group and isinstance(group[0], list):
+        return [sample for samples in group for sample in samples]
+    return group
+
+
+def group_outcome(group: list[Sample] | list[list[Sample]]) -> str:
+    samples = _flatten_group(group)
+    statuses = {sample.status for sample in samples}
+    if not samples or Sample.Status.TERMINAL_FAILED in statuses:
+        return "terminal"
+    if Sample.Status.FAILED in statuses:
+        return "retryable"
+    if Sample.Status.ABORTED in statuses:
+        return "interrupted"
+    if statuses <= {Sample.Status.COMPLETED, Sample.Status.TRUNCATED}:
+        return "completed"
+    return "terminal"
+
+
+def _group_retry_delay(group: list[Sample] | list[list[Sample]]) -> float:
+    hints = [sample.retry_after_seconds for sample in _flatten_group(group) if sample.retry_after_seconds is not None]
+    delay = max(hints) if hints else _GROUP_RETRY_DELAY_SECONDS
+    return min(_GROUP_MAX_RETRY_DELAY_SECONDS, max(0.0, delay))
+
+
+def _mark_group_terminal(group: list[Sample] | list[list[Sample]]) -> None:
+    for sample in _flatten_group(group):
+        sample.status = Sample.Status.TERMINAL_FAILED
+        sample.remove_sample = True
+
+
+def _group_failure_reason(group: list[Sample] | list[list[Sample]]) -> str:
+    for sample in _flatten_group(group):
+        for key in ("invalid_reason", "abort_reason"):
+            if reason := sample.metadata.get(key):
+                return str(reason)
+    return group_outcome(group)
+
+
+def ensure_group_progress(last_progress: float, rollout_id: int) -> None:
+    elapsed = time.monotonic() - last_progress
+    if elapsed >= _GROUP_NO_PROGRESS_SECONDS:
+        raise RuntimeError(
+            f"rollout {rollout_id} produced no completed group for {elapsed:.1f}s "
+            f"(limit={_GROUP_NO_PROGRESS_SECONDS:.1f}s)"
+        )
+
+
+def _remaining_group_progress_time(last_progress: float) -> float:
+    return max(0.0, _GROUP_NO_PROGRESS_SECONDS - (time.monotonic() - last_progress))
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -289,12 +349,7 @@ async def generate_and_rm(
     return sample
 
 
-@trace_function(
-    "generate_and_rm_group",
-    target="group",
-    attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
-)
-async def generate_and_rm_group(
+async def _generate_and_rm_group_once(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample] | list[list[Sample]]:
     # ``generate_and_rm`` may return either a ``Sample`` or a ``list[Sample]``
@@ -307,6 +362,8 @@ async def generate_and_rm_group(
     state = GenerateState(args)
 
     if state.aborted:
+        for sample in group:
+            sample.status = Sample.Status.ABORTED
         return group
 
     # Generate a unique session_id for each sample in the group
@@ -334,6 +391,72 @@ async def generate_and_rm_group(
             sample.reward = reward
 
     return group
+
+
+@trace_function(
+    "generate_and_rm_group",
+    target="group",
+    attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
+)
+async def generate_and_rm_group(
+    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+) -> list[Sample] | list[list[Sample]]:
+    pristine_group = copy.deepcopy(group)
+    failure_retries = 0
+
+    for attempt in range(1, _GROUP_MAX_ATTEMPTS + 1):
+        attempt_group = copy.deepcopy(pristine_group)
+        for sample in attempt_group:
+            sample.session_id = None
+
+        try:
+            result = await _generate_and_rm_group_once(
+                args,
+                attempt_group,
+                sampling_params=sampling_params.copy(),
+                evaluation=evaluation,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = f"group_exception:{type(exc).__name__}"
+            for sample in attempt_group:
+                sample.metadata["invalid_reason"] = reason
+            _mark_group_terminal(attempt_group)
+            logger.error(
+                "rollout group attempt outcome=terminal attempt=%d/%d reason=%s",
+                attempt,
+                _GROUP_MAX_ATTEMPTS,
+                reason,
+            )
+            return attempt_group
+        outcome = group_outcome(result)
+        if outcome == "completed" or outcome == "terminal":
+            if outcome == "terminal":
+                _mark_group_terminal(result)
+            return result
+
+        logger.warning(
+            "rollout group attempt outcome=%s attempt=%d/%d failure_retries=%d/%d reason=%s",
+            outcome,
+            attempt,
+            _GROUP_MAX_ATTEMPTS,
+            failure_retries,
+            _GROUP_FAILURE_RETRIES,
+            _group_failure_reason(result),
+        )
+
+        if outcome == "interrupted" and GenerateState(args).aborted:
+            return result
+        if attempt == _GROUP_MAX_ATTEMPTS:
+            _mark_group_terminal(result)
+            return result
+        if outcome == "retryable":
+            if failure_retries == _GROUP_FAILURE_RETRIES:
+                _mark_group_terminal(result)
+                return result
+            failure_retries += 1
+            await asyncio.sleep(_group_retry_delay(result))
+
+    raise AssertionError("unreachable")
 
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
@@ -403,17 +526,37 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
+    last_progress = time.monotonic()
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
+        ensure_group_progress(last_progress, rollout_id)
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        done, state.pendings = await asyncio.wait(
+            state.pendings,
+            timeout=_remaining_group_progress_time(last_progress),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            ensure_group_progress(last_progress, rollout_id)
+            continue
         for task in done:
             group: list[Sample] = task.result()
+
+            outcome = group_outcome(group)
+            if outcome != "completed":
+                state.remaining_batch_size -= 1
+                logger.warning(
+                    "rollout group excluded outcome=%s reason=%s",
+                    outcome,
+                    _group_failure_reason(group),
+                )
+                continue
+            last_progress = time.monotonic()
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
