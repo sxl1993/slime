@@ -1,7 +1,7 @@
 """Sandbox backends for agent rollouts.
 
 The public sandbox contract is intentionally small: async context management,
-command execution, and file read/write. Agent examples can build task-specific
+command execution, and file transfer. Agent examples can build task-specific
 setup, runner, and evaluator logic on top of this without depending directly on
 one sandbox provider.
 """
@@ -35,7 +35,8 @@ class Sandbox(Protocol):
     """Minimal async sandbox interface used by agent rollouts.
 
     ``write_file`` accepts either in-memory content (``str``/``bytes``) or a
-    host ``Path`` to stream into the sandbox.
+    host ``Path`` to stream into the sandbox. ``download_file`` streams a
+    sandbox file to a host ``Path`` without buffering the whole file.
 
     ``idempotent`` is a hint for the backend's transport-retry policy: callers
     mark whether re-sending the command after a severed response is safe to
@@ -67,6 +68,8 @@ class Sandbox(Protocol):
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None: ...
 
     async def read_file(self, sandbox_path: str, *, user: str = "root") -> str: ...
+
+    async def download_file(self, sandbox_path: str, host_path: Path, *, user: str = "root") -> None: ...
 
     async def destroy(self) -> bool: ...
 
@@ -409,6 +412,22 @@ class E2BSandbox:
         except Exception:
             return ""
 
+    async def download_file(self, sandbox_path: str, host_path: Path, *, user: str = "root") -> None:
+        reader = await self._rpc_retry(
+            f"download_file({sandbox_path} -> {host_path.name})",
+            lambda: self._sb.files.read(
+                sandbox_path,
+                format="stream",
+                user=user,
+                request_timeout=600,
+                stream_idle_timeout=60,
+            ),
+        )
+        with host_path.open("wb") as output:
+            async with reader:
+                async for chunk in reader:
+                    output.write(chunk)
+
 
 class SandboxLeaseError(RuntimeError):
     """The ARCA sandbox lease is unsafe for automatic retry."""
@@ -699,6 +718,14 @@ class ArcaSandbox:
         result = await self._sb.filesystem.read(sandbox_path, raw=True)
         content = result.content
         return content.decode("utf-8") if isinstance(content, bytes) else content
+
+    async def download_file(self, sandbox_path: str, host_path: Path, *, user: str = "admin") -> None:
+        self._require_admin(user)
+        await self._sb.filesystem.download(
+            sandbox_path,
+            str(host_path),
+            timeout_in_millis=600_000,
+        )
 
 
 def create_sandbox(image: str, *, metadata: dict[str, str] | None = None) -> Sandbox:

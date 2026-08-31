@@ -34,12 +34,16 @@ from slime.agent.adapters.common import (
     sid_from_bearer,
     tool_call_dict,
 )
-from slime.agent.adapters.anthropic_stream import AnthropicStreamResponse, QwenAnthropicStreamParser
+from slime.agent.adapters.anthropic_stream import (
+    AnthropicStreamResponse,
+    QwenAnthropicStreamParser,
+)
 from slime.agent.parsing import ParsedModelOutput
 
 logger = logging.getLogger(__name__)
 
 _TOOL_RESULT_TRUNCATION_MARKER = "\n...[tool result truncated]...\n"
+_PROMPT_SUFFIX_TOKEN_LIMIT = 16
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -96,6 +100,8 @@ class AnthropicAdapter(BaseAdapter):
         body: dict,
         input_tokens: int,
         tools_schema: list[dict] | None,
+        prompt_ids: list[int],
+        request_index: int,
     ) -> IncrementalStream | None:
         stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
         if not stream:
@@ -104,19 +110,33 @@ class AnthropicAdapter(BaseAdapter):
             return None
 
         response = await _start_stream(request, input_tokens, body.get("model", "slime-actor"))
-        parser = QwenAnthropicStreamParser(
-            tools_schema=tools_schema,
-            canonicalize_tool=_lower_search_tool,
-            deferred_tool_names=frozenset({"Grep", "Glob"}),
+        starts_in_reasoning = self.reasoning_parser == "qwen3" and _prompt_starts_in_reasoning(
+            self.tokenizer, prompt_ids
         )
+
+        def parser_factory() -> QwenAnthropicStreamParser:
+            return QwenAnthropicStreamParser(
+                tools_schema=tools_schema,
+                starts_in_reasoning=starts_in_reasoning,
+                canonicalize_tool=_lower_search_tool,
+                deferred_tool_names=frozenset({"Grep", "Glob"}),
+            )
+
+        sid = self._session_id(request, body)
         return AnthropicStreamResponse(
             response=response,
-            parser=parser,
+            parser_factory=parser_factory,
             input_tokens=input_tokens,
             model=body.get("model", "slime-actor"),
             logger=self.logger,
             log_prefix=self.log_prefix,
-            sid=self._session_id(request, body),
+            sid=sid,
+            failure_reporter=lambda family, code: self.record_session_failure(
+                sid,
+                request_index,
+                family,
+                code,
+            ),
         )
 
     def _context_limit_response(self, error: ContextWindowExceeded) -> web.Response:
@@ -140,6 +160,14 @@ class AnthropicAdapter(BaseAdapter):
         self._preprocess_body(body)
         _, _, prompt_ids = self._prepare_prompt(body)
         return web.json_response({"input_tokens": len(prompt_ids)})
+
+
+def _prompt_starts_in_reasoning(tokenizer, prompt_ids: list[int]) -> bool:
+    suffix = tokenizer.decode(
+        prompt_ids[-_PROMPT_SUFFIX_TOKEN_LIMIT:],
+        skip_special_tokens=False,
+    )
+    return suffix.rstrip().endswith("<think>")
 
 
 # --- Translation (Anthropic wire -> chat-template messages) ---

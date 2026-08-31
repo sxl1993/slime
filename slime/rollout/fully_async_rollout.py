@@ -320,10 +320,16 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         return 0
 
     out = sorted(collected.values(), key=_key)
+    batch_collect_time = time.time() - started
+    for result in out:
+        groups = result if result and isinstance(result[0], list) else [result]
+        for group in groups:
+            for sample in group:
+                sample.metadata["rollout_batch_collect_time"] = batch_collect_time
     logger.info(
         "fully-async rollout %d: done in %.1fs, queue_left=%d",
         rollout_id,
-        time.time() - started,
+        batch_collect_time,
         worker.queue_size(),
     )
     return out

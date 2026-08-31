@@ -411,7 +411,7 @@ def log_perf_data(
         and mpu.is_pipeline_last_stage()
         and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
     ):
-        return
+        return None
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
     if extra_metrics:
@@ -443,3 +443,66 @@ def log_perf_data(
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
+    return log_dict
+
+
+def compute_pipeline_perf_metrics(
+    rollout_data: RolloutBatch,
+    *,
+    critic_total_time: float | None,
+    actor_train_time: float | None,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    rollout_metrics = rollout_data.get("pipeline_rollout_metrics", [])
+
+    agent_times = [
+        item["rollout_agent_time"] for item in rollout_metrics if item.get("rollout_agent_time") is not None
+    ]
+    eval_times = [item["rollout_eval_time"] for item in rollout_metrics if item.get("rollout_eval_time") is not None]
+    if agent_times:
+        metrics["perf/rollout_agent_time_mean"] = float(np.mean(agent_times))
+        metrics["perf/rollout_agent_time_max"] = float(max(agent_times))
+    if eval_times:
+        metrics["perf/rollout_eval_time_mean"] = float(np.mean(eval_times))
+        metrics["perf/rollout_eval_time_max"] = float(max(eval_times))
+    if (batch_collect_time := rollout_data.get("rollout_batch_collect_time")) is not None:
+        metrics["perf/rollout_batch_collect_time"] = float(batch_collect_time)
+    if critic_total_time is not None:
+        metrics["perf/critic_total_time"] = float(critic_total_time)
+    if actor_train_time is not None:
+        metrics["perf/actor_train_time"] = float(actor_train_time)
+    return metrics
+
+
+def log_pipeline_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    *,
+    critic_total_time: float | None,
+    actor_train_time: float | None,
+) -> dict[str, float] | None:
+    from megatron.core import mpu
+
+    if not (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    ):
+        return None
+
+    metrics = compute_pipeline_perf_metrics(
+        rollout_data,
+        critic_total_time=critic_total_time,
+        actor_train_time=actor_train_time,
+    )
+    logger.info(f"pipeline_perf {rollout_id}: {metrics}")
+
+    # actor_train_time is already emitted by log_perf_data; keep the existing
+    # metric as its single tracking source while still showing it in this
+    # human-readable unified summary.
+    new_metrics = {key: value for key, value in metrics.items() if key != "perf/actor_train_time"}
+    if new_metrics:
+        new_metrics["rollout/step"] = compute_rollout_step(args, rollout_id)
+        logging_utils.log(args, new_metrics, step_key="rollout/step")
+    return metrics

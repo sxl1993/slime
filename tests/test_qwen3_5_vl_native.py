@@ -136,6 +136,18 @@ def test_raw_loader_uses_hf_vision_name_directly():
 
 
 @pytest.mark.unit
+def test_critic_output_layer_exports_as_scalar_head():
+    args = types.SimpleNamespace()
+    weight = torch.randn(1, 3)
+    bias = torch.tensor([0.5])
+
+    converted = dict(convert_qwen3_5_to_hf(args, "module.module.output_layer.weight", weight))
+    converted.update(dict(convert_qwen3_5_to_hf(args, "module.module.output_layer.bias", bias)))
+    assert torch.equal(converted["critic_head.weight"], weight)
+    assert torch.equal(converted["critic_head.bias"], bias)
+
+
+@pytest.mark.unit
 def test_raw_loader_uses_individual_mtp_expert_weights():
     gate = torch.randn(4, 3)
     up = torch.randn(4, 3)

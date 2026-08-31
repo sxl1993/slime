@@ -42,9 +42,23 @@ def _write_trace(path):
         json.dump(trace, stream)
 
 
-def test_iter_trace_events_reads_gzip_trace_without_loading_full_document(tmp_path):
+def _patch_orjson(monkeypatch):
+    class FakeOrjson:
+        calls = 0
+
+        @staticmethod
+        def loads(payload):
+            FakeOrjson.calls += 1
+            return json.loads(payload)
+
+    monkeypatch.setattr(_MODULE, "_orjson", FakeOrjson, raising=False)
+    return FakeOrjson
+
+
+def test_iter_trace_events_reads_gzip_trace(tmp_path, monkeypatch):
     trace_path = tmp_path / "critic.trace.json.gz"
     _write_trace(trace_path)
+    _patch_orjson(monkeypatch)
 
     events = list(iter_trace_events(trace_path))
 
@@ -52,9 +66,22 @@ def test_iter_trace_events_reads_gzip_trace_without_loading_full_document(tmp_pa
     assert events[1]["name"] == "ncclDevKernel_SendRecv"
 
 
-def test_analyze_trace_reports_critic_kernel_and_host_sync_breakdown(tmp_path):
+def test_iter_trace_events_uses_orjson(tmp_path, monkeypatch):
     trace_path = tmp_path / "critic.trace.json.gz"
     _write_trace(trace_path)
+    FakeOrjson = _patch_orjson(monkeypatch)
+
+    events = list(iter_trace_events(trace_path))
+
+    assert len(events) == 6
+    assert events[-1]["name"] == "cudaStreamSynchronize"
+    assert FakeOrjson.calls == 1
+
+
+def test_analyze_trace_reports_critic_kernel_and_host_sync_breakdown(tmp_path, monkeypatch):
+    trace_path = tmp_path / "critic.trace.json.gz"
+    _write_trace(trace_path)
+    _patch_orjson(monkeypatch)
 
     summary = analyze_trace_file(trace_path, top_n=5)
 

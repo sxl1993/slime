@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from types import SimpleNamespace
@@ -12,11 +13,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.coding_agent_rl.critic_pretrain.train import (  # noqa: E402
+    add_critic_pretrain_arguments,
     build_selection_payload,
     configure_critic_pretrain_schedule,
+    initial_training_step,
     iter_record_batches,
     selected_record_count,
     should_save_checkpoint,
+    should_save_training_checkpoint,
     total_optimizer_steps,
     validate_artifact_context,
     validate_canary_metrics,
@@ -52,11 +56,32 @@ def test_checkpoint_selection_saves_only_dev_improvements(tmp_path: Path):
     assert json.loads(path.read_text()) == payload
 
 
-def test_final_partial_batch_is_not_discarded():
+def test_final_partial_batch_is_discarded():
     batches = list(iter_record_batches(list(range(5)), batch_size=2))
-    assert batches == [[0, 1], [2, 3], [4]]
+    assert batches == [[0, 1], [2, 3]]
     assert total_optimizer_steps(4096, 128) == 32
-    assert total_optimizer_steps(4097, 128) == 33
+    assert total_optimizer_steps(4097, 128) == 32
+
+
+def test_critic_eval_limit_defaults_to_balanced_512_records():
+    parser = add_critic_pretrain_arguments(argparse.ArgumentParser())
+    args = parser.parse_args(["--critic-pretrain-data", "data", "--critic-pretrain-selection-json", "selection.json"])
+    assert args.critic_pretrain_eval_limit == 512
+
+
+def test_resume_training_starts_after_loaded_iteration():
+    assert initial_training_step([1, 1]) == 0
+    assert initial_training_step([21, 21]) == 20
+    with pytest.raises(ValueError, match="different checkpoint iterations"):
+        initial_training_step([21, 22])
+
+
+def test_training_checkpoint_saves_on_interval_and_final_step():
+    assert should_save_training_checkpoint(50, 409, 50)
+    assert not should_save_training_checkpoint(51, 409, 50)
+    assert should_save_training_checkpoint(409, 409, 50)
+    with pytest.raises(ValueError, match="positive"):
+        should_save_training_checkpoint(1, 2, 0)
 
 
 def test_selected_record_count_includes_both_balanced_outcomes():

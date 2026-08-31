@@ -56,9 +56,7 @@ def _claude_run_result(exit_code: int, output_tail: str) -> HarnessRunResult:
     error_message = _bounded_message(_last_json_string_field(output_tail, "result")) if is_error_record else None
     if terminal_reason == "rapid_refill_breaker":
         error_type = "context_thrashing"
-    elif error_message and (
-        "output token maximum" in error_message or "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in error_message
-    ):
+    elif error_message and "output token maximum" in error_message:
         error_type = "max_output_tokens"
     elif error_message and (
         "prompt is too long" in error_message.lower()
@@ -91,7 +89,6 @@ class ClaudeCodeHarness(BaseHarness):
     forwarded_envs = (
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
-        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     )
 
     launch_flags = (

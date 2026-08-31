@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 from datetime import timedelta
@@ -350,8 +351,18 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
         if self.role == "critic":
+            critic_started = time.perf_counter()
             result = self.train_critic(rollout_id, rollout_data)
+            result["critic_total_time"] = time.perf_counter() - critic_started
             self.prof.step(rollout_id=rollout_id)
+            if rollout_id < getattr(self.args, "num_critic_only_steps", 0):
+                train_metric_utils.log_pipeline_perf_data(
+                    rollout_id,
+                    self.args,
+                    rollout_data,
+                    critic_total_time=result["critic_total_time"],
+                    actor_train_time=None,
+                )
         else:
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
@@ -546,10 +557,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        train_metric_utils.log_perf_data(
+        perf_metrics = train_metric_utils.log_perf_data(
             rollout_id,
             self.args,
             extra_metrics=self.weight_updater.pop_metrics(),
+        )
+        train_metric_utils.log_pipeline_perf_data(
+            rollout_id,
+            self.args,
+            rollout_data,
+            critic_total_time=external_data.get("critic_total_time") if external_data is not None else None,
+            actor_train_time=(perf_metrics or {}).get("perf/actor_train_time"),
         )
 
     @timer

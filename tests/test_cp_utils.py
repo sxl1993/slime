@@ -27,7 +27,7 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
 )
-
+from slime.backends.megatron_utils import cp_utils
 
 NUM_GPUS = 0
 
@@ -174,6 +174,54 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
         cp_total += reducer_cp2(x_for_rank).item()
 
     assert cp_total == pytest.approx(baseline)
+
+
+@pytest.mark.unit
+def test_hf_attention_cp_slices_restore_each_rank_input_order():
+    """Precomputed HF-attention CP slices preserve the current gather order.
+
+    The fixture uses two packed sequences with different lengths. Applying the
+    gather slices to rank-local inputs and then the rank-specific output slices
+    must recover each rank's original local sequence, as an identity attention
+    layer would. The expected slices are hand-derived from the current CP
+    layout, so an off-by-one or reversed-chunk bug cannot satisfy this test.
+    """
+    gather_slices, output_slices_by_rank = cp_utils.build_hf_attention_cp_slices((0, 16, 48), cp_size=4)
+
+    assert gather_slices == (
+        (0, 0, 2),
+        (1, 0, 2),
+        (2, 0, 2),
+        (3, 0, 2),
+        (3, 2, 4),
+        (2, 2, 4),
+        (1, 2, 4),
+        (0, 2, 4),
+        (0, 4, 8),
+        (1, 4, 8),
+        (2, 4, 8),
+        (3, 4, 8),
+        (3, 8, 12),
+        (2, 8, 12),
+        (1, 8, 12),
+        (0, 8, 12),
+    )
+    assert output_slices_by_rank == (
+        ((0, 2), (14, 16), (16, 20), (44, 48)),
+        ((2, 4), (12, 14), (20, 24), (40, 44)),
+        ((4, 6), (10, 12), (24, 28), (36, 40)),
+        ((6, 8), (8, 10), (28, 32), (32, 36)),
+    )
+
+    rank_inputs = [torch.arange(12, dtype=torch.float32).unsqueeze(-1) + 1000 * rank for rank in range(4)]
+    gathered = torch.cat(
+        [rank_inputs[rank][start:end] for rank, start, end in gather_slices],
+        dim=0,
+    )
+
+    for rank, output_slices in enumerate(output_slices_by_rank):
+        restored = torch.cat([gathered[start:end] for start, end in output_slices], dim=0)
+        assert torch.equal(restored, rank_inputs[rank])
 
 
 if __name__ == "__main__":

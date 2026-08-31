@@ -157,8 +157,18 @@ def load_model_hf_weights(
         for name, parameter in named_params_and_buffers(args, model):
             # The scalar critic head is not present in the base HF checkpoint.
             if name.endswith("output_layer.bias") and parameter.numel() == 1:
-                continue
-            tensor = get_hf_tensor(name, reader, config)
+                if not hasattr(reader, "__contains__") or "critic_head.bias" not in reader:
+                    continue
+                tensor = reader.get_tensor("critic_head.bias")
+            elif (
+                name.endswith("output_layer.weight")
+                and parameter.shape[0] == 1
+                and hasattr(reader, "__contains__")
+                and "critic_head.weight" in reader
+            ):
+                tensor = reader.get_tensor("critic_head.weight")
+            else:
+                tensor = get_hf_tensor(name, reader, config)
             if name.endswith("output_layer.weight") and parameter.shape[0] == 1 and tensor.shape[0] != 1:
                 continue
             tensor = shard_mcore_tensor(name, _pad_vocab(args, name, tensor), parameter)

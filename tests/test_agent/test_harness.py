@@ -221,7 +221,7 @@ def test_claude_code_launch_command_and_env():
     asyncio.run(run_case())
 
 
-def test_claude_code_forwards_context_budget_env_to_sandbox():
+def test_claude_code_forwards_only_supported_context_budget_envs_to_sandbox():
     async def run_case():
         captured = {}
 
@@ -236,7 +236,6 @@ def test_claude_code_forwards_context_budget_env_to_sandbox():
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32768",
             "SLIME_AGENT_CC_EXTRA_ENVS": json.dumps(
                 {
-                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "49152",
                     "CUSTOM_SANDBOX_ENV": "enabled",
                 }
             ),
@@ -255,7 +254,7 @@ def test_claude_code_forwards_context_budget_env_to_sandbox():
         env = captured["env"]
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "65536"
         assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "70"
-        assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "49152"
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in env
         assert env["CUSTOM_SANDBOX_ENV"] == "enabled"
 
     asyncio.run(run_case())
