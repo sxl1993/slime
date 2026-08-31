@@ -24,6 +24,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import time
 import traceback
 import uuid
@@ -37,6 +38,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
+from slime.agent.adapters.common import AdapterFailure
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessRunResult
 from slime.agent.sandbox import Sandbox, SandboxCreateRateLimitError, SandboxLeaseError, create_sandbox
@@ -140,14 +142,14 @@ def _trajectory_destination(base_sample: Sample, instance_id: str, session_id: s
     )
 
 
-def _write_trajectory_gzip(destination: Path, trajectory: str) -> int:
+def _write_trajectory_gzip(destination: Path, source: Path) -> int:
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(temporary, "xb") as raw:
+        with source.open("rb") as input_file, open(temporary, "xb") as raw:
             os.chmod(temporary, 0o600)
             with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1, mtime=0) as compressed:
-                compressed.write(trajectory.encode("utf-8"))
+                shutil.copyfileobj(input_file, compressed)
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
         return destination.stat().st_size
@@ -156,21 +158,34 @@ def _write_trajectory_gzip(destination: Path, trajectory: str) -> int:
 
 
 async def _persist_trajectory(
-    trajectory: str,
+    sb: Sandbox,
+    sandbox_path: str,
     *,
+    user: str,
     base_sample: Sample,
     instance_id: str,
     session_id: str,
-    read_ms: float,
 ) -> dict[str, Any]:
     destination = _trajectory_destination(base_sample, instance_id, session_id)
-    raw_bytes = len(trajectory.encode("utf-8"))
-    queued = time.monotonic()
-    async with _TRAJECTORY_WRITE_SEM:
-        queue_ms = (time.monotonic() - queued) * 1000
-        started = time.monotonic()
-        gzip_bytes = await asyncio.to_thread(_write_trajectory_gzip, destination, trajectory)
-    write_ms = (time.monotonic() - started) * 1000
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    source = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.raw.tmp")
+    source.touch(mode=0o600)
+    try:
+        read_started = time.monotonic()
+        await sb.download_file(sandbox_path, source, user=user)
+        read_ms = (time.monotonic() - read_started) * 1000
+        raw_bytes = source.stat().st_size
+        if raw_bytes == 0:
+            return {}
+
+        queued = time.monotonic()
+        async with _TRAJECTORY_WRITE_SEM:
+            queue_ms = (time.monotonic() - queued) * 1000
+            started = time.monotonic()
+            gzip_bytes = await asyncio.to_thread(_write_trajectory_gzip, destination, source)
+        write_ms = (time.monotonic() - started) * 1000
+    finally:
+        source.unlink(missing_ok=True)
     logger.info(
         "[coding_agent_rl] %s: trajectory_saved path=%s raw_bytes=%d gzip_bytes=%d "
         "read_ms=%.1f queue_ms=%.1f write_ms=%.1f",
@@ -298,6 +313,7 @@ class _AdapterService(metaclass=SingletonMeta):
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
             max_tool_result_chars=CONFIG.max_tool_result_chars,
+            sglang_incremental_streaming_output=bool(args.sglang_incremental_streaming_output),
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
@@ -528,6 +544,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
+    phase_started = time.perf_counter()
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id, session_id) as sb:
@@ -543,6 +560,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     prompt=swe.SWE_PROMPT,
                 )
                 agent_exit_code = run_result.exit_code
+                adapter_failure = state.adapter.session_failure(session_id)
+                adapter_failure_metadata = _adapter_failure_metadata(adapter_failure)
                 diff_text, git_diff_exit_code, git_diff_stderr = await swe.git_diff(sb, md["workdir"])
                 adapter_turns = state.adapter.manager.turn_count(session_id)
                 session_stats = state.adapter.session_stats(session_id)
@@ -556,44 +575,49 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 trajectory_metadata: dict[str, Any] = {}
                 trajectory_tail = ""
-                if needs_diagnostic or save_trajectory:
-                    trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
-                    read_started = time.monotonic()
+                trajectory_path = f"{md['workdir']}/.harness/trajectory.jsonl"
+                if needs_diagnostic:
                     try:
-                        trajectory = await sb.read_file(trajectory_path, user=sb.work_user)
-                        read_ms = (time.monotonic() - read_started) * 1000
-                        trajectory_tail = trajectory[-4096:]
+                        tail_exit_code, trajectory_tail, tail_stderr = await sb.exec(
+                            f"tail -c 4096 {shlex.quote(trajectory_path)}",
+                            user=sb.work_user,
+                            timeout=15,
+                            check=False,
+                        )
+                        if tail_exit_code != 0:
+                            raise RuntimeError(tail_stderr[-200:] or f"tail exited {tail_exit_code}")
                     except Exception as e:
-                        trajectory = ""
-                        read_ms = (time.monotonic() - read_started) * 1000
                         trajectory_tail = f"<read failed: {type(e).__name__}: {str(e)[:200]}>"
                         logger.warning(
-                            "[coding_agent_rl] %s: trajectory_read failed: %s: %s",
+                            "[coding_agent_rl] %s: trajectory_tail failed: %s: %s",
                             instance_id,
                             type(e).__name__,
                             str(e)[:200],
                         )
-                    if save_trajectory and trajectory:
-                        try:
-                            trajectory_metadata = await _persist_trajectory(
-                                trajectory,
-                                base_sample=base_sample,
-                                instance_id=instance_id,
-                                session_id=session_id,
-                                read_ms=read_ms,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "[coding_agent_rl] %s: trajectory_save failed: %s: %s",
-                                instance_id,
-                                type(e).__name__,
-                                str(e)[:200],
-                            )
-                    elif save_trajectory:
-                        logger.warning(
-                            "[coding_agent_rl] %s: trajectory_save skipped because sandbox file is empty",
-                            instance_id,
+
+                if save_trajectory:
+                    try:
+                        trajectory_metadata = await _persist_trajectory(
+                            sb,
+                            trajectory_path,
+                            user=sb.work_user,
+                            base_sample=base_sample,
+                            instance_id=instance_id,
+                            session_id=session_id,
                         )
+                    except Exception as e:
+                        logger.warning(
+                            "[coding_agent_rl] %s: trajectory_save failed: %s: %s",
+                            instance_id,
+                            type(e).__name__,
+                            str(e)[:200],
+                        )
+                    else:
+                        if not trajectory_metadata:
+                            logger.warning(
+                                "[coding_agent_rl] %s: trajectory_save skipped because sandbox file is empty",
+                                instance_id,
+                            )
                 if agent_exit_code != 0:
                     logger.warning(
                         "[coding_agent_rl] %s: agent_exit_code=%d error_type=%s terminal_reason=%s "
@@ -638,11 +662,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         adapter_connectivity,
                         trajectory_tail,
                     )
+            rollout_agent_time = time.perf_counter() - phase_started
+            evaluation_started = time.perf_counter()
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
+            rollout_eval_time = time.perf_counter() - evaluation_started
+            rollout_timing_metadata = {
+                "rollout_agent_time": rollout_agent_time,
+                "rollout_eval_time": rollout_eval_time,
+            }
             if evaluation:
                 logger.info(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
@@ -658,11 +689,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     applied_cleanly=bool(applied_cleanly),
                     agent_exit_code=agent_exit_code,
                     instance_id=instance_id,
-                    extra_metadata={**session_stats, **trajectory_metadata},
+                    extra_metadata={
+                        **session_stats,
+                        **trajectory_metadata,
+                        **rollout_timing_metadata,
+                        "harness_error_type": run_result.error_type,
+                        **adapter_failure_metadata,
+                    },
                 )
 
-            if agent_exit_code != 0:
-                invalid_reason = f"agent_exit:{run_result.error_type or run_result.terminal_reason or agent_exit_code}"
+            allow_timeout_sample = run_result.error_type == "time_budget_exceeded" and adapter_failure is None
+            if agent_exit_code != 0 and not allow_timeout_sample:
+                invalid_reason = f"agent_exit:{_agent_failure_reason(run_result, adapter_failure)}"
                 logger.warning(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d trainable=False "
                     "invalid_reason=%s compaction_count=%d max_prompt_tokens=%d context_exceeded_count=%d",
@@ -679,14 +717,17 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     base_sample,
                     invalid_reason,
                     instance_id,
-                    status=_agent_failure_status(run_result),
+                    status=_agent_failure_status(run_result, adapter_failure),
                     extra_metadata={
                         **session_stats,
                         **trajectory_metadata,
+                        **rollout_timing_metadata,
                         "agent_exit_code": agent_exit_code,
                         "agent_error_type": run_result.error_type,
+                        "harness_error_type": run_result.error_type,
                         "agent_terminal_reason": run_result.terminal_reason,
                         "agent_error_message": run_result.error_message,
+                        **adapter_failure_metadata,
                         "grading_solved": float(reward) == 1.0,
                         "applied_cleanly": bool(applied_cleanly),
                     },
@@ -703,6 +744,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     "agent_exit_code": agent_exit_code,
                     "trainable": True,
                     "invalid_reason": None,
+                    **rollout_timing_metadata,
                     **trajectory_metadata,
                 },
             )
@@ -820,7 +862,32 @@ def _abort_result(
     return [sample]
 
 
-def _agent_failure_status(result: HarnessRunResult) -> Sample.Status:
+def _adapter_failure_metadata(failure: AdapterFailure | None) -> dict[str, Any]:
+    if failure is None:
+        return {}
+    return {
+        "adapter_failure_request_index": failure.request_index,
+        "adapter_failure_family": failure.family,
+        "adapter_failure_code": failure.code,
+    }
+
+
+def _agent_failure_reason(result: HarnessRunResult, failure: AdapterFailure | None = None) -> str:
+    if result.error_type == "server_error" and failure is not None:
+        if failure.family in {"stream_interrupted", "stream_protocol_error"}:
+            return failure.family
+    return str(result.error_type or result.terminal_reason or result.exit_code)
+
+
+def _agent_failure_status(
+    result: HarnessRunResult,
+    failure: AdapterFailure | None = None,
+) -> Sample.Status:
+    if result.error_type == "server_error" and failure is not None:
+        if failure.family == "stream_interrupted":
+            return Sample.Status.ABORTED
+        if failure.family == "stream_protocol_error":
+            return Sample.Status.FAILED
     message = (result.error_message or "").lower()
     if result.error_type == "server_error" and "session closed" not in message:
         return Sample.Status.FAILED

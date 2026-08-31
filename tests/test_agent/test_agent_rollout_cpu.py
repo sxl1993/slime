@@ -72,6 +72,7 @@ from tests.test_agent._fakes import FakeSandbox, FakeTokenizer, fake_call_sglang
 
 from slime.agent.adapters import OpenAIAdapter  # noqa: E402
 from slime.agent.adapters import common as adapters_common  # noqa: E402
+from slime.agent.adapters.common import AdapterFailure  # noqa: E402
 from slime.agent.aiohttp_threaded import run_app_in_thread  # noqa: E402
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessRunResult  # noqa: E402
 from slime.agent.harness import common as harness_common  # noqa: E402
@@ -199,6 +200,7 @@ def _args() -> SimpleNamespace:
         sglang_reasoning_parser=None,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=1,  # never dialed (call_sglang_generate is patched)
+        sglang_incremental_streaming_output=False,
     )
 
 
@@ -327,6 +329,8 @@ def test_generate_produces_trained_samples(caplog):
             assert s.metadata.get("invalid_reason") is None
             assert s.metadata.get("compaction_count") == 0
             assert s.metadata.get("max_prompt_tokens", 0) > 0
+            assert s.metadata["rollout_agent_time"] >= 0
+            assert s.metadata["rollout_eval_time"] >= 0
         # eval_cmd "true" applied cleanly on a clean (empty) diff -> reward 1.0,
         # split evenly across the emitted samples.
         assert abs(sum(s.reward for s in samples) - 1.0) < 1e-9
@@ -340,10 +344,48 @@ def test_generate_produces_trained_samples(caplog):
     assert "git_status_exit_code=0" in caplog.text
 
 
+def test_generate_keeps_valid_trajectory_after_time_budget_exceeded():
+    async def timing_out_agent(env):
+        await _anthropic_agent(env, n_turns=1)
+        return harness_common.EXIT_TIME_BUDGET_EXCEEDED
+
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        sandbox_factory = FakeSandbox.factory(on_launch=timing_out_agent)
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert len(samples) == 1
+        sample = samples[0]
+        assert sample.status == Sample.Status.COMPLETED
+        assert sample.remove_sample is False
+        assert sample.metadata["agent_exit_code"] == harness_common.EXIT_TIME_BUDGET_EXCEEDED
+        assert sample.metadata["harness_error_type"] == "time_budget_exceeded"
+        assert sample.metadata["trainable"] is True
+        assert sample.metadata["grading_solved"] is True
+        assert sum(sample.loss_mask) > 0
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+
 def test_generate_persists_complete_trajectory_as_atomic_gzip(tmp_path, caplog):
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
-        sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
+
+        class SizeLimitedReadSandbox(FakeSandbox):
+            async def read_file(self, sandbox_path, *, user="root") -> str:
+                content = await super().read_file(sandbox_path, user=user)
+                if sandbox_path.endswith("/.harness/trajectory.jsonl") and len(content.encode()) > 5 * 1024 * 1024:
+                    raise RuntimeError("read file: file is too large")
+                return content
+
+            async def download_file(self, sandbox_path, host_path, *, user="root") -> None:
+                content = self.files.get(sandbox_path, b"")
+                Path(host_path).write_bytes(content.encode() if isinstance(content, str) else content)
+
+        sandbox_factory = SizeLimitedReadSandbox.factory(on_launch=_anthropic_agent)
         _patch_generate(monkeypatch, tok, sandbox_factory)
         monkeypatch.setattr(
             gen,
@@ -355,7 +397,7 @@ def test_generate_persists_complete_trajectory_as_atomic_gzip(tmp_path, caplog):
             ),
         )
 
-        full_trajectory = json.dumps({"type": "assistant", "text": "x" * 5000}) + "\n"
+        full_trajectory = json.dumps({"type": "assistant", "text": "x" * (6 * 1024 * 1024)}) + "\n"
         original_run = ClaudeCodeHarness.run
 
         async def run_with_trajectory(self, sb, *, workdir, **kwargs):
@@ -384,6 +426,40 @@ def test_generate_persists_complete_trajectory_as_atomic_gzip(tmp_path, caplog):
         asyncio.run(run_case(mp))
 
     assert "trajectory_saved path=" in caplog.text
+
+
+def test_generate_reports_trajectory_download_failure_without_calling_it_empty(tmp_path, caplog):
+    async def run_case(monkeypatch):
+        class InterruptedDownloadSandbox(FakeSandbox):
+            async def download_file(self, sandbox_path, host_path, *, user="root") -> None:
+                Path(host_path).write_bytes(b"partial")
+                raise RuntimeError("download interrupted")
+
+        tok = FakeTokenizer()
+        sandbox_factory = InterruptedDownloadSandbox.factory(on_launch=_anthropic_agent)
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        monkeypatch.setattr(
+            gen,
+            "CONFIG",
+            dataclasses.replace(
+                gen.CONFIG,
+                trajectory_save="all",
+                trajectory_dir=str(tmp_path),
+            ),
+        )
+
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert samples
+        assert not list(tmp_path.rglob("*.tmp"))
+        assert not list(tmp_path.rglob("*.jsonl.gz"))
+
+    caplog.set_level(logging.WARNING)
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+    assert "trajectory_save failed: RuntimeError: download interrupted" in caplog.text
+    assert "sandbox file is empty" not in caplog.text
 
 
 def test_generate_logs_structured_nonzero_harness_exit_and_continues_evaluation(caplog):
@@ -423,7 +499,7 @@ def test_generate_logs_structured_nonzero_harness_exit_and_continues_evaluation(
 
         assert len(samples) == 1
         sample = samples[0]
-        assert sample.status == Sample.Status.ABORTED
+        assert sample.status == Sample.Status.TERMINAL_FAILED
         assert sample.remove_sample is True
         assert sample.metadata.get("trainable") is False
         assert sample.metadata.get("invalid_reason") == "agent_exit:max_output_tokens"
@@ -447,6 +523,124 @@ def test_generate_logs_structured_nonzero_harness_exit_and_continues_evaluation(
     assert "trainable=False" in caplog.text
     assert "CLI error (exit 1)" not in caplog.text
     assert "trajectory_tail=" not in caplog.text
+
+
+def test_generate_marks_upstream_server_error_retryable():
+    async def failing_agent(env):
+        await _anthropic_agent(env, n_turns=1)
+        return 1
+
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        output_tail = json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "terminal_reason": "api_error",
+                "error": "server_error",
+                "result": "API Error: upstream service unavailable",
+            }
+        )
+        sandbox_factory = FakeSandbox.factory(
+            on_launch=failing_agent,
+            responses=[
+                ("tail -c", (0, output_tail, "")),
+                ("git add -N . && git diff", (0, "diff --git a/a.py b/a.py\n+fixed\n", "")),
+            ],
+        )
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        monkeypatch.setattr(
+            adapters_common,
+            "call_sglang_generate",
+            fake_call_sglang_generate(_two_turn_script()[:1], tok),
+        )
+
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert len(samples) == 1
+        assert samples[0].status == Sample.Status.FAILED
+        assert samples[0].metadata["invalid_reason"] == "agent_exit:server_error"
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+
+def test_session_closed_server_error_is_terminal():
+    result = HarnessRunResult(
+        exit_code=1,
+        error_type="server_error",
+        terminal_reason="api_error",
+        error_message="API Error: session closed",
+    )
+
+    assert gen._agent_failure_status(result) == Sample.Status.TERMINAL_FAILED
+
+
+@pytest.mark.parametrize("failure_code", ["incomplete_tool_parameter", "protocol_error"])
+def test_stream_protocol_error_is_retryable_with_native_reason(failure_code):
+    result = HarnessRunResult(
+        exit_code=1,
+        error_type="server_error",
+        terminal_reason="api_error",
+        error_message="API Error: upstream service unavailable",
+    )
+    failure = AdapterFailure(
+        request_index=3,
+        family="stream_protocol_error",
+        code=failure_code,
+    )
+
+    assert gen._agent_failure_reason(result, failure) == "stream_protocol_error"
+    assert gen._agent_failure_status(result, failure) == Sample.Status.FAILED
+    assert gen._adapter_failure_metadata(failure) == {
+        "adapter_failure_request_index": 3,
+        "adapter_failure_family": "stream_protocol_error",
+        "adapter_failure_code": failure_code,
+    }
+
+
+def test_upstream_generation_abort_is_interrupted_with_native_reason():
+    result = HarnessRunResult(
+        exit_code=1,
+        error_type="server_error",
+        terminal_reason="api_error",
+        error_message="API Error: upstream generation aborted",
+    )
+    failure = AdapterFailure(
+        request_index=4,
+        family="stream_interrupted",
+        code="upstream_abort",
+    )
+
+    assert gen._agent_failure_reason(result, failure) == "stream_interrupted"
+    assert gen._agent_failure_status(result, failure) == Sample.Status.ABORTED
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_retry_after"),
+    [
+        (gen.SandboxCreateRateLimitError(retry_after=7), Sample.Status.FAILED, 7.0),
+        (gen.SandboxLeaseError("ambiguous lease"), Sample.Status.TERMINAL_FAILED, None),
+    ],
+)
+def test_generate_classifies_sandbox_creation_failure(error, expected_status, expected_retry_after):
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+
+        class FailingSandbox(FakeSandbox):
+            async def __aenter__(self):
+                raise error
+
+        _patch_generate(monkeypatch, tok, FailingSandbox.factory())
+
+        samples = await gen.generate(_args(), _base_sample(), sampling_params={"max_new_tokens": 32})
+
+        assert len(samples) == 1
+        assert samples[0].status == expected_status
+        assert samples[0].retry_after_seconds == expected_retry_after
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
 
 
 def test_adapter_connectivity_probe_rejects_malformed_url_without_credentials():
@@ -523,9 +717,9 @@ def test_adapter_connectivity_probe_distinguishes_sandbox_http_error():
     asyncio.run(run_case())
 
 
-def test_generate_aborts_on_empty_trajectory(caplog):
+def test_generate_marks_empty_trajectory_terminal(caplog):
     """If the agent never drives a turn, the session is empty and generate()
-    returns a single ABORTED sample (the fan-out shape) rather than crashing."""
+    returns one non-trainable terminal sample rather than crashing."""
 
     async def silent_agent(_env) -> int:
         return 0  # never contacts the adapter -> empty trajectory
@@ -550,7 +744,7 @@ def test_generate_aborts_on_empty_trajectory(caplog):
         samples = await gen.generate(_args(), _base_sample(), sampling_params={})
 
         assert len(samples) == 1
-        assert samples[0].status == Sample.Status.ABORTED
+        assert samples[0].status == Sample.Status.TERMINAL_FAILED
         assert samples[0].metadata.get("abort_reason") == "adapter_session_empty"
 
     caplog.set_level(logging.WARNING)
@@ -566,7 +760,7 @@ def test_generate_aborts_on_empty_trajectory(caplog):
     assert "ANTHROPIC_AUTH_TOKEN" not in caplog.text
 
 
-def test_generate_keeps_empty_session_abort_when_connectivity_probe_fails(caplog):
+def test_generate_keeps_empty_session_terminal_when_connectivity_probe_fails(caplog):
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
         _patch_generate(monkeypatch, tok, FakeSandbox.factory())
@@ -582,7 +776,7 @@ def test_generate_keeps_empty_session_abort_when_connectivity_probe_fails(caplog
         samples = await gen.generate(_args(), _base_sample(), sampling_params={})
 
         assert len(samples) == 1
-        assert samples[0].status == Sample.Status.ABORTED
+        assert samples[0].status == Sample.Status.TERMINAL_FAILED
         assert samples[0].metadata["abort_reason"] == "adapter_session_empty"
 
     caplog.set_level(logging.WARNING)
@@ -593,14 +787,14 @@ def test_generate_keeps_empty_session_abort_when_connectivity_probe_fails(caplog
     assert "probe transport failed" in caplog.text
 
 
-def test_generate_aborts_on_missing_image():
+def test_generate_marks_missing_image_terminal():
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
         _patch_generate(monkeypatch, tok, FakeSandbox.factory(on_launch=_anthropic_agent))
         # blank image -> early abort before any sandbox boot.
         samples = await gen.generate(_args(), _base_sample(image=""), sampling_params={})
         assert len(samples) == 1
-        assert samples[0].status == Sample.Status.ABORTED
+        assert samples[0].status == Sample.Status.TERMINAL_FAILED
         assert samples[0].rollout_id == samples[0].index == 0
         assert samples[0].metadata.get("abort_reason") == "missing_image_or_workdir"
 

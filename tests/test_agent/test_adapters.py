@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, ScriptedTokenizer  # noqa: E402
 
-from slime.agent.adapters import anthropic, openai  # noqa: E402
+from slime.agent.adapters import anthropic, anthropic_stream, common, openai  # noqa: E402
 from slime.agent.adapters.common import GenerationProgress, Session, call_sglang_generate  # noqa: E402
 from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
@@ -71,6 +72,19 @@ def _parse_sse(raw: str) -> list[tuple[str, object]]:
             data_lines.append(line.removeprefix("data:").strip())
     flush()
     return events
+
+
+def test_qwen_stream_initial_state_comes_from_rendered_prompt_suffix():
+    tokenizer = ScriptedTokenizer(
+        prompts=[],
+        outputs={
+            (1, 2): "assistant prefill <think>\n",
+            (3, 4): "assistant prefill\n",
+        },
+    )
+
+    assert anthropic._prompt_starts_in_reasoning(tokenizer, [1, 2])
+    assert not anthropic._prompt_starts_in_reasoning(tokenizer, [3, 4])
 
 
 async def _drain(adapter, sid) -> list[Sample]:
@@ -259,7 +273,7 @@ def test_generation_progress_reports_validated_cumulative_chunks():
                 "text": "ab",
                 "meta_info": {
                     "output_token_logprobs": [[-0.1, 301], [-0.2, 302]],
-                    "finish_reason": {"type": "stop"},
+                    "finish_reason": {"type": "stop", "matched": 248046},
                     "cached_tokens": 0,
                     "prompt_tokens": 1,
                 },
@@ -287,8 +301,57 @@ def test_generation_progress_reports_validated_cumulative_chunks():
     assert [item.text for item in progress] == ["a", "ab"]
     assert [item.chunk_index for item in progress] == [1, 2]
     assert [item.finish_reason for item in progress] == [None, "stop"]
+    assert [item.finish_matched_token_id for item in progress] == [None, 248046]
     assert turn.output_ids == [301, 302]
     assert turn.output_log_probs == [-0.1, -0.2]
+
+
+def test_incremental_generation_progress_processes_each_logprob_once():
+    async def run_case():
+        token_count = 4096
+        chunks = []
+        for index in range(token_count):
+            meta_info = {"output_token_logprobs": [[-0.1, 1000 + index]]}
+            if index == token_count - 1:
+                meta_info.update(
+                    {
+                        "finish_reason": {"type": "stop"},
+                        "cached_tokens": 0,
+                        "prompt_tokens": 1,
+                    }
+                )
+            chunks.append({"text": "x", "meta_info": meta_info})
+
+        text_parts: list[str] = []
+        processed_logprobs = 0
+
+        async def capture(item: GenerationProgress) -> None:
+            nonlocal processed_logprobs
+            text_parts.append(item.text_delta)
+            processed_logprobs += len(item.output_token_logprobs_delta)
+
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            adapter = anthropic.AnthropicAdapter(tokenizer=FakeTokenizer(), sglang_url=sglang.url)
+            adapter.sglang_incremental_streaming_output = True
+            turn = await call_sglang_generate(
+                [11],
+                Session(),
+                {},
+                adapter=adapter,
+                session_id="sid-incremental-progress",
+                progress_callback=capture,
+            )
+        cumulative_pair_visits = token_count * (token_count + 1) // 2
+        return "".join(text_parts), processed_logprobs, cumulative_pair_visits, turn
+
+    text, processed_logprobs, cumulative_pair_visits, turn = asyncio.run(run_case())
+
+    assert text == "x" * 4096
+    assert processed_logprobs == 4096
+    assert cumulative_pair_visits == 8_390_656
+    assert cumulative_pair_visits / processed_logprobs > 2_000
+    assert turn.output_ids == list(range(1000, 5096))
+    assert turn.output_log_probs == [-0.1] * 4096
 
 
 def test_non_stream_generate_does_not_request_sglang_sse():
@@ -465,6 +528,353 @@ def test_anthropic_messages_streams_blocks():
     asyncio.run(run_case())
 
 
+def test_anthropic_messages_streams_incremental_sglang_chunks():
+    async def run_case():
+        chunks = [
+            {"text": "stream", "meta_info": {"output_token_logprobs": [[-0.1, 301]]}},
+            {
+                "text": "ed",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.2, 302]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            },
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tok = FakeTokenizer(outputs={(301, 302): "streamed"})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tok,
+                sglang_url=sglang.url,
+                sglang_incremental_streaming_output=True,
+            )
+            adapter.open_session("sid-incremental-stream")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-incremental-stream", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-incremental-stream")
+        return response.status, events, samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    text = "".join(payload["delta"].get("text", "") for name, payload in events if name == "content_block_delta")
+    assert text == "streamed"
+    assert samples[0].tokens[-2:] == [301, 302]
+    assert samples[0].rollout_log_probs[-2:] == [-0.1, -0.2]
+
+
+def test_anthropic_stream_preserves_qwen_terminal_marker_in_canonical_reply():
+    async def run_case():
+        text = "streamed<|im_end|>"
+        chunks = [
+            {
+                "text": text,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 304]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tok = FakeTokenizer(outputs={(304,): text})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-terminal-marker")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-terminal-marker", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-terminal-marker")
+        return response.status, events, samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    assert events[-1][0] == "message_stop"
+    assert any(
+        payload.get("delta", {}).get("text") == "streamed<|im_end|>"
+        for name, payload in events
+        if name == "content_block_delta"
+    )
+    assert len(samples) == 1 and samples[0].response == "streamed<|im_end|>"
+
+
+def test_anthropic_stream_rejects_terminal_marker_decode_difference():
+    async def run_case():
+        decoded_text = "streamed<|im_end|>"
+        chunks = [
+            {
+                "text": "streamed",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 305]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tok = FakeTokenizer(outputs={(305,): decoded_text})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session("sid-terminal-marker-difference")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={
+                        "Authorization": "Bearer sid-terminal-marker-difference",
+                        "Accept": "text/event-stream",
+                    },
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-terminal-marker-difference")
+        return response.status, events, samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    assert events[-1][0] == "error"
+    assert all(name != "message_stop" for name, _ in events)
+    assert samples == []
+
+
+def test_anthropic_qwen_stream_uses_unified_parser_for_response_and_trajectory(monkeypatch):
+    def forbidden_parse(*args, **kwargs):
+        raise AssertionError("stream path must not call parse_model_output")
+
+    monkeypatch.setattr(common, "parse_model_output", forbidden_parse)
+
+    async def run_case():
+        raw = "inspect logs</think>fixed"
+        manager_messages = []
+
+        def capture_debug(sid, translated, tools_schema, manager_message, turn):
+            manager_messages.append(manager_message)
+
+        chunks = [
+            {
+                "text": raw,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 308]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tokenizer = ScriptedTokenizer(
+                prompts=[[11, 12]],
+                outputs={
+                    (11, 12): "assistant prefill <think>\n",
+                    (308,): raw,
+                },
+            )
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+                reasoning_parser="qwen3",
+                debug_callback=capture_debug,
+            )
+            adapter.open_session("sid-implicit-reasoning")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-implicit-reasoning", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-implicit-reasoning")
+        return events, samples, manager_messages
+
+    events, samples, manager_messages = asyncio.run(run_case())
+    thinking = [
+        payload["delta"]["thinking"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"].get("type") == "thinking_delta"
+    ]
+    text = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"].get("type") == "text_delta"
+    ]
+    assert "".join(thinking) == "inspect logs"
+    assert "".join(text) == "fixed"
+    assert events[-1][0] == "message_stop"
+    assert len(samples) == 1
+    assert manager_messages == [
+        {
+            "role": "assistant",
+            "content": "fixed",
+            "reasoning_content": "inspect logs",
+        }
+    ]
+
+
+def test_anthropic_stream_strips_explicit_think_after_leading_whitespace():
+    async def run_case():
+        raw = "\n<think>\ninspect</think>fixed"
+        chunks = [
+            {
+                "text": raw,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 307]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tok = FakeTokenizer(outputs={(307,): raw})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tok,
+                sglang_url=sglang.url,
+                reasoning_parser="qwen3",
+            )
+            adapter.open_session("sid-leading-reasoning-whitespace")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={
+                        "Authorization": "Bearer sid-leading-reasoning-whitespace",
+                        "Accept": "text/event-stream",
+                    },
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-leading-reasoning-whitespace")
+        return response.status, events, samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    assert events[-1][0] == "message_stop"
+    thinking = [
+        payload["delta"]["thinking"]
+        for name, payload in events
+        if name == "content_block_delta" and payload["delta"].get("type") == "thinking_delta"
+    ]
+    assert "".join(thinking) == "\ninspect"
+    assert len(samples) == 1
+
+
+def test_anthropic_stream_canonicalizes_deferred_grep_missing_from_schema():
+    async def run_case():
+        raw = "<tool_call><function=Grep><parameter=pattern>needle</parameter></function></tool_call>"
+        chunks = [
+            {
+                "text": raw,
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 306]],
+                    "finish_reason": {"type": "stop"},
+                    "cached_tokens": 0,
+                    "prompt_tokens": 2,
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tok = FakeTokenizer(outputs={(306,): raw})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tok,
+                sglang_url=sglang.url,
+                tool_parser="qwen3_coder",
+                reasoning_parser="qwen3",
+            )
+            adapter.open_session("sid-deferred-grep")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-deferred-grep", "Accept": "text/event-stream"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "x"}],
+                        "tools": [
+                            {
+                                "name": "Bash",
+                                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+                            }
+                        ],
+                    },
+                )
+                events = _parse_sse(await response.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-deferred-grep")
+        return response.status, events, samples
+
+    status, events, samples = asyncio.run(run_case())
+
+    assert status == 200
+    assert events[-1][0] == "message_stop"
+    tool_starts = [
+        payload["content_block"]
+        for name, payload in events
+        if name == "content_block_start" and payload["content_block"]["type"] == "tool_use"
+    ]
+    assert len(tool_starts) == 1 and tool_starts[0]["name"] == "Bash"
+    assert len(samples) == 1
+
+
 def test_anthropic_stream_emits_content_before_terminal_chunk():
     async def run_case():
         stream_gate = asyncio.Event()
@@ -540,7 +950,7 @@ def test_anthropic_stream_emits_content_before_terminal_chunk():
     assert events[-1][0] == "message_stop"
 
 
-def test_anthropic_streams_long_write_input_before_tool_closes(monkeypatch):
+def test_anthropic_streams_long_write_input_after_tool_closes(monkeypatch):
     monkeypatch.delitem(sys.modules, "transformers", raising=False)
 
     async def run_case():
@@ -604,15 +1014,7 @@ def test_anthropic_streams_long_write_input_before_tool_closes(monkeypatch):
             )
             try:
                 response = await asyncio.wait_for(asyncio.shield(request_task), timeout=1)
-                frames = []
-                while True:
-                    frame = await asyncio.wait_for(response.content.readuntil(b"\n\n"), timeout=1)
-                    frames.append(frame)
-                    events = _parse_sse(frame.decode())
-                    if events and events[0][0] == "content_block_delta":
-                        delta = events[0][1]["delta"]
-                        if delta.get("type") == "input_json_delta" and delta.get("partial_json"):
-                            break
+                await asyncio.wait_for(sglang.stream_chunk_written.wait(), timeout=1)
                 assert not stream_gate.is_set()
                 stream_gate.set()
                 remainder = await response.text()
@@ -623,7 +1025,7 @@ def test_anthropic_streams_long_write_input_before_tool_closes(monkeypatch):
                     await asyncio.gather(request_task, return_exceptions=True)
                 await client.close()
             await _drain(adapter, "sid-long-write")
-        return _parse_sse(b"".join(frames).decode() + remainder)
+        return _parse_sse(remainder)
 
     events = asyncio.run(run_case())
 
@@ -863,17 +1265,269 @@ def test_anthropic_stream_logs_one_content_free_summary(caplog):
             finally:
                 await client.close()
 
-    caplog.set_level(logging.INFO, logger=anthropic.__name__)
+    caplog.set_level(logging.DEBUG, logger=anthropic.__name__)
     asyncio.run(run_case())
 
-    summaries = [
-        record.getMessage() for record in caplog.records if "event=anthropic_stream_summary" in record.getMessage()
-    ]
-    assert len(summaries) == 1
-    assert "DISTINCTIVE_TOOL_PARAMETER_VALUE" not in summaries[0]
+    summary_records = [record for record in caplog.records if "event=anthropic_stream_summary" in record.getMessage()]
+    assert len(summary_records) == 1
+    assert summary_records[0].levelno == logging.DEBUG
+    assert "DISTINCTIVE_TOOL_PARAMETER_VALUE" not in summary_records[0].getMessage()
 
 
-def test_anthropic_stream_disconnect_aborts_pending_sglang_request():
+def test_anthropic_stream_failure_summary_reports_tokens_without_error_content(caplog):
+    async def run_case():
+        secret = "DISTINCTIVE_SECRET_MODEL_OUTPUT"
+        chunks = [
+            {
+                "text": "server text",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301], [-0.2, 302]],
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301, 302): secret})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-failure-summary")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-failure-summary"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                await response.text()
+            finally:
+                await client.close()
+
+    caplog.set_level(logging.DEBUG, logger=anthropic.__name__)
+    asyncio.run(run_case())
+
+    records = [record for record in caplog.records if "event=stream_parse_failed" in record.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert records[0].levelno == logging.WARNING
+    assert "finish_reason=stop" in message
+    assert "output_tokens=2" in message
+    assert "parser_state=preamble" in message
+    assert "DISTINCTIVE_SECRET_MODEL_OUTPUT" not in message
+
+
+def test_anthropic_stream_incomplete_terminal_tool_is_truncated_response(caplog):
+    raw = "<tool_call><function=Write><parameter=content>unfinished"
+
+    async def run_case():
+        chunks = [
+            [
+                {
+                    "text": raw,
+                    "meta_info": {
+                        "output_token_logprobs": [[-0.1, 301]],
+                        "finish_reason": {"type": "length"},
+                    },
+                }
+            ],
+            [
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "output_token_logprobs": [[-0.1, 302]],
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+            ],
+        ]
+        async with FakeSGLangServer([], stream_chunks=chunks) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301,): raw, (302,): "done"})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+                tool_parser="qwen3_coder",
+                sglang_incremental_streaming_output=True,
+            )
+            adapter.open_session("sid-incomplete-tool")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                body = {
+                    "model": "m",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [
+                        {
+                            "name": "Write",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"content": {"type": "string"}},
+                            },
+                        }
+                    ],
+                }
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-incomplete-tool"},
+                    json=body,
+                )
+                events = _parse_sse(await response.text())
+                turn_count = adapter.manager.turn_count("sid-incomplete-tool")
+                failure = adapter.session_failure("sid-incomplete-tool")
+                second = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-incomplete-tool"},
+                    json=body,
+                )
+                await second.text()
+                second_status = second.status
+                second_failure = adapter.session_failure("sid-incomplete-tool")
+            finally:
+                await client.close()
+            return events, sglang.abort_requests, turn_count, failure, second_status, second_failure
+
+    caplog.set_level(logging.DEBUG, logger=anthropic.__name__)
+    events, abort_requests, turn_count, failure, second_status, second_failure = asyncio.run(run_case())
+
+    assert events[-1] == ("message_stop", {"type": "message_stop"})
+    assert abort_requests == []
+    assert turn_count == 1
+    assert failure is None
+    assert all(
+        not (name == "content_block_start" and payload["content_block"]["type"] == "tool_use")
+        for name, payload in events
+    )
+    message_delta = next(payload for name, payload in events if name == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "max_tokens"
+    assert second_status == 200
+    assert second_failure is None
+    records = [record for record in caplog.records if "event=anthropic_stream_summary" in record.getMessage()]
+    assert len(records) == 2
+    first_message = records[0].getMessage()
+    assert records[0].levelno == logging.DEBUG
+    assert "finish_reason=length" in first_message
+    assert "output_tokens=1" in first_message
+    assert "parser_state=finished" in first_message
+    assert "unfinished" not in first_message
+    assert "finish_reason=stop" in records[1].getMessage()
+    assert "event=stream_parse_failed" not in caplog.text
+    assert "event=sglang_request_failed" not in caplog.text
+
+
+def test_anthropic_stream_upstream_abort_is_not_a_tool_protocol_failure(caplog):
+    raw = "<tool_call>not-a-function"
+
+    async def run_case():
+        chunks = [
+            [
+                {
+                    "text": raw,
+                    "meta_info": {
+                        "output_token_logprobs": [[-0.1, 301]],
+                        "finish_reason": {"type": "abort"},
+                    },
+                }
+            ]
+        ]
+        async with FakeSGLangServer([], stream_chunks=chunks) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301,): raw})
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+                tool_parser="qwen3_coder",
+                sglang_incremental_streaming_output=True,
+            )
+            adapter.open_session("sid-upstream-abort")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-upstream-abort"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "x"}],
+                        "tools": [
+                            {
+                                "name": "Write",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {"content": {"type": "string"}},
+                                },
+                            }
+                        ],
+                    },
+                )
+                events = _parse_sse(await response.text())
+                failure = adapter.session_failure("sid-upstream-abort")
+                turn_count = adapter.manager.turn_count("sid-upstream-abort")
+            finally:
+                await client.close()
+            return events, failure, turn_count, sglang.abort_requests
+
+    caplog.set_level(logging.DEBUG, logger=anthropic.__name__)
+    events, failure, turn_count, abort_requests = asyncio.run(run_case())
+
+    assert events[-1][0] == "error"
+    assert failure == common.AdapterFailure(
+        request_index=1,
+        family="stream_interrupted",
+        code="upstream_abort",
+    )
+    assert turn_count == 0
+    assert abort_requests == []
+    assert "event=stream_interrupted" in caplog.text
+    assert "event=stream_parse_failed" not in caplog.text
+
+
+def test_anthropic_stream_final_flush_failure_does_not_abort_completed_sglang_request(monkeypatch):
+    original_write_event = anthropic_stream._write_event
+    flush_failed = asyncio.Event()
+
+    async def fail_message_stop(response, name, payload):
+        if name == "message_stop":
+            flush_failed.set()
+            raise ConnectionResetError("client disconnected")
+        await original_write_event(response, name, payload)
+
+    monkeypatch.setattr(anthropic_stream, "_write_event", fail_message_stop)
+
+    async def run_case():
+        chunks = [
+            {
+                "text": "done",
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 301]],
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+        ]
+        async with FakeSGLangServer([], stream_chunks=[chunks]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(301,): "done"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-final-flush")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-final-flush"},
+                    json={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                )
+                await asyncio.wait_for(flush_failed.wait(), timeout=1)
+                await asyncio.sleep(0)
+                response.close()
+            finally:
+                await client.close()
+            turn_count = adapter.manager.turn_count("sid-final-flush")
+            return sglang.requests, sglang.abort_requests, turn_count
+
+    requests, abort_requests, turn_count = asyncio.run(run_case())
+    assert abort_requests == []
+    assert turn_count == 0
+
+
+def test_anthropic_stream_disconnect_aborts_pending_sglang_request(caplog):
     async def run_case():
         stream_gate = asyncio.Event()
         chunks = [
@@ -929,11 +1583,14 @@ def test_anthropic_stream_disconnect_aborts_pending_sglang_request():
             turn_count = adapter.manager.turn_count("sid-disconnect")
             return sglang.requests, sglang.abort_requests, turn_count
 
+    caplog.set_level(logging.DEBUG, logger=anthropic.__name__)
     requests, abort_requests, turn_count = asyncio.run(run_case())
 
     assert len(requests) == 1
     assert abort_requests == [{"rid": requests[0]["rid"]}]
     assert turn_count == 0
+    assert "event=request_cancelled outcome=cancelled cancel_source=caller" in caplog.text
+    assert "event=sglang_request_failed" not in caplog.text
 
 
 def test_openai_chat_completions_streams_chunks_until_done():
@@ -1085,7 +1742,7 @@ def test_anthropic_tracks_prompt_compaction_and_exports_session_stats():
     asyncio.run(run_case())
 
 
-def test_anthropic_rejects_turn_when_full_response_budget_would_exceed_context():
+def test_anthropic_clamps_response_budget_to_remaining_context():
     async def run_case():
         async with FakeSGLangServer([[(-0.1, 701)]]) as sglang:
             tok = ScriptedTokenizer(prompts=[[11] * 8], outputs={(701,): "unexpected"})
@@ -1110,13 +1767,45 @@ def test_anthropic_rejects_turn_when_full_response_budget_would_exceed_context()
             turns = adapter.manager.turn_count("sid-context-guard")
             await adapter.drop_session("sid-context-guard")
 
-        assert response.status == 400
-        assert payload["type"] == "error"
-        assert payload["error"]["type"] == "invalid_request_error"
-        assert "Prompt is too long" in payload["error"]["message"]
+        assert response.status == 200
+        assert payload["type"] == "message"
+        assert sglang.requests[0]["sampling_params"]["max_new_tokens"] == 2
+        assert turns == 1
+        assert stats["context_exceeded_count"] == 0
+
+    asyncio.run(run_case())
+
+
+def test_anthropic_returns_length_when_prompt_fills_context():
+    async def run_case():
+        async with FakeSGLangServer([]) as sglang:
+            tok = ScriptedTokenizer(prompts=[[11] * 10], outputs={})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session(
+                "sid-context-full",
+                sampling_defaults={"max_new_tokens": 4},
+                max_context_tokens=10,
+            )
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-context-full"},
+                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "x"}]},
+                )
+                payload = await response.json()
+            finally:
+                await client.close()
+            stats = adapter.session_stats("sid-context-full")
+            turns = adapter.manager.turn_count("sid-context-full")
+            await adapter.drop_session("sid-context-full")
+
+        assert response.status == 200
+        assert payload["stop_reason"] == "max_tokens"
         assert sglang.requests == []
-        assert turns == 0
-        assert stats["context_exceeded_count"] == 1
+        assert turns == 1
+        assert stats["context_exceeded_count"] == 0
 
     asyncio.run(run_case())
 
@@ -1238,6 +1927,42 @@ def test_parse_model_output_think_split_fallback():
     # the qwen3 reasoning parser (or the </think> fallback) splits reasoning out.
     assert "visible" in parsed.text
     assert "reason here" in parsed.reasoning
+
+
+def test_parse_model_output_does_not_force_reasoning_from_parser_name(monkeypatch):
+    constructor_kwargs = []
+
+    class FakeReasoningParser:
+        def __init__(self, **kwargs):
+            constructor_kwargs.append(kwargs)
+
+        def parse_non_stream(self, raw_output):
+            return None, raw_output
+
+    modules = {
+        "sglang": types.ModuleType("sglang"),
+        "sglang.srt": types.ModuleType("sglang.srt"),
+        "sglang.srt.parser": types.ModuleType("sglang.srt.parser"),
+        "sglang.srt.parser.reasoning_parser": types.ModuleType("sglang.srt.parser.reasoning_parser"),
+    }
+    modules["sglang.srt.parser.reasoning_parser"].ReasoningParser = FakeReasoningParser
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    parsed = parse_model_output(
+        "plain output",
+        tools_schema=None,
+        tool_parser_name=None,
+        reasoning_parser_name="qwen3",
+    )
+
+    assert parsed.text == "plain output"
+    assert constructor_kwargs == [
+        {
+            "model_type": "qwen3",
+            "stream_reasoning": False,
+        }
+    ]
 
 
 def test_parse_xml_tool_uses_fallback():
