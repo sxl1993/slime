@@ -137,6 +137,8 @@ def shard_mcore_tensor(name: str, tensor: torch.Tensor, parameter: torch.Tensor)
 def _pad_vocab(args, name: str, tensor: torch.Tensor) -> torch.Tensor:
     if not (name.endswith("embedding.word_embeddings.weight") or name.endswith("output_layer.weight")):
         return tensor
+    if name.endswith("output_layer.weight") and tensor.shape[0] == 1:
+        return tensor
     padded_size = getattr(args, "padded_vocab_size", None)
     if padded_size is None or tensor.shape[0] >= padded_size:
         return tensor
