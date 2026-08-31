@@ -15,10 +15,17 @@ from aiohttp import web
 
 if TYPE_CHECKING:
     from slime.agent.adapters.common import GenerationProgress, Reply
+    from slime.agent.parsing import ParsedModelOutput
 
 
 class StreamProtocolError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "protocol_error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class StreamInterruptedError(RuntimeError):
+    code = "upstream_abort"
 
 
 class StreamParityError(RuntimeError):
@@ -34,7 +41,14 @@ def normalize_blocks(blocks: list[dict]) -> list[dict]:
         elif block_type == "text":
             normalized.append({"type": "text", "text": block.get("text", "")})
         elif block_type == "tool_use":
-            normalized.append({"type": "tool_use", "name": block.get("name"), "input": block.get("input") or {}})
+            normalized.append(
+                {
+                    "type": "tool_use",
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "input": block.get("input") or {},
+                }
+            )
         else:
             raise StreamParityError(f"unsupported Anthropic block type: {block_type}")
     return normalized
@@ -86,32 +100,51 @@ class StreamSnapshot:
     tool_uses: tuple[dict[str, Any], ...]
 
 
+def validate_snapshot_parity(incremental: StreamSnapshot, canonical: StreamSnapshot) -> None:
+    if incremental != canonical:
+        raise StreamParityError(
+            "incremental snapshot differs from complete snapshot: "
+            f"incremental={_snapshot_summary(incremental)} "
+            f"canonical={_snapshot_summary(canonical)}"
+        )
+
+
+def _snapshot_summary(snapshot: StreamSnapshot) -> dict[str, Any]:
+    return {
+        "reasoning_length": len(snapshot.reasoning),
+        "text_length": len(snapshot.text),
+        "tool_names": [tool.get("name") for tool in snapshot.tool_uses],
+    }
+
+
 class CumulativeTextTracker:
     """Release only text confirmed by two consecutive cumulative chunks."""
 
     def __init__(self) -> None:
         self._previous = ""
         self._committed = 0
+        self._committed_prefix = ""
 
     @staticmethod
-    def _common_prefix_length(left: str, right: str) -> int:
+    def _common_prefix_length(left: str, right: str, start: int = 0) -> int:
         size = min(len(left), len(right))
-        index = 0
+        index = start
         while index < size and left[index] == right[index]:
             index += 1
         return index
 
     def push(self, cumulative_text: str) -> str:
-        common = self._common_prefix_length(self._previous, cumulative_text)
-        if common < self._committed:
+        if not cumulative_text.startswith(self._committed_prefix):
             raise StreamProtocolError("sglang revised text that was already emitted")
+        common = self._common_prefix_length(self._previous, cumulative_text, self._committed)
         stable = self._previous[self._committed : common]
         self._committed = common
+        self._committed_prefix = cumulative_text[:common]
         self._previous = cumulative_text
         return stable
 
     def finish(self, final_text: str) -> str:
-        if not final_text.startswith(self._previous[: self._committed]):
+        if not final_text.startswith(self._committed_prefix):
             raise StreamProtocolError("terminal text changed an emitted prefix")
         self._previous = final_text
         stable = final_text[self._committed :]
@@ -142,6 +175,7 @@ class QwenAnthropicStreamParser:
     _THINK_START = "<think>"
     _THINK_END = "</think>"
     _TOOL_START = "<tool_call>"
+    _TERMINAL_MARKERS = ("<|im_end|>", "<|endoftext|>")
 
     _FUNCTION_START = "<function="
     _FUNCTION_END = "</function>"
@@ -153,11 +187,13 @@ class QwenAnthropicStreamParser:
         self,
         *,
         tools_schema: list[dict] | None,
+        starts_in_reasoning: bool = False,
         canonicalize_tool: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         deferred_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self._tracker = CumulativeTextTracker()
         self._state = _TopState.PREAMBLE
+        self._starts_in_reasoning = starts_in_reasoning
         self._buffer = ""
         self._reasoning_parts: list[str] = []
         self._text_parts: list[str] = []
@@ -179,10 +215,14 @@ class QwenAnthropicStreamParser:
         self._json_started = False
         self._parameter_count = 0
         self._current_input: dict[str, Any] = {}
+        self._truncated_tool = False
 
     def push(self, cumulative_text: str) -> list[SemanticDelta]:
         stable = self._tracker.push(cumulative_text)
         return self._consume(stable, final=False)
+
+    def push_delta(self, text_delta: str) -> list[SemanticDelta]:
+        return self._consume(text_delta, final=False)
 
     @property
     def state(self) -> str:
@@ -190,13 +230,48 @@ class QwenAnthropicStreamParser:
             return f"{self._state.value}.{self._tool_state.value}"
         return self._state.value
 
-    def finish(self, final_text: str) -> tuple[list[SemanticDelta], StreamSnapshot]:
-        deltas = self._consume(self._tracker.finish(final_text), final=True)
-        if self._state is _TopState.TOOL and not self._tools_schema and not self._buffer:
+    @property
+    def truncated_tool(self) -> bool:
+        return self._truncated_tool
+
+    def finish(
+        self,
+        final_text: str,
+        *,
+        allow_truncated_tool: bool = False,
+    ) -> tuple[list[SemanticDelta], StreamSnapshot]:
+        return self._finish(
+            self._tracker.finish(final_text),
+            allow_truncated_tool=allow_truncated_tool,
+        )
+
+    def finish_delta(
+        self,
+        *,
+        allow_truncated_tool: bool = False,
+    ) -> tuple[list[SemanticDelta], StreamSnapshot]:
+        return self._finish("", allow_truncated_tool=allow_truncated_tool)
+
+    def _finish(
+        self,
+        text: str,
+        *,
+        allow_truncated_tool: bool = False,
+    ) -> tuple[list[SemanticDelta], StreamSnapshot]:
+        self._truncated_tool = False
+        deltas = self._consume(text, final=not allow_truncated_tool)
+        if self._state is _TopState.TOOL and allow_truncated_tool:
+            self._buffer = ""
+            self._reset_tool()
+            self._tool_uses.clear()
+            self._truncated_tool = True
+            self._state = _TopState.POST_TOOL
+        elif self._state is _TopState.TOOL and not self._tools_schema and not self._buffer:
             self._state = _TopState.POST_TOOL
         elif self._state is _TopState.TOOL:
             detail = "parameter" if self._tool_state is _ToolState.PARAMETER_VALUE else self._tool_state.value
-            raise StreamProtocolError(f"stream ended in incomplete tool {detail}")
+            code = "incomplete_tool_parameter" if self._tool_state is _ToolState.PARAMETER_VALUE else "protocol_error"
+            raise StreamProtocolError(f"stream ended in incomplete tool {detail}", code=code)
         if self._state is _TopState.POST_TOOL and self._buffer.strip():
             raise StreamProtocolError("stream ended after a tool with unexpected text")
         if self._state is _TopState.POST_TOOL:
@@ -216,6 +291,9 @@ class QwenAnthropicStreamParser:
             tool_uses=tuple(self._tool_uses),
         )
 
+    def mark_failed(self) -> None:
+        self._state = _TopState.FAILED
+
     @staticmethod
     def _proper_marker_suffix(text: str, markers: tuple[str, ...]) -> int:
         max_size = min(len(text), max(map(len, markers)) - 1)
@@ -231,6 +309,10 @@ class QwenAnthropicStreamParser:
         while self._buffer:
             before = (self._state, self._tool_state, len(self._buffer))
             if self._state is _TopState.PREAMBLE:
+                if not self._starts_in_reasoning:
+                    self._buffer = self._buffer.lstrip()
+                if not self._buffer:
+                    break
                 if self._buffer.startswith(self._THINK_START):
                     self._buffer = self._buffer[len(self._THINK_START) :]
                     self._state = _TopState.REASONING
@@ -242,7 +324,7 @@ class QwenAnthropicStreamParser:
                 ) == len(self._buffer):
                     break
                 else:
-                    self._state = _TopState.TEXT
+                    self._state = _TopState.REASONING if self._starts_in_reasoning else _TopState.TEXT
             elif self._state is _TopState.REASONING:
                 markers = ((self._THINK_END, _TopState.TEXT), (self._TOOL_START, _TopState.TOOL))
                 found = [(self._buffer.find(marker), marker, state) for marker, state in markers]
@@ -306,7 +388,7 @@ class QwenAnthropicStreamParser:
                     raise StreamProtocolError("stream ended in incomplete tool function name")
                 return False
             name = self._buffer[:end]
-            if name not in self._known_tool_names():
+            if name not in self._known_tool_names() and not self._is_deferred_tool(name):
                 raise StreamProtocolError(f"unknown tool: {name}")
             self._buffer = self._buffer[end + 1 :]
             self._tool_name = name
@@ -373,7 +455,10 @@ class QwenAnthropicStreamParser:
                 self._tool_state = _ToolState.EXPECT_PARAMETER_OR_FUNCTION_END
                 return True
             if final:
-                raise StreamProtocolError("stream ended in incomplete tool parameter")
+                raise StreamProtocolError(
+                    "stream ended in incomplete tool parameter",
+                    code="incomplete_tool_parameter",
+                )
             retained = self._proper_marker_suffix(self._buffer, (self._PARAMETER_END,))
             emit_to = len(self._buffer) - retained
             self._consume_parameter_fragment(self._buffer[:emit_to], deltas)
@@ -405,7 +490,11 @@ class QwenAnthropicStreamParser:
             self._reset_tool()
             self._state = _TopState.TOOL
             return True
-        if not final and self._TOOL_START.startswith(rest):
+        for marker in self._TERMINAL_MARKERS:
+            if rest.startswith(marker) and not rest[len(marker) :].strip():
+                self._buffer = ""
+                return True
+        if not final and any(marker.startswith(rest) for marker in (self._TOOL_START, *self._TERMINAL_MARKERS)):
             return False
         raise StreamProtocolError("text after a completed tool cannot preserve Anthropic block order")
 
@@ -415,6 +504,9 @@ class QwenAnthropicStreamParser:
             for tool in self._tools_schema
             if tool.get("function", {}).get("name")
         }
+
+    def _is_deferred_tool(self, name: str) -> bool:
+        return name in self._deferred_tool_names and self._canonicalize_tool is not None
 
     def _parameter_schema(self, tool_name: str, parameter_name: str) -> dict[str, Any]:
         for tool in self._tools_schema:
@@ -513,7 +605,12 @@ class QwenAnthropicStreamParser:
         if value_type in {"string", "str", "text", "varchar", "char", "enum"}:
             return raw
         if value_type in {"boolean", "bool", "binary"}:
-            return raw.lower() == "true"
+            normalized = raw.lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+            raise StreamProtocolError(f"invalid boolean parameter: {raw!r}")
         if value_type.startswith(("int", "uint", "long", "short", "unsigned")):
             try:
                 return int(raw)
@@ -567,59 +664,111 @@ class AnthropicStreamResponse:
         self,
         *,
         response: web.StreamResponse,
-        parser: QwenAnthropicStreamParser,
+        parser_factory: Callable[[], QwenAnthropicStreamParser],
         input_tokens: int,
         model: str,
         logger: logging.Logger,
         log_prefix: str,
         sid: str,
+        failure_reporter: Callable[[str, str], None] | None = None,
     ) -> None:
         self.response = response
-        self.parser = parser
+        self._parser_factory = parser_factory
+        self.parser = parser_factory()
         self.input_tokens = input_tokens
         self.model = model
         self.logger = logger
         self.log_prefix = log_prefix
         self.sid = sid
+        self._failure_reporter = failure_reporter
         self.started_at = time.monotonic()
         self.first_chunk_ms: float | None = None
         self.first_content_delta_ms: float | None = None
         self.last_content_delta_ms: float | None = None
         self.stream_chunks = 0
         self.content_delta_count = 0
+        self.output_tokens = 0
+        self.finish_reason: str | None = None
+        self.finish_matched_token_id: int | None = None
         self.latest_text = ""
+        self._incremental_text_parts: list[str] = []
+        self._incremental_output: bool | None = None
         self.rid = "-"
         self._summary_logged = False
         self._next_block_index = 0
         self._open_block_index: int | None = None
         self._open_block_kind: DeltaKind | None = None
         self._tool_ids: dict[int, str] = {}
+        self._buffered_tool_deltas: list[SemanticDelta] = []
 
     async def on_progress(self, progress: GenerationProgress) -> None:
         now = time.monotonic()
         if self.first_chunk_ms is None:
             self.first_chunk_ms = (now - self.started_at) * 1000
         self.stream_chunks = progress.chunk_index
+        self.output_tokens = progress.output_token_count or len(progress.output_token_logprobs)
+        if getattr(progress, "finish_reason", None) is not None:
+            self.finish_reason = progress.finish_reason
+        if getattr(progress, "finish_matched_token_id", None) is not None:
+            self.finish_matched_token_id = progress.finish_matched_token_id
         self.rid = progress.rid
-        self.latest_text = progress.text
-        await self._write_deltas(self._coalesce(self.parser.push(progress.text)))
+        if getattr(progress, "finish_reason", None) == "abort":
+            raise StreamInterruptedError("sglang generation aborted")
+        if self._incremental_output is None:
+            self._incremental_output = progress.incremental
+        elif self._incremental_output != progress.incremental:
+            raise StreamProtocolError("sglang changed streaming output mode within one response")
+        if progress.incremental:
+            self._incremental_text_parts.append(progress.text_delta)
+            deltas = self.parser.push_delta(progress.text_delta)
+        else:
+            self.latest_text = progress.text
+            deltas = self.parser.push(progress.text)
+        await self._write_deltas(self._coalesce(deltas))
 
     async def finish(
         self,
-        reply: Reply,
         raw_output: str,
         input_tokens: int,
         output_tokens: int,
-    ) -> web.StreamResponse:
-        if self.latest_text != raw_output:
+        result_factory: Callable[
+            [str, str, list[dict[str, Any]]],
+            tuple[ParsedModelOutput, Reply],
+        ],
+    ) -> tuple[web.StreamResponse, ParsedModelOutput, Reply]:
+        streamed_text = "".join(self._incremental_text_parts) if self._incremental_output else self.latest_text
+        if streamed_text != raw_output:
             raise StreamParityError(
                 f"terminal SGLang text differs from local decode: "
-                f"sglang_length={len(self.latest_text)} decoded_length={len(raw_output)}"
+                f"sglang_length={len(streamed_text)} decoded_length={len(raw_output)}"
             )
-        deltas, snapshot = self.parser.finish(raw_output)
+        allow_truncated_tool = self.finish_reason == "length"
+        if self._incremental_output:
+            deltas, snapshot = self.parser.finish_delta(allow_truncated_tool=allow_truncated_tool)
+        else:
+            deltas, snapshot = self.parser.finish(
+                raw_output,
+                allow_truncated_tool=allow_truncated_tool,
+            )
+        canonical_parser = self._parser_factory()
+        _, canonical_snapshot = canonical_parser.finish(
+            raw_output,
+            allow_truncated_tool=allow_truncated_tool,
+        )
+        validate_snapshot_parity(snapshot, canonical_snapshot)
+        parsed, reply = result_factory(
+            canonical_snapshot.reasoning,
+            canonical_snapshot.text,
+            [dict(tool_use) for tool_use in canonical_snapshot.tool_uses],
+        )
         await self._write_deltas(self._coalesce(deltas))
+        if self.parser.truncated_tool:
+            self._buffered_tool_deltas = []
+        else:
+            await self._flush_buffered_tools()
         await self._close_block()
         canonical_blocks, stop_reason = reply.wire
+        canonical_blocks = self._reuse_tool_ids(canonical_blocks)
         streamed_blocks = self._snapshot_blocks(snapshot)
         if not streamed_blocks and canonical_blocks == [{"type": "text", "text": ""}]:
             await self._open_block(DeltaKind.TEXT, {"type": "text", "text": ""})
@@ -638,7 +787,7 @@ class AnthropicStreamResponse:
         await _write_event(self.response, "message_stop", {"type": "message_stop"})
         await self.response.write_eof()
         self._log_summary("success", output_tokens=output_tokens)
-        return self.response
+        return self.response, parsed, reply
 
     def _snapshot_blocks(self, snapshot: StreamSnapshot) -> list[dict]:
         blocks: list[dict] = []
@@ -657,10 +806,24 @@ class AnthropicStreamResponse:
             )
         return blocks
 
+    def _reuse_tool_ids(self, blocks: list[dict]) -> list[dict]:
+        result = []
+        tool_index = 0
+        for block in blocks:
+            if block.get("type") == "tool_use":
+                block = {**block, "id": self._tool_ids.get(tool_index, block.get("id", ""))}
+                tool_index += 1
+            result.append(block)
+        return result
+
+    @property
+    def request_id(self) -> str:
+        return self.rid
+
     async def fail(self, error: Exception) -> web.StreamResponse:
         from slime.agent.adapters.common import ContextWindowExceeded
 
-        self._log_summary("failure", output_tokens=0, error=error)
+        self.record_failure(error)
         if isinstance(error, ContextWindowExceeded):
             error_type = "invalid_request_error"
             message = str(error)
@@ -675,17 +838,60 @@ class AnthropicStreamResponse:
         await self.response.write_eof()
         return self.response
 
-    def _log_summary(self, outcome: str, *, output_tokens: int, error: Exception | None = None) -> None:
+    def record_failure(self, error: BaseException) -> None:
+        parser_state = self.parser.state
+        failure_family, failure_code = self._failure_classification(error)
+        if self._failure_reporter is not None and failure_family != "-":
+            self._failure_reporter(failure_family, failure_code)
+        self._log_summary(
+            "interrupted" if isinstance(error, StreamInterruptedError) else "failure",
+            output_tokens=self.output_tokens,
+            error=error,
+            parser_state=parser_state,
+        )
+        self.parser.mark_failed()
+
+    @staticmethod
+    def _failure_classification(error: BaseException) -> tuple[str, str]:
+        if isinstance(error, StreamInterruptedError):
+            return "stream_interrupted", error.code
+        if isinstance(error, StreamProtocolError):
+            return "stream_protocol_error", error.code
+        if isinstance(error, StreamParityError):
+            return "stream_parity_error", "parity_mismatch"
+        return "-", "-"
+
+    def _log_summary(
+        self,
+        outcome: str,
+        *,
+        output_tokens: int,
+        error: BaseException | None = None,
+        parser_state: str | None = None,
+    ) -> None:
         if self._summary_logged:
             return
         self._summary_logged = True
-        self.logger.info(
-            "[%s] sid=%s rid=%s event=anthropic_stream_summary outcome=%s "
+        interrupted = isinstance(error, StreamInterruptedError)
+        parse_failure = isinstance(error, (StreamProtocolError, StreamParityError))
+        failure_family, failure_code = self._failure_classification(error) if error is not None else ("-", "-")
+        if interrupted:
+            event = "stream_interrupted"
+        elif parse_failure:
+            event = "stream_parse_failed"
+        else:
+            event = "anthropic_stream_summary"
+        log = self.logger.warning if interrupted or parse_failure else self.logger.debug
+        log(
+            "[%s] sid=%s rid=%s event=%s outcome=%s "
             "first_chunk_ms=%.1f first_content_delta_ms=%.1f last_content_delta_ms=%.1f "
-            "stream_chunks=%d content_delta_count=%d output_tokens=%d parser_state=%s exception_type=%s",
+            "stream_chunks=%d content_delta_count=%d output_tokens=%d finish_reason=%s "
+            "finish_matched_token_id=%s "
+            "parser_state=%s exception_type=%s failure_family=%s failure_code=%s",
             self.log_prefix,
             self.sid,
             self.rid,
+            event,
             outcome,
             self.first_chunk_ms if self.first_chunk_ms is not None else -1.0,
             self.first_content_delta_ms if self.first_content_delta_ms is not None else -1.0,
@@ -693,8 +899,12 @@ class AnthropicStreamResponse:
             self.stream_chunks,
             self.content_delta_count,
             output_tokens,
-            self.parser.state,
+            self.finish_reason or "-",
+            self.finish_matched_token_id if self.finish_matched_token_id is not None else "-",
+            parser_state or self.parser.state,
             type(error).__name__ if error is not None else "-",
+            failure_family,
+            failure_code,
         )
 
     @staticmethod
@@ -714,6 +924,26 @@ class AnthropicStreamResponse:
         return coalesced
 
     async def _write_deltas(self, deltas: list[SemanticDelta]) -> None:
+        committed_deltas: list[SemanticDelta] = []
+        for delta in deltas:
+            if delta.kind is DeltaKind.TOOL_START:
+                self._buffered_tool_deltas.append(delta)
+                continue
+            if self._buffered_tool_deltas:
+                if delta.kind not in {DeltaKind.TOOL_INPUT, DeltaKind.TOOL_STOP}:
+                    raise StreamProtocolError("non-tool delta arrived before the tool batch completed")
+                self._buffered_tool_deltas.append(delta)
+                continue
+            committed_deltas.append(delta)
+
+        await self._write_committed_deltas(committed_deltas)
+
+    async def _flush_buffered_tools(self) -> None:
+        buffered = self._buffered_tool_deltas
+        self._buffered_tool_deltas = []
+        await self._write_committed_deltas(buffered)
+
+    async def _write_committed_deltas(self, deltas: list[SemanticDelta]) -> None:
         for delta in deltas:
             if delta.kind is DeltaKind.REASONING:
                 await self._ensure_block(DeltaKind.REASONING, {"type": "thinking", "thinking": ""})

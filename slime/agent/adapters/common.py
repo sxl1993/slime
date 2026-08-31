@@ -25,10 +25,10 @@ from typing import Any, Protocol
 import aiohttp
 from aiohttp import web
 
-from slime.agent.parsing import parse_model_output
+from slime.agent.parsing import ParsedModelOutput, parse_model_output
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
 
-__all__ = ["GenerationProgress", "TurnRecord"]
+__all__ = ["AdapterFailure", "GenerationProgress", "TurnRecord"]
 
 
 _COMPACTION_MIN_DROP_TOKENS = 8192
@@ -50,6 +50,15 @@ class Session:
     max_prompt_tokens: int = 0
     compaction_count: int = 0
     context_exceeded_count: int = 0
+    request_index: int = 0
+    adapter_failure: AdapterFailure | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class AdapterFailure:
+    request_index: int
+    family: str
+    code: str
 
 
 @dataclasses.dataclass
@@ -72,23 +81,46 @@ class GenerationProgress:
     text: str
     output_token_logprobs: tuple[tuple[float, int], ...]
     finish_reason: str | None
+    finish_matched_token_id: int | None = None
+    incremental: bool = False
+    output_token_count: int = 0
+
+    @property
+    def text_delta(self) -> str:
+        if not self.incremental:
+            raise ValueError("text_delta is only available for incremental SGLang output")
+        return self.text
+
+    @property
+    def output_token_logprobs_delta(self) -> tuple[tuple[float, int], ...]:
+        if not self.incremental:
+            raise ValueError("output_token_logprobs_delta is only available for incremental SGLang output")
+        return self.output_token_logprobs
 
 
 ProgressCallback = Callable[[GenerationProgress], Awaitable[None]]
 
 
 class IncrementalStream(Protocol):
+    @property
+    def request_id(self) -> str: ...
+
     async def on_progress(self, progress: GenerationProgress) -> None: ...
 
     async def finish(
         self,
-        reply: Reply,
         raw_output: str,
         input_tokens: int,
         output_tokens: int,
-    ) -> web.StreamResponse: ...
+        result_factory: Callable[
+            [str, str, list[dict[str, Any]]],
+            tuple[ParsedModelOutput, Reply],
+        ],
+    ) -> tuple[web.StreamResponse, ParsedModelOutput, Reply]: ...
 
     async def fail(self, error: Exception) -> web.StreamResponse: ...
+
+    def record_failure(self, error: BaseException) -> None: ...
 
 
 class ContextWindowExceeded(Exception):
@@ -204,11 +236,13 @@ class BaseAdapter:
         max_turns_per_sid: int | None = None,
         fork_threshold_tokens: int | None = None,
         debug_callback: Callable[..., None] | None = None,
+        sglang_incremental_streaming_output: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
+        self.sglang_incremental_streaming_output = sglang_incremental_streaming_output
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -267,6 +301,8 @@ class BaseAdapter:
         body: dict,
         input_tokens: int,
         tools_schema: list[dict] | None,
+        prompt_ids: list[int],
+        request_index: int,
     ) -> IncrementalStream | None:
         return None
 
@@ -329,6 +365,16 @@ class BaseAdapter:
             "max_prompt_tokens": int(getattr(session, "max_prompt_tokens", 0) or 0),
             "context_exceeded_count": int(getattr(session, "context_exceeded_count", 0) or 0),
         }
+
+    def session_failure(self, sid: str) -> AdapterFailure | None:
+        session = self.store.get(sid)
+        return getattr(session, "adapter_failure", None)
+
+    def record_session_failure(self, sid: str, request_index: int, family: str, code: str) -> None:
+        session = self.store.get(sid)
+        if session is None or session.request_index != request_index:
+            return
+        session.adapter_failure = AdapterFailure(request_index=request_index, family=family, code=code)
 
     async def finish_session(
         self,
@@ -434,6 +480,9 @@ class BaseAdapter:
 
         tok = self.tokenizer
         s = self.store.setdefault(sid, Session())
+        s.request_index += 1
+        s.adapter_failure = None
+        request_index = s.request_index
         task = asyncio.current_task()
         self.inflight.setdefault(sid, set()).add(task)
         t0 = time.monotonic()
@@ -459,6 +508,8 @@ class BaseAdapter:
                 body,
                 prompt_tokens,
                 tools_schema,
+                prompt_ids,
+                request_index,
             )
 
             try:
@@ -484,25 +535,48 @@ class BaseAdapter:
                 raise
 
             raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
-            parsed = parse_model_output(
-                raw_output,
-                tools_schema=tools_schema,
-                tool_parser_name=self.tool_parser,
-                reasoning_parser_name=self.reasoning_parser,
-            )
-            reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
-            turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
-
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
             # Flush the response before recording the trajectory: a client that
             # disconnected during generation makes _respond raise here, and we
             # must not record a turn the client never received.
             try:
                 if controller is not None:
-                    response = await controller.finish(reply, raw_output, in_tok, out_tok)
+
+                    def build_stream_result(
+                        reasoning: str,
+                        text: str,
+                        tool_uses: list[dict[str, Any]],
+                    ) -> tuple[ParsedModelOutput, Reply]:
+                        parsed = ParsedModelOutput(
+                            reasoning=reasoning,
+                            text=text,
+                            tool_uses=tool_uses,
+                        )
+                        return parsed, self._build_reply(
+                            parsed,
+                            turn.finish_reason,
+                            translated,
+                            tools_schema,
+                        )
+
+                    response, parsed, reply = await controller.finish(
+                        raw_output,
+                        in_tok,
+                        out_tok,
+                        build_stream_result,
+                    )
                 else:
+                    parsed = parse_model_output(
+                        raw_output,
+                        tools_schema=tools_schema,
+                        tool_parser_name=self.tool_parser,
+                        reasoning_parser_name=self.reasoning_parser,
+                    )
+                    reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
                     response = await self._respond(request, body, reply, in_tok, out_tok, stream)
             except (ConnectionResetError, asyncio.CancelledError) as e:
+                if controller is not None:
+                    controller.record_failure(e)
                 self.logger.warning(
                     "[%s] sid=%s client disconnected before response flush: %s after %.1fs",
                     self.log_prefix,
@@ -517,6 +591,8 @@ class BaseAdapter:
                 if controller is not None:
                     return await controller.fail(error)
                 raise
+
+            turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
             self._run_debug_callback(
                 sid,
@@ -606,22 +682,17 @@ async def call_sglang_generate(
     sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
 
     if session.max_context_tokens > 0:
-        output_tokens = int(sp.get("max_new_tokens", 0) or 0)
-        if len(prompt_ids) + output_tokens > session.max_context_tokens:
-            session.context_exceeded_count = int(getattr(session, "context_exceeded_count", 0) or 0) + 1
+        remaining_context = session.max_context_tokens - len(prompt_ids)
+        if remaining_context <= 0:
             logger.warning(
-                "[%s] sid=%s insufficient context budget " "prompt_tokens=%d output_budget=%d max_context_tokens=%d",
+                "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
                 adapter.log_prefix,
                 session_id,
                 len(prompt_ids),
-                output_tokens,
                 session.max_context_tokens,
             )
-            raise ContextWindowExceeded(
-                prompt_tokens=len(prompt_ids),
-                output_tokens=output_tokens,
-                max_context_tokens=session.max_context_tokens,
-            )
+            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
+        sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
@@ -653,6 +724,7 @@ async def call_sglang_generate(
     stream_chunks = 0
     response_status = 0
     data: dict[str, Any] | None = None
+    terminal_seen = False
     try:
         async with aiohttp.ClientSession(timeout=timeout) as client, client.post(
             f"{sglang_url}/generate", json=payload, headers=headers
@@ -682,7 +754,7 @@ async def call_sglang_generate(
             else:
                 previous_pairs: tuple[tuple[float, int], ...] = ()
                 previous_text = ""
-                terminal_seen = False
+                incremental_pairs: list[tuple[float, int]] = []
                 async for raw_line in response.content:
                     line = raw_line.decode("utf-8").strip()
                     if not line.startswith("data:"):
@@ -695,32 +767,55 @@ async def call_sglang_generate(
                     try:
                         chunk = json.loads(encoded)
                     except json.JSONDecodeError as error:
-                        raise aiohttp.ClientPayloadError(f"invalid sglang SSE chunk: {encoded[:200]}") from error
+                        raise aiohttp.ClientPayloadError("invalid sglang SSE chunk") from error
                     if not isinstance(chunk, dict):
                         raise aiohttp.ClientPayloadError("sglang SSE chunk must be a JSON object")
                     if chunk.get("error"):
-                        raise aiohttp.ClientPayloadError(f"sglang stream error: {str(chunk['error'])[:200]}")
+                        raise aiohttp.ClientPayloadError("sglang stream reported an error")
                     text = chunk.get("text")
                     if not isinstance(text, str):
                         raise aiohttp.ClientPayloadError("sglang SSE chunk text must be a string")
-                    if len(text) < len(previous_text):
+                    if not adapter.sglang_incremental_streaming_output and len(text) < len(previous_text):
                         raise aiohttp.ClientPayloadError("sglang cumulative text length rolled back")
 
                     meta = chunk.get("meta_info") or {}
                     raw_pairs = meta.get("output_token_logprobs") or []
+                    parsed_pairs: list[tuple[float, int]] = []
                     try:
-                        pairs = tuple((float(pair[0]), int(pair[1])) for pair in raw_pairs)
+                        for index, pair in enumerate(raw_pairs):
+                            converted = (float(pair[0]), int(pair[1]))
+                            if (
+                                not adapter.sglang_incremental_streaming_output
+                                and index < len(previous_pairs)
+                                and converted != previous_pairs[index]
+                            ):
+                                raise aiohttp.ClientPayloadError(
+                                    "sglang cumulative output token logprobs were revised"
+                                )
+                            parsed_pairs.append(converted)
                     except (IndexError, TypeError, ValueError) as error:
-                        raise aiohttp.ClientPayloadError("invalid cumulative output token logprobs") from error
-                    if len(pairs) < len(previous_pairs) or pairs[: len(previous_pairs)] != previous_pairs:
+                        raise aiohttp.ClientPayloadError("invalid output token logprobs") from error
+                    pairs = tuple(parsed_pairs)
+                    if not adapter.sglang_incremental_streaming_output and len(pairs) < len(previous_pairs):
                         raise aiohttp.ClientPayloadError("sglang cumulative output token logprobs were revised")
+
+                    if adapter.sglang_incremental_streaming_output:
+                        incremental_pairs.extend(pairs)
+                        output_token_count = len(incremental_pairs)
+                    else:
+                        output_token_count = len(pairs)
 
                     finish_info = meta.get("finish_reason") or {}
                     finish_reason = finish_info.get("type") if isinstance(finish_info, dict) else None
                     finish_reason = str(finish_reason) if finish_reason else None
+                    matched = finish_info.get("matched") if isinstance(finish_info, dict) else None
+                    finish_matched_token_id = matched if type(matched) is int else None
                     stream_chunks += 1
                     if first_chunk_ms is None:
                         first_chunk_ms = (time.monotonic() - request_started) * 1000
+                    if finish_reason is not None:
+                        terminal_seen = True
+                        data = chunk
                     await progress_callback(
                         GenerationProgress(
                             rid=rid,
@@ -728,21 +823,23 @@ async def call_sglang_generate(
                             text=text,
                             output_token_logprobs=pairs,
                             finish_reason=finish_reason,
+                            finish_matched_token_id=finish_matched_token_id,
+                            incremental=adapter.sglang_incremental_streaming_output,
+                            output_token_count=output_token_count,
                         )
                     )
-                    previous_pairs = pairs
-                    previous_text = text
-                    if finish_reason is not None:
-                        terminal_seen = True
-                        data = chunk
-
+                    if not adapter.sglang_incremental_streaming_output:
+                        previous_pairs = pairs
+                        previous_text = text
                 if data is None:
                     raise aiohttp.ClientPayloadError("sglang stream ended without a terminal chunk")
     except asyncio.CancelledError as error:
-        await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
+        if not terminal_seen:
+            await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
         raise
     except Exception as error:
-        await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
+        if not terminal_seen:
+            await _abort_after_failure(adapter, session_id, rid, sglang_url, request_started, error)
         raise
 
     if not isinstance(data, dict):
@@ -752,12 +849,15 @@ async def call_sglang_generate(
     finish = finish_info.get("type") if isinstance(finish_info, dict) else None
     if not finish:
         raise aiohttp.ClientPayloadError("sglang response did not contain a finish reason")
-    try:
-        output_token_logprobs = tuple(
-            (float(pair[0]), int(pair[1])) for pair in (meta.get("output_token_logprobs") or [])
-        )
-    except (IndexError, TypeError, ValueError) as error:
-        raise aiohttp.ClientPayloadError("invalid terminal output token logprobs") from error
+    if progress_callback is not None and adapter.sglang_incremental_streaming_output:
+        output_token_logprobs = tuple(incremental_pairs)
+    else:
+        try:
+            output_token_logprobs = tuple(
+                (float(pair[0]), int(pair[1])) for pair in (meta.get("output_token_logprobs") or [])
+            )
+        except (IndexError, TypeError, ValueError) as error:
+            raise aiohttp.ClientPayloadError("invalid terminal output token logprobs") from error
     output_ids = [token_id for _, token_id in output_token_logprobs]
     output_log_probs = [logprob for logprob, _ in output_token_logprobs]
     logger.debug(
@@ -792,17 +892,30 @@ async def _abort_after_failure(
     request_started: float,
     error: BaseException,
 ) -> None:
-    adapter.logger.warning(
-        "[%s] sid=%s rid=%s stage=adapter event=sglang_request_failed outcome=exception "
-        "router_url=%s duration_ms=%.1f exception_type=%s error=%s",
-        adapter.log_prefix,
-        session_id,
-        rid,
-        sglang_url,
-        (time.monotonic() - request_started) * 1000,
-        type(error).__name__,
-        str(error)[:200],
-    )
+    cancelled = isinstance(error, asyncio.CancelledError)
+    if cancelled:
+        adapter.logger.info(
+            "[%s] sid=%s rid=%s stage=adapter event=request_cancelled outcome=cancelled "
+            "cancel_source=caller router_url=%s duration_ms=%.1f exception_type=%s",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            (time.monotonic() - request_started) * 1000,
+            type(error).__name__,
+        )
+    else:
+        adapter.logger.warning(
+            "[%s] sid=%s rid=%s stage=adapter event=sglang_request_failed outcome=exception "
+            "router_url=%s duration_ms=%.1f exception_type=%s error=%s",
+            adapter.log_prefix,
+            session_id,
+            rid,
+            sglang_url,
+            (time.monotonic() - request_started) * 1000,
+            type(error).__name__,
+            str(error)[:200],
+        )
     try:
         status = await asyncio.shield(_abort_sglang_request(sglang_url, rid))
         adapter.logger.debug(
