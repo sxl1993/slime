@@ -105,6 +105,49 @@ def test_pipeline_perf_log_does_not_retrack_existing_actor_metric(monkeypatch):
     ]
 
 
+@pytest.mark.unit
+def test_rollout_log_skips_pipeline_perf_metadata(monkeypatch):
+    from megatron.core import mpu as _mpu
+
+    monkeypatch.setattr(_mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(_mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        _mpu,
+        "get_data_parallel_world_size",
+        lambda with_context_parallel=False: 1,
+        raising=False,
+    )
+    gathered_log_dicts = []
+    monkeypatch.setattr(
+        train_metric_utils,
+        "gather_log_data",
+        lambda _metric_name, _args, _rollout_id, log_dict: gathered_log_dicts.append(log_dict),
+    )
+
+    rollout_data = {
+        "response_lengths": [3, 4],
+        "loss_masks": [[1, 1, 1], [1, 1, 1, 1]],
+        "total_lengths": [5, 6],
+        "global_batch_sizes": [2],
+        "pipeline_rollout_metrics": [{"rollout_agent_time": 10.0, "rollout_eval_time": 2.0}],
+        "rollout_batch_collect_time": 5.0,
+    }
+
+    train_metric_utils.log_rollout_data(
+        0,
+        Namespace(ci_test=False, log_multi_turn=False, log_passrate=False, log_correct_samples=False),
+        rollout_data,
+    )
+
+    assert gathered_log_dicts == [
+        {
+            "response_lengths": (7, 2),
+            "total_lengths": (11, 2),
+        }
+    ]
+
+
 @pytest.fixture
 def mock_dp_with_cp_group(monkeypatch):
     """A sentinel "process group" object plus a no-op ``dist.all_reduce``.
