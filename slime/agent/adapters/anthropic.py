@@ -131,6 +131,7 @@ class AnthropicAdapter(BaseAdapter):
             logger=self.logger,
             log_prefix=self.log_prefix,
             sid=sid,
+            tokenizer=self.tokenizer,
             failure_reporter=lambda family, code: self.record_session_failure(
                 sid,
                 request_index,
