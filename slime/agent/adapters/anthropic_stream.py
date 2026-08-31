@@ -670,6 +670,7 @@ class AnthropicStreamResponse:
         logger: logging.Logger,
         log_prefix: str,
         sid: str,
+        tokenizer: Any | None = None,
         failure_reporter: Callable[[str, str], None] | None = None,
     ) -> None:
         self.response = response
@@ -680,6 +681,7 @@ class AnthropicStreamResponse:
         self.logger = logger
         self.log_prefix = log_prefix
         self.sid = sid
+        self.tokenizer = tokenizer
         self._failure_reporter = failure_reporter
         self.started_at = time.monotonic()
         self.first_chunk_ms: float | None = None
@@ -694,6 +696,9 @@ class AnthropicStreamResponse:
         self._incremental_text_parts: list[str] = []
         self._incremental_output: bool | None = None
         self._last_incremental_chunk = ""
+        self._last_chunk_text = ""
+        self._last_chunk_token_ids: list[int] = []
+        self._last_chunk_token_texts: list[str] = []
         self._recent_output_token_ids: list[int] = []
         self.rid = "-"
         self._summary_logged = False
@@ -721,6 +726,9 @@ class AnthropicStreamResponse:
         elif self._incremental_output != progress.incremental:
             raise StreamProtocolError("sglang changed streaming output mode within one response")
         chunk_token_ids = [token_id for _, token_id in progress.output_token_logprobs]
+        self._last_chunk_text = (progress.text_delta if progress.incremental else progress.text)[-256:]
+        self._last_chunk_token_ids = chunk_token_ids[-32:]
+        self._last_chunk_token_texts = self._decode_token_ids(self._last_chunk_token_ids)
         if progress.incremental:
             self._last_incremental_chunk = progress.text_delta[-128:]
             self._recent_output_token_ids.extend(chunk_token_ids)
@@ -732,6 +740,17 @@ class AnthropicStreamResponse:
             self.latest_text = progress.text
             deltas = self.parser.push(progress.text)
         await self._write_deltas(self._coalesce(deltas))
+
+    def _decode_token_ids(self, token_ids: list[int]) -> list[str]:
+        if self.tokenizer is None:
+            return []
+        decoded = []
+        for token_id in token_ids:
+            try:
+                decoded.append(self.tokenizer.decode([token_id], skip_special_tokens=False))
+            except Exception:
+                decoded.append("<decode_error>")
+        return decoded
 
     async def finish(
         self,
@@ -893,9 +912,17 @@ class AnthropicStreamResponse:
         if isinstance(error, StreamProtocolError) and active_parser_state in safe_protocol_states:
             parser_buffer_tail = json.dumps(self.parser._buffer[-128:], ensure_ascii=True)
             sglang_chunk_tail = json.dumps(self._last_incremental_chunk, ensure_ascii=True)
+            failure_chunk_text_tail = json.dumps(self._last_chunk_text, ensure_ascii=True)
+            failure_chunk_token_ids = json.dumps(self._last_chunk_token_ids, ensure_ascii=True)
+            failure_chunk_token_texts = json.dumps(self._last_chunk_token_texts, ensure_ascii=True)
+            known_tool_names = json.dumps(sorted(self.parser._known_tool_names()), ensure_ascii=True)
         else:
             parser_buffer_tail = "-"
             sglang_chunk_tail = "-"
+            failure_chunk_text_tail = "-"
+            failure_chunk_token_ids = "-"
+            failure_chunk_token_texts = "-"
+            known_tool_names = "-"
         recent_output_token_ids = (
             ",".join(str(token_id) for token_id in self._recent_output_token_ids)
             if isinstance(error, StreamProtocolError)
@@ -914,7 +941,9 @@ class AnthropicStreamResponse:
             "stream_chunks=%d content_delta_count=%d output_tokens=%d finish_reason=%s "
             "finish_matched_token_id=%s "
             "parser_state=%s exception_type=%s failure_family=%s failure_code=%s "
-            "parser_buffer_tail=%s sglang_chunk_tail=%s recent_output_token_ids=%s",
+            "parser_buffer_tail=%s sglang_chunk_tail=%s failure_chunk_text_tail=%s "
+            "failure_chunk_token_ids=%s failure_chunk_token_texts=%s known_tool_names=%s "
+            "recent_output_token_ids=%s",
             self.log_prefix,
             self.sid,
             self.rid,
@@ -934,6 +963,10 @@ class AnthropicStreamResponse:
             failure_code,
             parser_buffer_tail,
             sglang_chunk_tail,
+            failure_chunk_text_tail,
+            failure_chunk_token_ids,
+            failure_chunk_token_texts,
+            known_tool_names,
             recent_output_token_ids,
         )
 
