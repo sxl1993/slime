@@ -693,6 +693,8 @@ class AnthropicStreamResponse:
         self.latest_text = ""
         self._incremental_text_parts: list[str] = []
         self._incremental_output: bool | None = None
+        self._last_incremental_chunk = ""
+        self._recent_output_token_ids: list[int] = []
         self.rid = "-"
         self._summary_logged = False
         self._next_block_index = 0
@@ -718,10 +720,15 @@ class AnthropicStreamResponse:
             self._incremental_output = progress.incremental
         elif self._incremental_output != progress.incremental:
             raise StreamProtocolError("sglang changed streaming output mode within one response")
+        chunk_token_ids = [token_id for _, token_id in progress.output_token_logprobs]
         if progress.incremental:
+            self._last_incremental_chunk = progress.text_delta[-128:]
+            self._recent_output_token_ids.extend(chunk_token_ids)
+            self._recent_output_token_ids = self._recent_output_token_ids[-16:]
             self._incremental_text_parts.append(progress.text_delta)
             deltas = self.parser.push_delta(progress.text_delta)
         else:
+            self._recent_output_token_ids = chunk_token_ids[-16:]
             self.latest_text = progress.text
             deltas = self.parser.push(progress.text)
         await self._write_deltas(self._coalesce(deltas))
@@ -875,6 +882,25 @@ class AnthropicStreamResponse:
         interrupted = isinstance(error, StreamInterruptedError)
         parse_failure = isinstance(error, (StreamProtocolError, StreamParityError))
         failure_family, failure_code = self._failure_classification(error) if error is not None else ("-", "-")
+        active_parser_state = parser_state or self.parser.state
+        safe_protocol_states = {
+            "tool.expect_function",
+            "tool.function_name",
+            "tool.expect_parameter_or_function_end",
+            "tool.parameter_name",
+            "tool.expect_tool_end",
+        }
+        if isinstance(error, StreamProtocolError) and active_parser_state in safe_protocol_states:
+            parser_buffer_tail = json.dumps(self.parser._buffer[-128:], ensure_ascii=True)
+            sglang_chunk_tail = json.dumps(self._last_incremental_chunk, ensure_ascii=True)
+        else:
+            parser_buffer_tail = "-"
+            sglang_chunk_tail = "-"
+        recent_output_token_ids = (
+            ",".join(str(token_id) for token_id in self._recent_output_token_ids)
+            if isinstance(error, StreamProtocolError)
+            else "-"
+        )
         if interrupted:
             event = "stream_interrupted"
         elif parse_failure:
@@ -887,7 +913,8 @@ class AnthropicStreamResponse:
             "first_chunk_ms=%.1f first_content_delta_ms=%.1f last_content_delta_ms=%.1f "
             "stream_chunks=%d content_delta_count=%d output_tokens=%d finish_reason=%s "
             "finish_matched_token_id=%s "
-            "parser_state=%s exception_type=%s failure_family=%s failure_code=%s",
+            "parser_state=%s exception_type=%s failure_family=%s failure_code=%s "
+            "parser_buffer_tail=%s sglang_chunk_tail=%s recent_output_token_ids=%s",
             self.log_prefix,
             self.sid,
             self.rid,
@@ -901,10 +928,13 @@ class AnthropicStreamResponse:
             output_tokens,
             self.finish_reason or "-",
             self.finish_matched_token_id if self.finish_matched_token_id is not None else "-",
-            parser_state or self.parser.state,
+            active_parser_state,
             type(error).__name__ if error is not None else "-",
             failure_family,
             failure_code,
+            parser_buffer_tail,
+            sglang_chunk_tail,
+            recent_output_token_ids,
         )
 
     @staticmethod
