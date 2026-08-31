@@ -6,6 +6,36 @@ import torch.nn.functional as F
 from megatron.core import mpu
 
 
+def build_hf_attention_cp_slices(
+    cu_seqlens: Sequence[int],
+    cp_size: int,
+) -> tuple[tuple[tuple[int, int, int], ...], tuple[tuple[tuple[int, int], ...], ...]]:
+    """Build Python slice bounds for the duplicated HF attention CP path."""
+    local_cu_seqlens = tuple(value // cp_size for value in cu_seqlens)
+    gather_slices = []
+    output_slices_by_rank = [[] for _ in range(cp_size)]
+
+    for index, (sequence_start, sequence_end) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True)):
+        chunk_size = (sequence_end - sequence_start) // (2 * cp_size)
+        local_start = local_cu_seqlens[index]
+        local_end = local_cu_seqlens[index + 1]
+        gather_slices.extend((rank, local_start, local_start + chunk_size) for rank in range(cp_size))
+        gather_slices.extend(reversed([(rank, local_start + chunk_size, local_end) for rank in range(cp_size)]))
+
+        for rank in range(cp_size):
+            output_slices_by_rank[rank].extend(
+                [
+                    (sequence_start + rank * chunk_size, sequence_start + (rank + 1) * chunk_size),
+                    (
+                        sequence_start + (2 * cp_size - 1 - rank) * chunk_size,
+                        sequence_start + (2 * cp_size - rank) * chunk_size,
+                    ),
+                ]
+            )
+
+    return tuple(gather_slices), tuple(tuple(slices) for slices in output_slices_by_rank)
+
+
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,

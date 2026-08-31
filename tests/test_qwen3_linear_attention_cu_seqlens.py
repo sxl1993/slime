@@ -13,7 +13,21 @@ NUM_GPUS = 0
 
 
 def install_megatron_stubs() -> None:
-    if "megatron" in sys.modules:
+    required_modules = {
+        "megatron.core",
+        "megatron.core.models",
+        "megatron.core.models.gpt",
+        "megatron.core.models.gpt.gpt_layer_specs",
+        "megatron.core.inference",
+        "megatron.core.inference.contexts",
+        "megatron.core.packed_seq_params",
+        "megatron.core.transformer",
+        "megatron.core.transformer.module",
+        "megatron.core.transformer.spec_utils",
+        "megatron.core.transformer.transformer_block",
+        "megatron.core.transformer.transformer_layer",
+    }
+    if required_modules.issubset(sys.modules) and hasattr(sys.modules["megatron.core"], "tensor_parallel"):
         return
 
     megatron_mod = types.ModuleType("megatron")
@@ -190,6 +204,134 @@ def test_linear_attention_forwards_cu_seqlens_to_chunk_kernel(
     assert output.shape == hidden_states.shape
     assert len(chunk_calls) == 1
     assert torch.equal(chunk_calls[0], cu_seqlens)
+
+
+@pytest.mark.unit
+def test_hf_attention_uses_cached_cp_slices_without_reading_cu_seqlens(monkeypatch):
+    module = load_module("slime_plugins.models.hf_attention")
+
+    class IdentityAttention(module.HuggingfaceAttention):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.args = SimpleNamespace(sequence_parallel=False)
+
+        def hf_forward(self, hidden_states, packed_seq_params):
+            del packed_seq_params
+            return hidden_states
+
+    attention = IdentityAttention()
+    rank_inputs = [torch.arange(12, dtype=torch.float32).reshape(12, 1, 1) + 1000 * rank for rank in range(4)]
+
+    class GuardedCuSeqlens:
+        def __len__(self):
+            raise AssertionError("cached CP slices should avoid reading cu_seqlens")
+
+        def __getitem__(self, index):
+            del index
+            raise AssertionError("cached CP slices should avoid indexing cu_seqlens")
+
+    packed_seq_params = module.PackedSeqParams(cu_seqlens_q=GuardedCuSeqlens())
+    packed_seq_params.hf_attention_cp_slices = (
+        (
+            (0, 0, 2),
+            (1, 0, 2),
+            (2, 0, 2),
+            (3, 0, 2),
+            (3, 2, 4),
+            (2, 2, 4),
+            (1, 2, 4),
+            (0, 2, 4),
+            (0, 4, 8),
+            (1, 4, 8),
+            (2, 4, 8),
+            (3, 4, 8),
+            (3, 8, 12),
+            (2, 8, 12),
+            (1, 8, 12),
+            (0, 8, 12),
+        ),
+        (
+            ((0, 2), (14, 16), (16, 20), (44, 48)),
+            ((2, 4), (12, 14), (20, 24), (40, 44)),
+            ((4, 6), (10, 12), (24, 28), (36, 40)),
+            ((6, 8), (8, 10), (28, 32), (32, 36)),
+        ),
+    )
+
+    monkeypatch.setattr(module.mpu, "get_context_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module.mpu, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(
+        module._AllGatherForDuplicatedComputation,
+        "apply",
+        staticmethod(lambda hidden_states, group: tuple(rank_inputs)),
+    )
+
+    for rank in range(4):
+        monkeypatch.setattr(module.mpu, "get_context_parallel_rank", lambda r=rank: r)
+        output, _ = module.HuggingfaceAttention.forward(
+            attention,
+            rank_inputs[rank],
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
+        assert torch.equal(output, rank_inputs[rank])
+
+
+@pytest.mark.unit
+def test_get_batch_attaches_hf_attention_cp_slices(monkeypatch):
+    install_megatron_stubs()
+    sys.modules.pop("slime.backends.megatron_utils.data", None)
+    data_module = importlib.import_module("slime.backends.megatron_utils.data")
+    cp_module = importlib.import_module("slime.backends.megatron_utils.cp_utils")
+
+    for module in (data_module, cp_module):
+        monkeypatch.setattr(module.mpu, "get_context_parallel_world_size", lambda: 4)
+        monkeypatch.setattr(module.mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(data_module.accelerator, "device", lambda: "cpu")
+    monkeypatch.setattr(data_module.accelerator, "current_device", lambda: "cpu")
+
+    iterator = data_module.DataIterator(
+        {
+            "tokens": [torch.arange(16), torch.arange(32)],
+            "loss_masks": [torch.ones(8), torch.ones(16)],
+            "total_lengths": [16, 32],
+            "response_lengths": [8, 16],
+        },
+        [[0, 1]],
+    )
+    batch = data_module.get_batch(
+        iterator,
+        ["tokens", "loss_masks", "total_lengths", "response_lengths"],
+        pad_multiplier=1,
+    )
+
+    assert batch["packed_seq_params"].hf_attention_cp_slices == (
+        (
+            (0, 0, 2),
+            (1, 0, 2),
+            (2, 0, 2),
+            (3, 0, 2),
+            (3, 2, 4),
+            (2, 2, 4),
+            (1, 2, 4),
+            (0, 2, 4),
+            (0, 4, 8),
+            (1, 4, 8),
+            (2, 4, 8),
+            (3, 4, 8),
+            (3, 8, 12),
+            (2, 8, 12),
+            (1, 8, 12),
+            (0, 8, 12),
+        ),
+        (
+            ((0, 2), (14, 16), (16, 20), (44, 48)),
+            ((2, 4), (12, 14), (20, 24), (40, 44)),
+            ((4, 6), (10, 12), (24, 28), (36, 40)),
+            ((6, 8), (8, 10), (28, 32), (32, 36)),
+        ),
+    )
 
 
 if __name__ == "__main__":

@@ -40,6 +40,71 @@ from slime.observability import train_metric_utils  # noqa: E402
 NUM_GPUS = 0
 
 
+@pytest.mark.unit
+def test_pipeline_perf_metrics_add_new_fields_without_redefining_actor_time():
+    assert hasattr(train_metric_utils, "compute_pipeline_perf_metrics")
+    rollout_data = {
+        "pipeline_rollout_metrics": [
+            {"rollout_agent_time": 10.0, "rollout_eval_time": 2.0},
+            {"rollout_agent_time": 20.0, "rollout_eval_time": 4.0},
+        ],
+        "rollout_batch_collect_time": 5.0,
+    }
+
+    metrics = train_metric_utils.compute_pipeline_perf_metrics(
+        rollout_data,
+        critic_total_time=7.0,
+        actor_train_time=11.0,
+    )
+
+    assert metrics == {
+        "perf/rollout_agent_time_mean": 15.0,
+        "perf/rollout_agent_time_max": 20.0,
+        "perf/rollout_eval_time_mean": 3.0,
+        "perf/rollout_eval_time_max": 4.0,
+        "perf/rollout_batch_collect_time": 5.0,
+        "perf/critic_total_time": 7.0,
+        "perf/actor_train_time": 11.0,
+    }
+
+
+@pytest.mark.unit
+def test_pipeline_perf_log_does_not_retrack_existing_actor_metric(monkeypatch):
+    from megatron.core import mpu as _mpu
+
+    monkeypatch.setattr(_mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(_mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(
+        _mpu,
+        "get_data_parallel_rank",
+        lambda with_context_parallel=True: 0,
+        raising=False,
+    )
+    logged_metrics = []
+    monkeypatch.setattr(
+        train_metric_utils.logging_utils,
+        "log",
+        lambda args, metrics, step_key: logged_metrics.append(metrics),
+    )
+
+    metrics = train_metric_utils.log_pipeline_perf_data(
+        3,
+        Namespace(wandb_always_use_train_step=False),
+        {"rollout_batch_collect_time": 5.0},
+        critic_total_time=7.0,
+        actor_train_time=11.0,
+    )
+
+    assert metrics["perf/actor_train_time"] == 11.0
+    assert logged_metrics == [
+        {
+            "perf/rollout_batch_collect_time": 5.0,
+            "perf/critic_total_time": 7.0,
+            "rollout/step": 3,
+        }
+    ]
+
+
 @pytest.fixture
 def mock_dp_with_cp_group(monkeypatch):
     """A sentinel "process group" object plus a no-op ``dist.all_reduce``.

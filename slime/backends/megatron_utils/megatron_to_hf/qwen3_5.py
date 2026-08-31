@@ -56,7 +56,13 @@ def convert_qwen3_5_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.language_model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
+        if param.shape[0] == 1:
+            return [("critic_head.weight", param)]
         return [("lm_head.weight", param)]
+    if name == "module.module.output_layer.bias":
+        if param.numel() == 1:
+            return [("critic_head.bias", param)]
+        raise ValueError(f"Qwen3.5 output layer bias must be scalar for critic export: {tuple(param.shape)}")
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.language_model.norm.weight", param)]
 

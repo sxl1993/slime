@@ -20,7 +20,8 @@ def test_critic_train_advances_profiler_once_per_rollout():
 
         result = actor.train(7, {"num_microbatches": [1]})
 
-        assert result == {"values": [7]}
+        assert result["values"] == [7]
+        assert result["critic_total_time"] >= 0
         assert profiled_rollout_ids == [7]
         """)
 

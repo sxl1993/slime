@@ -593,6 +593,7 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
             ev,
             cmd="bash /tmp/eval.sh",
             user=ev.privileged_user,
+            env={"PYTHONIOENCODING": "utf-8"},
             time_budget_sec=timeout_sec,
             tag="eval",
             want_output=True,

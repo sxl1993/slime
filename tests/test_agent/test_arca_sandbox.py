@@ -52,6 +52,7 @@ class FakeFilesystem:
         self.writes = []
         self.uploads = []
         self.reads = []
+        self.downloads = []
 
     async def write(self, path, content):
         self.writes.append((path, content))
@@ -64,6 +65,10 @@ class FakeFilesystem:
     async def read(self, path, *, raw=False):
         self.reads.append((path, raw))
         return SimpleNamespace(content=b"file-body")
+
+    async def download(self, source, dest, *, timeout_in_millis):
+        self.downloads.append((source, dest, timeout_in_millis))
+        Path(dest).write_bytes(b"downloaded-body")
 
 
 class FakeProviderSandbox:
@@ -279,6 +284,7 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
     FakeFactory.provider = provider
     host_file = tmp_path / "payload.bin"
     host_file.write_bytes(b"payload")
+    downloaded_file = tmp_path / "downloaded.bin"
 
     async def run_case():
         sb = sandbox_mod.ArcaSandbox("image")
@@ -287,6 +293,7 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
         await sb.write_file("/testbed/text", "hello", user="admin")
         await sb.write_file("/testbed/payload", host_file, user="admin")
         assert await sb.read_file("/testbed/text", user="admin") == "file-body"
+        await sb.download_file("/testbed/large", downloaded_file, user="admin")
         with pytest.raises(ValueError, match="admin"):
             await sb.exec("id", user="root")
         with pytest.raises(ValueError, match="admin"):
@@ -299,6 +306,8 @@ def test_arca_exec_and_filesystem_use_async_sdk_and_reject_non_admin(tmp_path):
     assert provider.filesystem.writes == [("/testbed/text", "hello")]
     assert provider.filesystem.uploads == [(str(host_file), "/testbed/payload")]
     assert provider.filesystem.reads == [("/testbed/text", True)]
+    assert provider.filesystem.downloads == [("/testbed/large", str(downloaded_file), 600_000)]
+    assert downloaded_file.read_bytes() == b"downloaded-body"
 
 
 def test_ambiguous_create_is_recognizable_and_not_retried():

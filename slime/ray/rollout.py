@@ -337,6 +337,32 @@ class RolloutManager:
             "rollout_ids": rollout_ids,
         }
 
+        pipeline_rollout_metrics = []
+        seen_rollout_ids = set()
+        for rollout_id, sample in zip(rollout_ids, samples, strict=True):
+            if rollout_id in seen_rollout_ids:
+                continue
+            seen_rollout_ids.add(rollout_id)
+            agent_time = sample.metadata.get("rollout_agent_time")
+            eval_time = sample.metadata.get("rollout_eval_time")
+            if agent_time is not None or eval_time is not None:
+                pipeline_rollout_metrics.append(
+                    {
+                        "rollout_agent_time": agent_time,
+                        "rollout_eval_time": eval_time,
+                    }
+                )
+        if pipeline_rollout_metrics:
+            train_data["pipeline_rollout_metrics"] = pipeline_rollout_metrics
+
+        batch_collect_times = [
+            sample.metadata["rollout_batch_collect_time"]
+            for sample in samples
+            if "rollout_batch_collect_time" in sample.metadata
+        ]
+        if batch_collect_times:
+            train_data["rollout_batch_collect_time"] = batch_collect_times[0]
+
         # loss mask
         # TODO: compress the loss mask
         loss_masks = []
@@ -477,7 +503,7 @@ class RolloutManager:
                     continue
                 rollout_data[key] = [data[key][j] for j in partition]
             # keys that need to be splited at train side
-            for key in ["raw_reward", "total_lengths"]:
+            for key in ["raw_reward", "total_lengths", "pipeline_rollout_metrics", "rollout_batch_collect_time"]:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]

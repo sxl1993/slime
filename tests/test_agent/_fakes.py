@@ -354,6 +354,11 @@ class FakeSandbox:
         for needle, result in self.responses:
             if needle in cmd:
                 return result
+
+        tail = re.search(r"tail -c (\d+) (\S+)", cmd)
+        if tail:
+            size, path = tail.groups()
+            return 0, _as_str(self.files.get(path, ""))[-int(size) :], ""
         return 0, "", ""
 
     async def write_file(self, sandbox_path, content, *, user="root") -> None:

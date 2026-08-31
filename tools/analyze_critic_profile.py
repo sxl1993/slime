@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze PyTorch critic profiler traces without loading the full JSON document.
+"""Analyze PyTorch profiler traces with the fast orjson parser.
 
 Usage:
     python tools/analyze_critic_profile.py path/to/train_critic_rank_0.trace.json.gz
@@ -15,10 +15,13 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
-CHUNK_SIZE = 1024 * 1024
-TRACE_EVENTS_KEY = '"traceEvents"'
+try:
+    import orjson as _orjson
+except ModuleNotFoundError:  # Keep unit-test collection usable on minimal hosts.
+    _orjson = None
+
 GPU_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
 HOST_SYNC_NAMES = {
     "aten::item",
@@ -29,103 +32,44 @@ HOST_SYNC_NAMES = {
 }
 
 
-def _open_trace(path: Path) -> TextIO:
+def _open_trace(path: Path):
     if path.name.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("rt", encoding="utf-8")
+        return gzip.open(path, "rb")
+    return path.open("rb")
 
 
-def _trace_prelude(path: Path) -> str:
-    buffer = ""
+def _load_trace(path: Path) -> dict[str, Any]:
+    if _orjson is None:
+        raise RuntimeError("orjson is required to analyze profiler traces")
     with _open_trace(path) as stream:
-        while True:
-            chunk = stream.read(CHUNK_SIZE)
-            buffer += chunk
-            marker_index = buffer.find(TRACE_EVENTS_KEY)
-            if marker_index >= 0:
-                return buffer[:marker_index]
-            if not chunk:
-                raise ValueError(f'Could not find "traceEvents" in {path}')
-            buffer = buffer[-(len(TRACE_EVENTS_KEY) - 1) :]
+        trace = _orjson.loads(stream.read())
+    if not isinstance(trace, dict):
+        raise ValueError(f"Trace root must be an object: {path}")
+    if not isinstance(trace.get("traceEvents"), list):
+        raise ValueError(f'Trace does not contain a "traceEvents" array: {path}')
+    return trace
 
 
-def _extract_prelude_value(prelude: str, key: str) -> Any:
-    marker = json.dumps(key)
-    marker_index = prelude.find(marker)
-    if marker_index < 0:
-        return None
-    colon_index = prelude.find(":", marker_index + len(marker))
-    if colon_index < 0:
-        return None
-    value_index = colon_index + 1
-    while value_index < len(prelude) and prelude[value_index].isspace():
-        value_index += 1
-    try:
-        value, _ = json.JSONDecoder().raw_decode(prelude, value_index)
-    except json.JSONDecodeError:
-        return None
-    return value
-
-
-def _metadata(path: Path) -> dict[str, Any]:
-    prelude = _trace_prelude(path)
-    distributed = _extract_prelude_value(prelude, "distributedInfo") or {}
-    devices = _extract_prelude_value(prelude, "deviceProperties") or []
+def _metadata(trace: dict[str, Any]) -> dict[str, Any]:
+    distributed = trace.get("distributedInfo") or {}
+    devices = trace.get("deviceProperties") or []
     first_device = devices[0] if devices and isinstance(devices[0], dict) else {}
     return {
-        "schema_version": _extract_prelude_value(prelude, "schemaVersion"),
+        "schema_version": trace.get("schemaVersion"),
         "rank": distributed.get("rank"),
         "world_size": distributed.get("world_size"),
         "backend": distributed.get("backend"),
         "nccl_version": distributed.get("nccl_version"),
-        "cuda_runtime_version": _extract_prelude_value(prelude, "cuda_runtime_version"),
+        "cuda_runtime_version": trace.get("cuda_runtime_version"),
         "device_name": first_device.get("name"),
         "visible_device_count": len(devices),
     }
 
 
 def iter_trace_events(path: str | Path) -> Iterator[dict[str, Any]]:
-    """Yield traceEvents one at a time from a plain or gzip-compressed trace."""
+    """Yield events from a gzip-compressed or plain trace parsed by orjson."""
 
-    path = Path(path)
-    decoder = json.JSONDecoder()
-    buffer = ""
-    found_array = False
-
-    with _open_trace(path) as stream:
-        while True:
-            chunk = stream.read(CHUNK_SIZE)
-            buffer += chunk
-
-            if not found_array:
-                marker_index = buffer.find(TRACE_EVENTS_KEY)
-                if marker_index >= 0:
-                    array_index = buffer.find("[", marker_index + len(TRACE_EVENTS_KEY))
-                    if array_index >= 0:
-                        buffer = buffer[array_index + 1 :]
-                        found_array = True
-                elif not chunk:
-                    raise ValueError(f'Could not find "traceEvents" in {path}')
-                else:
-                    buffer = buffer[-(len(TRACE_EVENTS_KEY) - 1) :]
-
-            if found_array:
-                while True:
-                    buffer = buffer.lstrip(" \t\r\n,")
-                    if not buffer:
-                        break
-                    if buffer[0] == "]":
-                        return
-                    try:
-                        event, end_index = decoder.raw_decode(buffer)
-                    except json.JSONDecodeError:
-                        break
-                    buffer = buffer[end_index:]
-                    if isinstance(event, dict):
-                        yield event
-
-            if not chunk:
-                raise ValueError(f"Truncated traceEvents array in {path}")
+    yield from (event for event in _load_trace(Path(path))["traceEvents"] if isinstance(event, dict))
 
 
 def classify_kernel(name: str) -> str:
@@ -201,6 +145,7 @@ def analyze_trace_file(path: str | Path, top_n: int = 20) -> dict[str, Any]:
     if top_n < 1:
         raise ValueError("top_n must be positive")
 
+    trace = _load_trace(path)
     name_stats: dict[tuple[str, str], dict[str, float | int]] = {}
     category_counts: Counter[str] = Counter()
     category_durations: defaultdict[str, float] = defaultdict(float)
@@ -214,7 +159,9 @@ def analyze_trace_file(path: str | Path, top_n: int = 20) -> dict[str, Any]:
     trace_start_us: float | None = None
     trace_end_us: float | None = None
 
-    for event in iter_trace_events(path):
+    for event in trace["traceEvents"]:
+        if not isinstance(event, dict):
+            continue
         total_events += 1
         category = str(event.get("cat", ""))
         phase = str(event.get("ph", ""))
@@ -248,7 +195,7 @@ def analyze_trace_file(path: str | Path, top_n: int = 20) -> dict[str, Any]:
     trace_wall_time_us = 0.0 if trace_start_us is None or trace_end_us is None else trace_end_us - trace_start_us
     return {
         "path": str(path),
-        "metadata": _metadata(path),
+        "metadata": _metadata(trace),
         "total_events": total_events,
         "phase_counts": dict(phase_counts),
         "category_counts": dict(category_counts),

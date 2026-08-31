@@ -20,6 +20,7 @@ if not _has_megatron:
     sys.modules["slime.backends.megatron_utils"] = _megatron_utils
 
 from slime.backends.megatron_utils.hf_to_megatron import _LOADERS
+from slime.backends.megatron_utils.hf_to_megatron import common as hf_common
 from slime.backends.megatron_utils.hf_to_megatron.common import SafetensorReader
 from slime.backends.megatron_utils.hf_to_megatron.deepseek import deepseek_hf_tensor
 from slime.backends.megatron_utils.hf_to_megatron.glm import glm4_hf_tensor, glm4_moe_hf_tensor
@@ -355,6 +356,56 @@ def test_reader_dequantizes_block_scaled_fp8(tmp_path):
 
     assert loaded.dtype == torch.bfloat16
     assert torch.equal(loaded, weight.to(torch.bfloat16) * 2)
+
+
+@pytest.mark.unit
+def test_hf_loader_skips_scalar_critic_output_bias(monkeypatch):
+    update_weight_common = types.ModuleType("slime.backends.megatron_utils.update_weight.common")
+
+    def named_params_and_buffers(_args, _model):
+        yield "module.module.output_layer.bias", torch.nn.Parameter(torch.zeros(1))
+
+    update_weight_common.named_params_and_buffers = named_params_and_buffers
+    monkeypatch.setitem(sys.modules, "slime.backends.megatron_utils.update_weight.common", update_weight_common)
+    monkeypatch.setattr(hf_common, "SafetensorReader", lambda _path: object())
+
+    def should_not_load_hf_tensor(*_args):
+        raise AssertionError("critic output bias is not an HF base-model weight")
+
+    hf_common.load_model_hf_weights(None, None, "/unused", None, should_not_load_hf_tensor)
+
+
+@pytest.mark.unit
+def test_hf_loader_loads_exported_scalar_critic_head(monkeypatch):
+    update_weight_common = types.ModuleType("slime.backends.megatron_utils.update_weight.common")
+    weight = torch.nn.Parameter(torch.zeros(1, 3))
+    bias = torch.nn.Parameter(torch.zeros(1))
+
+    def named_params_and_buffers(_args, _model):
+        yield "module.module.output_layer.weight", weight
+        yield "module.module.output_layer.bias", bias
+
+    update_weight_common.named_params_and_buffers = named_params_and_buffers
+    monkeypatch.setitem(sys.modules, "slime.backends.megatron_utils.update_weight.common", update_weight_common)
+    monkeypatch.setattr(
+        hf_common,
+        "SafetensorReader",
+        lambda _path: Reader(
+            **{
+                "critic_head.weight": torch.tensor([[1.0, 2.0, 3.0]]),
+                "critic_head.bias": torch.tensor([4.0]),
+            }
+        ),
+    )
+    monkeypatch.setattr(hf_common, "shard_mcore_tensor", lambda _name, tensor, _parameter: tensor)
+
+    def should_not_load_base_model_tensor(*_args):
+        raise AssertionError("exported critic head should be loaded directly")
+
+    hf_common.load_model_hf_weights(None, None, "/unused", None, should_not_load_base_model_tensor)
+
+    assert torch.equal(weight.detach(), torch.tensor([[1.0, 2.0, 3.0]]))
+    assert torch.equal(bias.detach(), torch.tensor([4.0]))
 
 
 if __name__ == "__main__":

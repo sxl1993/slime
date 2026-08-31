@@ -9,6 +9,8 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 
+from slime.backends.megatron_utils.cp_utils import build_hf_attention_cp_slices
+
 
 def _load_hf_config(checkpoint_path):
     """Load HF config with fallback for unsupported model types."""
@@ -116,6 +118,12 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         if mpu.get_context_parallel_world_size() > 1:
             cp_size = mpu.get_context_parallel_world_size()
+            cp_slices = getattr(packed_seq_params, "hf_attention_cp_slices", None)
+            if cp_slices is None:
+                # Keep non-training callers compatible; training batches attach
+                # these Python bounds in ``get_batch`` and avoid this fallback.
+                cp_slices = build_hf_attention_cp_slices(tuple(cu_seqlens.detach().cpu().tolist()), cp_size)
+            gather_slices, output_slices_by_rank = cp_slices
             # Use custom all-gather whose backward returns local gradient
             # instead of reduce-scatter, since the computation is duplicated.
             hidden_states_list = _AllGatherForDuplicatedComputation.apply(
@@ -123,24 +131,10 @@ class HuggingfaceAttention(MegatronModule, ABC):
                 mpu.get_context_parallel_group(),
             )
 
-            # TODO: preprocess this for each batch to prevent tolist in the training step
-            whole_hidden_states_list = []
-
-            local_cu_seqlens = cu_seqlens // cp_size
-            for i in range(len(cu_seqlens) - 1):
-                seqlen = cu_seqlens[i + 1] - cu_seqlens[i]
-                chunk_size = seqlen // 2 // cp_size
-                whole_hidden_states_list.extend(
-                    [
-                        hidden_states_list[cp_rank][local_cu_seqlens[i] : local_cu_seqlens[i] + chunk_size]
-                        for cp_rank in range(cp_size)
-                    ]
-                    + [
-                        hidden_states_list[cp_rank][local_cu_seqlens[i] + chunk_size : local_cu_seqlens[i + 1]]
-                        for cp_rank in range(cp_size)
-                    ][::-1],
-                )
-            hidden_states = torch.cat(whole_hidden_states_list, dim=0)
+            hidden_states = torch.cat(
+                [hidden_states_list[rank][start:end] for rank, start, end in gather_slices],
+                dim=0,
+            )
 
         hidden_states = hidden_states.permute(1, 0, 2)  # [bsz, seq_len, hidden_dim]
 
@@ -151,15 +145,10 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         if mpu.get_context_parallel_world_size() > 1:
             cp_rank = mpu.get_context_parallel_rank()
-            output_list = []
-            for i in range(len(cu_seqlens) - 1):
-                seqlen = cu_seqlens[i + 1] - cu_seqlens[i]
-                chunk_size = seqlen // 2 // cp_size
-                seq = output[cu_seqlens[i] : cu_seqlens[i + 1]]
-                chunks = torch.chunk(seq, 2 * cp_size, dim=0)
-                output_list.append(chunks[cp_rank])
-                output_list.append(chunks[2 * cp_size - 1 - cp_rank])
-            output = torch.cat(output_list, dim=0)
+            output = torch.cat(
+                [output[start:end] for start, end in output_slices_by_rank[cp_rank]],
+                dim=0,
+            )
 
         if self.args.sequence_parallel:
             output = tensor_parallel.scatter_to_sequence_parallel_region(
