@@ -8,7 +8,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import accelerator
 from slime.utils.types import RolloutBatch
 
-from .cp_utils import build_hf_attention_cp_slices, slice_with_cp
+from .cp_utils import slice_with_cp
 
 
 def get_batch(
@@ -74,9 +74,9 @@ def get_batch(
     else:
         tokens = [slice_with_cp(t, pad_token_id) for t in tokens]
 
-        cu_seqlens_list = [0]
+        cu_seqlens = [0]
         for t in tokens:
-            cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
+            cu_seqlens.append(cu_seqlens[-1] + t.size(0))
 
         tokens = torch.cat(tokens)
 
@@ -84,10 +84,10 @@ def get_batch(
         pad = (pad_size - tokens.size(0) % pad_size) % pad_size
         if pad != 0:
             tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-            cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
+            cu_seqlens.append(cu_seqlens[-1] + pad)
 
         # thd requires the cu_seqlens to be of the origin length
-        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.device()) * cp_size
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp_size
 
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
     packed_seq_params = PackedSeqParams(
@@ -97,10 +97,6 @@ def get_batch(
         max_seqlen_kv=max_seqlen,
         qkv_format="thd",
     )
-    if cp_size > 1 and not allgather_cp:
-        packed_seq_params.hf_attention_cp_slices = build_hf_attention_cp_slices(
-            tuple(value * cp_size for value in cu_seqlens_list), cp_size
-        )
 
     tokens = tokens.unsqueeze(0)
 
