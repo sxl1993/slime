@@ -25,6 +25,8 @@ The scheduling philosophy is **pack first, distribute second**:
 Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
+  - an empty mbs is scheduling-only padding used when unsplittable dynamic
+    mbs cannot otherwise satisfy DP alignment; it carries no real sample;
   - every mbs (dynamic path without ``balance_by_flops``) holds
     ``<= max_tokens_per_gpu * cp_size`` tokens, with one exception — an
     individual sample larger than that cap lands alone in its own mbs (and
@@ -46,6 +48,24 @@ from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.seqlen_balancing import expand_bins_by_splitting, first_fit_pack, get_seqlen_balanced_partitions
 
 logger = logging.getLogger(__name__)
+
+
+def restore_forward_outputs(values: list[Any], micro_batch_indices: list[list[int]], num_samples: int) -> list[Any]:
+    """Restore local sample order while discarding scheduling-only padding outputs."""
+    restored: list[Any | None] = [None] * num_samples
+    value_offset = 0
+    for indices in micro_batch_indices:
+        output_count = len(indices) if indices else 1
+        next_offset = value_offset + output_count
+        assert next_offset <= len(values), "forward output count is shorter than the micro-batch schedule"
+        if indices:
+            for index, value in zip(indices, values[value_offset:next_offset], strict=True):
+                restored[index] = value
+        value_offset = next_offset
+
+    assert value_offset == len(values), "forward output count is longer than the micro-batch schedule"
+    assert all(value is not None for value in restored), "forward outputs do not cover every local sample"
+    return restored
 
 
 def _calculate_workloads(step_lengths, args):
@@ -169,11 +189,15 @@ def build_dp_schedule(
         if target_K != len(step_mbs):
             if args.use_dynamic_batch_size:
                 expand_bins_by_splitting(step_mbs, target_K, step_lengths)
-                assert len(step_mbs) == target_K, (
-                    f"dynamic path: could only produce {len(step_mbs)} mbs after maximal splitting; "
-                    f"need {target_K}. step {step_i} has {len(sample_indices)} samples, below the "
-                    f"alignment threshold ({align_to})."
-                )
+                if len(step_mbs) != target_K:
+                    assert vpp_size == 1, "dynamic padding mbs is not validated with virtual pipeline parallelism"
+                    assert not getattr(
+                        args, "calculate_per_token_loss", False
+                    ), "dynamic padding mbs is not validated with per-token loss"
+                    assert not getattr(
+                        args, "enable_mtp_training", False
+                    ), "dynamic padding mbs is not validated with MTP training"
+                    step_mbs.extend([[] for _ in range(target_K - len(step_mbs))])
             else:
                 raise AssertionError(
                     f"static path: num_mbs ({len(step_mbs)}) is not a multiple of "

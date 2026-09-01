@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.utils.dp_schedule import build_dp_schedule
-
+from slime.utils.dp_schedule import (
+    build_dp_schedule,
+    restore_forward_outputs,
+)
 
 NUM_GPUS = 0
 
@@ -222,6 +224,74 @@ def test_dynamic_oversized_sample_lands_alone():
                 assert mbs == [local], f"oversized sample shares an mbs: {mbs}"
                 found = True
     assert found
+
+
+@pytest.mark.unit
+def test_dynamic_singletons_pad_to_dp_alignment_without_dropping_samples():
+    """An unsplittable odd mbs count uses one scheduling-only padding mbs."""
+    total_lengths = [10] * 49
+    rollout_indices = list(range(49))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    tp = make_tp(dp_size=2)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=49, rollout_indices=rollout_indices
+    )
+
+    assert nmb == [25]
+    assert gbs_per_step == [49]
+    assert sum(not micro_batch for rank_mbi in mbi for micro_batch in rank_mbi) == 1
+    assert sorted(index for partition in partitions for index in partition) == list(range(49))
+    for rank, rank_mbi in enumerate(mbi):
+        real_local_indices = [index for micro_batch in rank_mbi for index in micro_batch]
+        assert real_local_indices == list(range(len(partitions[rank])))
+
+
+@pytest.mark.unit
+def test_restore_forward_outputs_discards_padding_and_restores_sample_order():
+    restored = restore_forward_outputs(
+        ["sample-2", "sample-0", "padding", "sample-1"],
+        [[2, 0], [], [1]],
+        num_samples=3,
+    )
+
+    assert restored == ["sample-0", "sample-1", "sample-2"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("arg_name", "error"),
+    [
+        ("calculate_per_token_loss", "per-token loss"),
+        ("enable_mtp_training", "MTP training"),
+    ],
+)
+def test_dynamic_padding_rejects_unvalidated_loss_modes(arg_name, error):
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    setattr(args, arg_name, True)
+
+    with pytest.raises(AssertionError, match=error):
+        build_dp_schedule(
+            args,
+            make_tp(dp_size=2),
+            [10] * 49,
+            global_batch_size=49,
+            rollout_indices=list(range(49)),
+        )
+
+
+@pytest.mark.unit
+def test_dynamic_padding_rejects_virtual_pipeline_parallelism():
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+
+    with pytest.raises(AssertionError, match="virtual pipeline parallelism"):
+        build_dp_schedule(
+            args,
+            make_tp(dp_size=2, vpp_size=2, microbatch_group_size_per_vp_stage=2),
+            [10] * 49,
+            global_batch_size=49,
+            rollout_indices=list(range(49)),
+        )
 
 
 @pytest.mark.unit
