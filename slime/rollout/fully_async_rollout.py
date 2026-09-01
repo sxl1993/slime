@@ -226,6 +226,12 @@ class AsyncRolloutWorker:
                 else:
                     logger.warning("fully-async SAO: rollout returned %r; dropping", type(result).__name__)
                     return
+                if any(
+                    sample.remove_sample or sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED)
+                    for sample in samples
+                ):
+                    logger.warning("fully-async SAO: non-trainable rollout dropped")
+                    return
                 self.output_queue.put((gid, samples))
                 return
             if not isinstance(result, list):
