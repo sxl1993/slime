@@ -174,12 +174,18 @@ class DataIterator:
         """
         batch = {}
         indices = self.micro_batch_indices[self.offset]
+        is_padding = not indices
+        if is_padding:
+            total_lengths = self.rollout_data["total_lengths"]
+            indices = [min(range(len(total_lengths)), key=total_lengths.__getitem__)]
         for key in keys:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
             else:
                 batch[key] = [vals[i] for i in indices]
+                if is_padding and key == "loss_masks":
+                    batch[key] = [loss_mask * 0 for loss_mask in batch[key]]
         self.offset += 1
         return batch
 

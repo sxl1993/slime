@@ -29,6 +29,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.observability import logging_utils, train_metric_utils
+from slime.utils.dp_schedule import restore_forward_outputs
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -592,11 +593,11 @@ def forward_only(
             if args.use_dynamic_batch_size:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
-                origin_values = [None] * len(values)
-                origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                for value, origin_index in zip(values, origin_indices, strict=False):
-                    origin_values[origin_index] = value
-                values = origin_values
+                values = restore_forward_outputs(
+                    values,
+                    data_iterator[0].micro_batch_indices,
+                    num_samples=len(data_iterator[0].rollout_data["tokens"]),
+                )
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 
