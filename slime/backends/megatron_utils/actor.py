@@ -382,7 +382,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Compute pre-update critic values (used as old_values for the value loss).
         rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
 
-        compute_advantages_and_returns(self.args, rollout_data)
+        compute_advantages_and_returns(self.args, rollout_data, role="critic")
 
         self.args.loss_type = "value_loss"
         critic_updates = self.args.sao_critic_update_ratio if self.args.advantage_estimator == "sao" else 1
@@ -496,7 +496,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                compute_advantages_and_returns(self.args, rollout_data, role="policy")
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)

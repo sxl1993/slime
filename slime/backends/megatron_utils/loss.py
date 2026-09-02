@@ -702,12 +702,17 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
+def compute_advantages_and_returns(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    *,
+    role: str,
+) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "cispo", "ppo",
+    estimator. Supported methods: "grpo", "gspo", "cispo", "ppo", "sao",
     "reinforce_plus_plus", and "reinforce_plus_plus_baseline". When
     `args.normalize_advantages` is True, advantages are whitened across the
     data-parallel-with-context-parallel group using masked statistics.
@@ -726,6 +731,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             "rewards", "values", "response_lengths", "loss_masks",
             "total_lengths"). Modified in-place to add "advantages" and
             "returns" keys, each mapping to lists of tensors per sample.
+        role: Training role that consumes the targets. SAO uses separate GAE
+            settings for the policy and critic targets.
     """
     rollout_log_probs: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
     log_probs: list[torch.Tensor] | None = (
@@ -786,16 +793,24 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             raise ValueError("SAO requires critic values")
         old_rewards = rewards
         token_level_rewards = [per_token_kl * (-args.kl_coef) for per_token_kl in kl]
+        if role == "critic":
+            lambd = args.sao_critic_lambda
+            length_adaptive_alpha = None
+        elif role == "policy":
+            lambd = args.lambd
+            length_adaptive_alpha = args.sao_policy_gae_alpha if args.sao_skip_observation_gae else None
+        else:
+            raise ValueError(role)
         advantages, returns = get_advantages_and_returns_batch(
             total_lengths,
             response_lengths,
             values,
             token_level_rewards,
             args.gamma,
-            args.lambd,
+            lambd,
             loss_masks=loss_masks,
             skip_observation=args.sao_skip_observation_gae,
-            length_adaptive_alpha=(args.sao_gae_alpha if args.sao_skip_observation_gae else None),
+            length_adaptive_alpha=length_adaptive_alpha,
             terminal_rewards=old_rewards,
         )
 

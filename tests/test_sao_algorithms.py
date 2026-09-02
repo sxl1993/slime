@@ -162,3 +162,73 @@ def test_sao_length_adaptive_gae_uses_inverse_alpha_length():
 
     torch.testing.assert_close(advantages[0][0], torch.tensor(0.53744124), atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(returns[0][0], torch.tensor(0.53744124), atol=1e-5, rtol=1e-5)
+
+
+def test_sao_critic_targets_use_critic_lambda(monkeypatch):
+    from argparse import Namespace
+
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils.loss import compute_advantages_and_returns
+
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    rollout_data = {
+        "rewards": [1.0],
+        "values": [torch.zeros(3)],
+        "response_lengths": [3],
+        "total_lengths": [3],
+        "loss_masks": [torch.ones(3, dtype=torch.int32)],
+    }
+    args = Namespace(
+        advantage_estimator="sao",
+        kl_coef=0.0,
+        kl_loss_type="low_var_kl",
+        use_rollout_logprobs=False,
+        custom_advantage_function_path=None,
+        normalize_advantages=False,
+        use_opd=False,
+        gamma=1.0,
+        lambd=0.25,
+        sao_skip_observation_gae=True,
+        sao_policy_gae_alpha=2.0,
+        sao_critic_lambda=1.0,
+    )
+
+    compute_advantages_and_returns(args, rollout_data, role="critic")
+
+    torch.testing.assert_close(rollout_data["returns"][0], torch.ones(3))
+
+
+def test_sao_policy_targets_use_policy_gae_settings(monkeypatch):
+    from argparse import Namespace
+
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils.loss import compute_advantages_and_returns
+
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    rollout_data = {
+        "rewards": [1.0],
+        "values": [torch.zeros(3)],
+        "response_lengths": [3],
+        "total_lengths": [3],
+        "loss_masks": [torch.ones(3, dtype=torch.int32)],
+    }
+    args = Namespace(
+        advantage_estimator="sao",
+        kl_coef=0.0,
+        kl_loss_type="low_var_kl",
+        use_rollout_logprobs=False,
+        custom_advantage_function_path=None,
+        normalize_advantages=False,
+        use_opd=False,
+        gamma=1.0,
+        lambd=0.25,
+        sao_skip_observation_gae=True,
+        sao_policy_gae_alpha=2.0,
+        sao_critic_lambda=1.0,
+    )
+
+    compute_advantages_and_returns(args, rollout_data, role="policy")
+
+    torch.testing.assert_close(rollout_data["returns"][0], torch.tensor([25 / 36, 5 / 6, 1.0]))
