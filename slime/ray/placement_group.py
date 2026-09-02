@@ -199,6 +199,8 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
             critic_args.disable_param_buffers_cpu_backup = False
             if getattr(critic_args, "critic_lr", None) is not None:
                 critic_args.lr = critic_args.critic_lr
+        critic_args.lr_warmup_iters = critic_args.critic_lr_warmup_iters
+        critic_args.lr_warmup_fraction = None
 
         critic_model = allocate_train_group(
             args=critic_args,
