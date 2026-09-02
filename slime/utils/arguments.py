@@ -895,6 +895,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Learning rate for the critic; SAO defaults to 5e-6 when not explicitly set.",
             )
+            parser.add_argument(
+                "--critic-lr-warmup-iters",
+                type=int,
+                default=0,
+                help="Number of learning-rate warmup iterations for the critic; 0 disables critic LR warmup.",
+            )
 
             parser.add_argument(
                 "--num-critic-only-steps",
@@ -1022,7 +1028,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--sao-critic-lambda", type=float, default=1.0, help="SAO critic GAE lambda")
             parser.add_argument("--sao-batch-size", type=int, default=128)
             parser.add_argument("--sao-critic-update-ratio", type=int, default=2)
-            parser.add_argument("--sao-critic-warmup-steps", type=int, default=10)
             parser.add_argument(
                 "--sao-critic-freeze-attention",
                 action=argparse.BooleanOptionalAction,
@@ -1805,6 +1810,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    if args.num_critic_only_steps < 0:
+        raise ValueError("--num-critic-only-steps must be non-negative")
+    if args.critic_lr_warmup_iters < 0:
+        raise ValueError("--critic-lr-warmup-iters must be non-negative")
+
     if args.rollout_temperature <= 0:
         raise ValueError(
             "--rollout-temperature must be > 0; temperature 0 is greedy decoding and is not a valid RL policy."
@@ -1953,15 +1963,12 @@ def slime_validate_args(args):
             raise ValueError("--sao-batch-size must be positive")
         if args.sao_critic_update_ratio <= 0:
             raise ValueError("--sao-critic-update-ratio must be positive")
-        if args.sao_critic_warmup_steps < 0:
-            raise ValueError("--sao-critic-warmup-steps must be non-negative")
         if args.sao_dis_clip_low < 0 or args.sao_dis_clip_high < 0:
             raise ValueError("SAO DIS clip bounds must be non-negative")
         if args.use_tis:
             raise ValueError("SAO already applies DIS and cannot be combined with --use-tis")
         args.rollout_batch_size = args.sao_batch_size
         args.use_rollout_logprobs = True
-        args.num_critic_only_steps = max(args.num_critic_only_steps, args.sao_critic_warmup_steps)
         if getattr(args, "critic_lr", None) is None:
             args.critic_lr = 5e-6
 
