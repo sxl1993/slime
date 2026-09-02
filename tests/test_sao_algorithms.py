@@ -144,3 +144,21 @@ def test_sao_cp_keeps_loss_mask_in_response_space(monkeypatch):
 
     assert len(gathered) == 2  # values and rewards only
     assert advantages[0].numel() == returns[0].numel()
+
+
+def test_sao_length_adaptive_gae_uses_inverse_alpha_length():
+    advantages, returns = get_advantages_and_returns_batch(
+        total_lengths=[10],
+        response_lengths=[10],
+        values_list=[torch.zeros(10)],
+        rewards_list=[torch.zeros(10)],
+        gamma=1.0,
+        lambd=1.0,
+        loss_masks=[torch.ones(10, dtype=torch.int32)],
+        skip_observation=True,
+        length_adaptive_alpha=1.5,
+        terminal_rewards=[1.0],
+    )
+
+    torch.testing.assert_close(advantages[0][0], torch.tensor(0.53744124), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(returns[0][0], torch.tensor(0.53744124), atol=1e-5, rtol=1e-5)
