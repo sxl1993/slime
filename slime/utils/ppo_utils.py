@@ -555,7 +555,10 @@ def get_advantages_and_returns_batch(
                 for i, (total_len, resp_len) in enumerate(zip(total_lengths, response_lengths, strict=False)):
                     sample_lambda = lambd
                     if length_adaptive_alpha is not None:
-                        sample_lambda = max(0.0, 1.0 - length_adaptive_alpha / max(resp_len, 1))
+                        sample_lambda = max(
+                            0.0,
+                            1.0 - 1.0 / (length_adaptive_alpha * max(resp_len, 1)),
+                        )
                     sample_advantages, sample_returns = compute_skip_observation_gae(
                         full_rewards_list[i][:resp_len],
                         full_values_list[i][:resp_len],
