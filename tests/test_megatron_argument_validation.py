@@ -427,6 +427,32 @@ def test_sao_critic_freeze_attention_argument(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sao_gae_arguments_are_role_specific(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--sao-policy-gae-alpha",
+            "2.0",
+            "--sao-critic-lambda",
+            "0.75",
+        ]
+    )
+    assert defaults.sao_policy_gae_alpha == 1.5
+    assert defaults.sao_critic_lambda == 1.0
+    assert configured.sao_policy_gae_alpha == 2.0
+    assert configured.sao_critic_lambda == 0.75
+    assert not hasattr(defaults, "sao_gae_alpha")
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--sao-gae-alpha", "2.5"])
+
+@pytest.mark.unit
 def test_sao_defaults_to_critic_attention_freeze_after_validation(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(advantage_estimator="sao", sao_critic_freeze_attention=None)

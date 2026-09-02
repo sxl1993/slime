@@ -1036,7 +1036,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--sao-policy-gae-alpha",
-                "--sao-gae-alpha",
                 dest="sao_policy_gae_alpha",
                 type=float,
                 default=1.5,
