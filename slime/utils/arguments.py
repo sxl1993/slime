@@ -1025,8 +1025,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--sao-critic-warmup-steps", type=int, default=10)
             parser.add_argument(
                 "--sao-critic-freeze-attention",
-                action="store_true",
-                default=False,
+                action=argparse.BooleanOptionalAction,
+                default=None,
                 help="Freeze critic attention parameters while keeping normalization and value parameters trainable.",
             )
             parser.add_argument(
@@ -1945,6 +1945,8 @@ def slime_validate_args(args):
         apply_external_engine_info_to_args(args, logger=logger)
 
     if args.advantage_estimator == "sao":
+        if args.sao_critic_freeze_attention is None:
+            args.sao_critic_freeze_attention = True
         if args.n_samples_per_prompt != 1:
             raise ValueError("SAO requires --n-samples-per-prompt 1")
         if args.sao_batch_size <= 0:

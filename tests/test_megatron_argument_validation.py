@@ -200,6 +200,14 @@ def make_slime_validate_args(**overrides):
         save=None,
         kl_loss_coef=0,
         advantage_estimator="grpo",
+        sao_critic_freeze_attention=None,
+        sao_batch_size=128,
+        sao_critic_update_ratio=2,
+        sao_critic_warmup_steps=10,
+        sao_dis_clip_low=0.8,
+        sao_dis_clip_high=3.0,
+        num_critic_only_steps=0,
+        critic_lr=None,
         normalize_advantages=False,
         use_rollout_logprobs=False,
         use_tis=False,
@@ -410,10 +418,32 @@ def test_sao_critic_freeze_attention_argument(monkeypatch):
     module.get_slime_extra_args_provider()(parser)
 
     defaults = parser.parse_args(["--rollout-batch-size", "1"])
-    configured = parser.parse_args(["--rollout-batch-size", "1", "--sao-critic-freeze-attention"])
+    enabled = parser.parse_args(["--rollout-batch-size", "1", "--sao-critic-freeze-attention"])
+    disabled = parser.parse_args(["--rollout-batch-size", "1", "--no-sao-critic-freeze-attention"])
 
-    assert defaults.sao_critic_freeze_attention is False
-    assert configured.sao_critic_freeze_attention is True
+    assert defaults.sao_critic_freeze_attention is None
+    assert enabled.sao_critic_freeze_attention is True
+    assert disabled.sao_critic_freeze_attention is False
+
+
+@pytest.mark.unit
+def test_sao_defaults_to_critic_attention_freeze_after_validation(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(advantage_estimator="sao", sao_critic_freeze_attention=None)
+
+    module.slime_validate_args(args)
+
+    assert args.sao_critic_freeze_attention is True
+
+
+@pytest.mark.unit
+def test_sao_preserves_explicit_critic_attention_freeze_disable(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(advantage_estimator="sao", sao_critic_freeze_attention=False)
+
+    module.slime_validate_args(args)
+
+    assert args.sao_critic_freeze_attention is False
 
 
 if __name__ == "__main__":
