@@ -141,7 +141,7 @@ ALGO_ARGS=(
    --sao-critic-update-ratio 2
    --sao-critic-freeze-attention
    --sao-critic-warmup-steps 10
-   --sao-gae-alpha 1.5
+   --sao-policy-gae-alpha 1.5
    --sao-dis-clip-low 0.8
    --sao-dis-clip-high 3.0
    --kl-loss-coef 0.00
