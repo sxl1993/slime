@@ -1019,6 +1019,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument("--sao-critic-lambda", type=float, default=1.0, help="SAO critic GAE lambda")
             parser.add_argument("--sao-batch-size", type=int, default=128)
             parser.add_argument("--sao-critic-update-ratio", type=int, default=2)
             parser.add_argument("--sao-critic-warmup-steps", type=int, default=10)
@@ -1028,7 +1029,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Freeze critic attention parameters while keeping normalization and value parameters trainable.",
             )
-            parser.add_argument("--sao-gae-alpha", type=float, default=1.5)
+            parser.add_argument(
+                "--sao-policy-gae-alpha",
+                "--sao-gae-alpha",
+                dest="sao_policy_gae_alpha",
+                type=float,
+                default=1.5,
+                help="SAO policy GAE length-adaptive alpha.",
+            )
             parser.add_argument(
                 "--sao-skip-observation-gae",
                 action=argparse.BooleanOptionalAction,

@@ -51,7 +51,7 @@ def test_ppo_estimator_does_not_corrupt_logged_kl(monkeypatch):
             gamma=1.0,
             lambd=1.0,
         )
-        compute_advantages_and_returns(args, rollout_data)
+        compute_advantages_and_returns(args, rollout_data, role="policy")
         torch.testing.assert_close(rollout_data["kl"][0], expected_kl)
     finally:
         if previous_loss is None:

@@ -34,7 +34,6 @@ import _cp_dist_helpers  # noqa: F401
 import pytest
 from _cp_dist_helpers import free_port, stub_megatron_in_worker
 
-
 NUM_GPUS = 0
 
 # (total_length, response_length) per sample, plus its rollout reward. Eight
@@ -116,7 +115,7 @@ def _whiten_worker(rank, world_size, cp_size, dp_size, master_port, result_dir):
             "total_lengths": [SEQS[i][0] for i in my_samples],
         }
 
-        compute_advantages_and_returns(_Args(), rollout_data)
+        compute_advantages_and_returns(_Args(), rollout_data, role="policy")
 
         # grpo gives every token of a sample the same advantage, and whitening is
         # affine, so one value per sample fully describes the result. Ranks that
