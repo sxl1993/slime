@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from slime.observability.rollout_metrics import _compute_top_p_kept_vocab_metrics
+from slime.observability.rollout_metrics import _compute_top_p_kept_vocab_metrics, compute_metrics_from_samples
 from slime.utils.misc import decode_int32_meta_array
 from slime.utils.types import Sample
 
@@ -48,6 +48,68 @@ def test_top_p_kept_vocab_metric_skips_removed_samples():
     ]
 
     assert _compute_top_p_kept_vocab_metrics(samples) == {}
+
+
+@pytest.mark.unit
+def test_trajectory_expansion_metrics_deduplicate_segments():
+    args = Namespace(
+        advantage_estimator="ppo",
+        log_reward_category=None,
+        sglang_speculative_algorithm=None,
+    )
+    shared_stats = {
+        "trajectory_routing_leaf_count": 2,
+        "trajectory_num_segments": 2,
+        "trajectory_flat_tokens": 15,
+        "trajectory_unique_tokens": 11,
+        "trajectory_expansion_factor": 15 / 11,
+    }
+    samples = [
+        Sample(rollout_id=7, tokens=[1, 2, 3], response_length=3, metadata=shared_stats),
+        Sample(rollout_id=7, tokens=[1, 2, 4], response_length=3, metadata=shared_stats),
+        Sample(
+            rollout_id=8,
+            tokens=[5, 6],
+            response_length=2,
+            metadata={
+                "trajectory_routing_leaf_count": 1,
+                "trajectory_num_segments": 1,
+                "trajectory_flat_tokens": 4,
+                "trajectory_unique_tokens": 4,
+                "trajectory_expansion_factor": 1.0,
+            },
+        ),
+    ]
+
+    metrics = compute_metrics_from_samples(args, samples)
+
+    assert metrics["trajectory/count"] == 2
+    assert metrics["trajectory/routing_leaves_total"] == 3
+    assert metrics["trajectory/num_segments_total"] == 3
+    assert metrics["trajectory/num_segments_mean"] == pytest.approx(1.5)
+    assert metrics["trajectory/num_segments_max"] == 2
+    assert metrics["trajectory/flat_tokens_total"] == 19
+    assert metrics["trajectory/flat_tokens_mean"] == pytest.approx(9.5)
+    assert metrics["trajectory/flat_tokens_max"] == 15
+    assert metrics["trajectory/unique_tokens_total"] == 15
+    assert metrics["trajectory/unique_tokens_mean"] == pytest.approx(7.5)
+    assert metrics["trajectory/unique_tokens_max"] == 11
+    assert metrics["trajectory/expansion_factor_mean"] == pytest.approx((15 / 11 + 1) / 2)
+    assert metrics["trajectory/expansion_factor_max"] == pytest.approx(15 / 11)
+    assert metrics["trajectory/expansion_factor_weighted"] == pytest.approx(19 / 15)
+
+
+@pytest.mark.unit
+def test_trajectory_expansion_metrics_skip_samples_without_stats():
+    args = Namespace(
+        advantage_estimator="ppo",
+        log_reward_category=None,
+        sglang_speculative_algorithm=None,
+    )
+
+    metrics = compute_metrics_from_samples(args, [Sample(response_length=1, tokens=[1])])
+
+    assert not any(key.startswith("trajectory/") for key in metrics)
 
 
 def _b64_int32(values: list[int]) -> str:

@@ -224,8 +224,17 @@ def build_dp_schedule(
         # 4. Build per-rank partitions (global sample indices) and micro_batch_indices
         # (local indices into partitions[r]).
         for r in range(dp_size):
-            for mbs_idx in rank_mbs_idx[r]:
+            for microbatch_i, mbs_idx in enumerate(rank_mbs_idx[r]):
                 mbs_locals = step_mbs[mbs_idx]  # local indices into sample_indices
+                microbatch_lengths = [step_lengths[i] for i in mbs_locals]
+                logger.info(
+                    "microbatch_length step=%s dp_rank=%s microbatch=%s total_tokens=%s max_sample_tokens=%s",
+                    step_i,
+                    r,
+                    microbatch_i,
+                    sum(microbatch_lengths),
+                    max(microbatch_lengths, default=0),
+                )
                 local_start = len(partitions[r])
                 partitions[r].extend(sample_indices[i] for i in mbs_locals)
                 micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_locals))))

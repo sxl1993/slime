@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# SWE coding-agent RL with Qwen3.8-27B + ARCA sandbox, 64 GPUs.
+# SWE coding-agent RL with Qwen3.8-27B + ARCA sandbox, 144 logical GPUs.
 # Fully-async mode keeps a background rollout pool warm across rollout
 # boundaries and returns completed groups as they become available.
-# This script uses 32 training GPUs and 32 rollout GPUs; train_async.py does
-# not support colocated training and rollout.
+# Actor and critic each use 64 logical GPUs; rollout uses 16 logical GPUs.
+# Actor and critic share a placement group, so physical reservation is 80 GPUs.
 #
 # Model arch sourced from scripts/models/qwen3.5-27B.sh (qwen3_5 hybrid 64L).
 # The fully-async collector requeues ABORTED groups from scratch; it does not
@@ -18,6 +18,8 @@ UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-2}"
 ACTOR_LOAD_PATH="${REF_MODEL_PATH:-/mnt/amedelastic-m/common/ckpt/muchen/Qwen3.8-27B_torch_dist}"
 CRITIC_LOAD="${CRITIC_LOAD:-/mnt/amedelastic-m/common/ckpt/muchen/Qwen3.8-27B-Critic/}"
 SAO_BATCH_SIZE="${SAO_BATCH_SIZE:-8}"
+SAO_CRITIC_UPDATE_RATIO="${SAO_CRITIC_UPDATE_RATIO:-2}"
+SAO_CRITIC_WARMUP_STEPS="${SAO_CRITIC_WARMUP_STEPS:-5}"
 
 SLIME_DIR="${SLIME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 export MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
@@ -34,7 +36,9 @@ export SLIME_AGENT_ARCA_IMAGE_REGISTRY="${SLIME_AGENT_ARCA_IMAGE_REGISTRY:-asr.a
 export SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX="${SLIME_AGENT_ARCA_IMAGE_TAG_SUFFIX:-claude-code-2.1.220-v1}"
 
 # ============ Parallelism ============
-# Fixed 64-GPU non-colocated layout: 4 nodes x 8 actor GPUs + 32 rollout GPUs.
+# Fixed layout: actor logical = 64, critic logical = 64, rollout = 16,
+# logical role footprint = 144; actor and critic share placement group, so
+# physical reservation = 80 GPUs.
 ACTOR_NUM_NODES=8
 ACTOR_NUM_GPUS_PER_NODE=8
 ROLLOUT_NUM_GPUS=16
@@ -57,7 +61,7 @@ if ! mkdir -m 700 "${RUN_ROOT}"; then
    exit 2
 fi
 echo "Training log: ${RUN_ROOT}/run.log"
-echo "RUN_ROOT=${RUN_ROOT} | backend=${SLIME_AGENT_SANDBOX_BACKEND} | mode=fully_async | train=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE} | rollout=${ROLLOUT_NUM_GPUS} | parallelism=TP${TP_SIZE}xPP${PP_SIZE}xCP${CP_SIZE} | update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
+echo "RUN_ROOT=${RUN_ROOT} | backend=${SLIME_AGENT_SANDBOX_BACKEND} | mode=fully_async | actor logical=64 (${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}) | critic logical=64 | rollout logical=${ROLLOUT_NUM_GPUS} | logical role footprint=144 | physical reservation=80 | parallelism=TP${TP_SIZE}xPP${PP_SIZE}xCP${CP_SIZE} | update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}"
 
 # ============ Profiler ============
 PROFILE="${PROFILE:-0}"
@@ -96,17 +100,23 @@ CKPT_ARGS=(
 )
 echo "Checkpoint path: ${SAVE_PATH} | interval=${SAVE_INTERVAL} steps"
 
-ROLE_CONFIG_TEMPLATE="${SLIME_DIR}/examples/coding_agent_rl/qwen38_27b_sao_roles.yaml"
 ACTOR_SAVE_PATH="${SAVE_PATH}/actor"
 CRITIC_SAVE_PATH="${SAVE_PATH}/critic"
 install -d -m 700 "${ACTOR_SAVE_PATH}" "${CRITIC_SAVE_PATH}"
 ROLE_CONFIG_PATH="${RUN_ROOT}/megatron_roles.yaml"
-sed \
-   -e "s|__ACTOR_LOAD_PATH__|${ACTOR_LOAD_PATH}|g" \
-   -e "s|__CRITIC_LOAD_PATH__|${CRITIC_LOAD}|g" \
-   -e "s|__ACTOR_SAVE_PATH__|${ACTOR_SAVE_PATH}|g" \
-   -e "s|__CRITIC_SAVE_PATH__|${CRITIC_SAVE_PATH}|g" \
-   "${ROLE_CONFIG_TEMPLATE}" > "${ROLE_CONFIG_PATH}"
+cat > "${ROLE_CONFIG_PATH}" <<EOF
+megatron:
+  - name: default
+    role: actor
+    overrides:
+      load: ${ACTOR_LOAD_PATH}
+      save: ${ACTOR_SAVE_PATH}
+  - name: default
+    role: critic
+    overrides:
+      load: ${CRITIC_LOAD}
+      save: ${CRITIC_SAVE_PATH}
+EOF
 chmod 600 "${ROLE_CONFIG_PATH}"
 CKPT_ARGS+=(--megatron-config-path "${ROLE_CONFIG_PATH}")
 echo "Separate critic role: load=${CRITIC_LOAD} | actor load=${ACTOR_LOAD_PATH}"
@@ -160,8 +170,8 @@ ALGO_ARGS=(
    --sao-batch-size "${SAO_BATCH_SIZE}"
    --critic-lr 5e-6
    --sao-critic-freeze-attention
-   --sao-critic-update-ratio 1
-   --sao-critic-warmup-steps 5
+   --sao-critic-update-ratio "${SAO_CRITIC_UPDATE_RATIO}"
+   --sao-critic-warmup-steps "${SAO_CRITIC_WARMUP_STEPS}"
    --sao-policy-gae-alpha 1.5
    --sao-dis-clip-low 0.8
    --sao-dis-clip-high 3.0

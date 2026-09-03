@@ -1029,6 +1029,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--sao-batch-size", type=int, default=128)
             parser.add_argument("--sao-critic-update-ratio", type=int, default=2)
             parser.add_argument(
+                "--sao-critic-warmup-steps",
+                type=int,
+                default=None,
+                help="Number of initial SAO rollout steps that train critic only.",
+            )
+            parser.add_argument(
                 "--sao-critic-freeze-attention",
                 action=argparse.BooleanOptionalAction,
                 default=None,
@@ -1962,6 +1968,15 @@ def slime_validate_args(args):
             raise ValueError("--sao-batch-size must be positive")
         if args.sao_critic_update_ratio <= 0:
             raise ValueError("--sao-critic-update-ratio must be positive")
+        if args.sao_critic_warmup_steps is not None:
+            if args.sao_critic_warmup_steps < 0:
+                raise ValueError("--sao-critic-warmup-steps must be non-negative")
+            if args.num_critic_only_steps > 0 and args.num_critic_only_steps != args.sao_critic_warmup_steps:
+                raise ValueError(
+                    "SAO critic warmup steps conflict with --num-critic-only-steps: "
+                    f"{args.sao_critic_warmup_steps} != {args.num_critic_only_steps}"
+                )
+            args.num_critic_only_steps = args.sao_critic_warmup_steps
         if args.sao_dis_clip_low < 0 or args.sao_dis_clip_high < 0:
             raise ValueError("SAO DIS clip bounds must be non-negative")
         if args.use_tis:

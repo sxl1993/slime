@@ -272,6 +272,28 @@ class _SampleBuilder:
         )
 
 
+def _count_unique_prefix_tokens(sequences: list[list[int]]) -> int:
+    unique_tokens = 0
+    previous: list[int] | None = None
+    for sequence in sorted(sequences):
+        shared_tokens = _common_prefix_len(previous, sequence) if previous is not None else 0
+        unique_tokens += len(sequence) - shared_tokens
+        previous = sequence
+    return unique_tokens
+
+
+def _compute_trajectory_expansion_stats(samples: list[Sample], routing_leaf_count: int) -> dict[str, int | float]:
+    flat_tokens = sum(len(sample.tokens) for sample in samples)
+    unique_tokens = _count_unique_prefix_tokens([sample.tokens for sample in samples])
+    return {
+        "trajectory_routing_leaf_count": routing_leaf_count,
+        "trajectory_num_segments": len(samples),
+        "trajectory_flat_tokens": flat_tokens,
+        "trajectory_unique_tokens": unique_tokens,
+        "trajectory_expansion_factor": flat_tokens / unique_tokens if unique_tokens else 0.0,
+    }
+
+
 # ===========================================================================
 # TrajectoryManager
 # ===========================================================================
@@ -336,6 +358,7 @@ class TrajectoryManager:
         if root is None:
             return []
 
+        routing_leaf_count = sum(1 for leaf in root.leaves() if not leaf.is_root)
         samples: list[Sample] = []
         for routing_leaf in root.leaves():
             if routing_leaf.is_root:
@@ -345,6 +368,22 @@ class TrajectoryManager:
                 self._chain_to_samples(
                     chain, base_sample=base_sample, extra_metadata=extra_metadata, max_sample_tokens=max_sample_tokens
                 )
+            )
+
+        if samples:
+            expansion_stats = _compute_trajectory_expansion_stats(samples, routing_leaf_count)
+            for sample in samples:
+                sample.metadata.update(expansion_stats)
+            logger.info(
+                "trajectory_stats sid=%s rollout_id=%s routing_leaf_count=%d num_segments=%d "
+                "Tflat=%d Tunique=%d D=%.4f",
+                sid,
+                base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
+                expansion_stats["trajectory_routing_leaf_count"],
+                expansion_stats["trajectory_num_segments"],
+                expansion_stats["trajectory_flat_tokens"],
+                expansion_stats["trajectory_unique_tokens"],
+                expansion_stats["trajectory_expansion_factor"],
             )
 
         for s in samples:

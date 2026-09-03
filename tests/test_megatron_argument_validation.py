@@ -203,11 +203,12 @@ def make_slime_validate_args(**overrides):
         sao_critic_freeze_attention=None,
         sao_batch_size=128,
         sao_critic_update_ratio=2,
-        sao_critic_warmup_steps=10,
+        sao_critic_warmup_steps=None,
         sao_dis_clip_low=0.8,
         sao_dis_clip_high=3.0,
         num_critic_only_steps=0,
         critic_lr=None,
+        critic_lr_warmup_iters=0,
         normalize_advantages=False,
         use_rollout_logprobs=False,
         use_tis=False,
@@ -427,6 +428,19 @@ def test_sao_critic_freeze_attention_argument(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sao_critic_warmup_argument(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(["--rollout-batch-size", "1", "--sao-critic-warmup-steps", "5"])
+
+    assert defaults.sao_critic_warmup_steps is None
+    assert configured.sao_critic_warmup_steps == 5
+
+
+@pytest.mark.unit
 def test_sao_gae_arguments_are_role_specific(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     parser = argparse.ArgumentParser()
@@ -451,6 +465,53 @@ def test_sao_gae_arguments_are_role_specific(monkeypatch):
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--rollout-batch-size", "1", "--sao-gae-alpha", "2.5"])
+
+
+@pytest.mark.unit
+def test_sao_critic_warmup_maps_to_generic_critic_only_steps(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(advantage_estimator="sao", sao_critic_warmup_steps=5)
+
+    module.slime_validate_args(args)
+
+    assert args.num_critic_only_steps == 5
+
+
+@pytest.mark.unit
+def test_sao_critic_warmup_agrees_with_generic_critic_only_steps(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        advantage_estimator="sao",
+        num_critic_only_steps=5,
+        sao_critic_warmup_steps=5,
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.num_critic_only_steps == 5
+
+
+@pytest.mark.unit
+def test_sao_critic_warmup_rejects_conflicting_generic_value(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        advantage_estimator="sao",
+        num_critic_only_steps=4,
+        sao_critic_warmup_steps=5,
+    )
+
+    with pytest.raises(ValueError, match="critic warmup steps conflict"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_sao_critic_warmup_rejects_negative_value(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(advantage_estimator="sao", sao_critic_warmup_steps=-1)
+
+    with pytest.raises(ValueError, match="--sao-critic-warmup-steps must be non-negative"):
+        module.slime_validate_args(args)
+
 
 @pytest.mark.unit
 def test_sao_defaults_to_critic_attention_freeze_after_validation(monkeypatch):

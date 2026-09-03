@@ -504,6 +504,54 @@ def test_1_6_tool_fork_shared_assistant():
     print("PASS 1.6")
 
 
+def test_1_6_trajectory_expansion_stats_count_shared_prefix_once():
+    mgr = TrajectoryManager()
+    sid = "1.6-metrics"
+    s, u, a1 = sys_msg("S"), usr_msg("u"), asst_msg("call")
+    append(mgr, sid, [s, u], "call", prompt_ids=[1, 2], response_ids=[3, 4])
+    append(
+        mgr,
+        sid,
+        [s, u, a1, tool_msg("x")],
+        "ax",
+        prompt_ids=[1, 2, 3, 4, 5],
+        response_ids=[6, 7],
+    )
+    append(
+        mgr,
+        sid,
+        [s, u, a1, tool_msg("y")],
+        "ay",
+        prompt_ids=[1, 2, 3, 4, 8],
+        response_ids=[9, 10, 11],
+    )
+
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+
+    assert len(samples) == 2
+    for sample in samples:
+        assert sample.metadata["trajectory_routing_leaf_count"] == 2
+        assert sample.metadata["trajectory_num_segments"] == 2
+        assert sample.metadata["trajectory_flat_tokens"] == 15
+        assert sample.metadata["trajectory_unique_tokens"] == 11
+        assert sample.metadata["trajectory_expansion_factor"] == pytest.approx(15 / 11)
+
+
+def test_1_6_single_segment_has_unit_expansion_factor():
+    mgr = TrajectoryManager()
+    sid = "1.6-single-metrics"
+    append(mgr, sid, [sys_msg("S"), usr_msg("u")], "a", prompt_ids=[1, 2], response_ids=[3, 4])
+
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+
+    assert len(samples) == 1
+    assert samples[0].metadata["trajectory_routing_leaf_count"] == 1
+    assert samples[0].metadata["trajectory_num_segments"] == 1
+    assert samples[0].metadata["trajectory_flat_tokens"] == 4
+    assert samples[0].metadata["trajectory_unique_tokens"] == 4
+    assert samples[0].metadata["trajectory_expansion_factor"] == 1.0
+
+
 def test_1_7_token_only_drift_no_fork():
     """Identical messages, tampered prompt_ids -> NO tree fork (DFS ignores
     tokens), but the drift DOES surface in the linearized sample: it lands in

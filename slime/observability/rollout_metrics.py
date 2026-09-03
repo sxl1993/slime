@@ -49,11 +49,54 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(samples)
+    log_dict |= _compute_trajectory_expansion_metrics(samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_trajectory_expansion_metrics(all_samples: list[Sample]) -> dict[str, int | float]:
+    fields = (
+        "trajectory_routing_leaf_count",
+        "trajectory_num_segments",
+        "trajectory_flat_tokens",
+        "trajectory_unique_tokens",
+        "trajectory_expansion_factor",
+    )
+    records = {}
+    for sample in all_samples:
+        metadata = sample.metadata or {}
+        if not all(field in metadata for field in fields):
+            continue
+        trajectory_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+        records.setdefault(trajectory_id, {field: metadata[field] for field in fields})
+
+    if not records:
+        return {}
+
+    metrics: dict[str, int | float] = {
+        "trajectory/count": len(records),
+        "trajectory/routing_leaves_total": sum(record["trajectory_routing_leaf_count"] for record in records.values()),
+    }
+    for field, name in (
+        ("trajectory_num_segments", "num_segments"),
+        ("trajectory_flat_tokens", "flat_tokens"),
+        ("trajectory_unique_tokens", "unique_tokens"),
+    ):
+        values = [record[field] for record in records.values()]
+        metrics[f"trajectory/{name}_total"] = sum(values)
+        metrics[f"trajectory/{name}_mean"] = float(np.mean(values))
+        metrics[f"trajectory/{name}_max"] = max(values)
+
+    expansion_factors = [record["trajectory_expansion_factor"] for record in records.values()]
+    metrics["trajectory/expansion_factor_mean"] = float(np.mean(expansion_factors))
+    metrics["trajectory/expansion_factor_max"] = max(expansion_factors)
+    flat_tokens = metrics["trajectory/flat_tokens_total"]
+    unique_tokens = metrics["trajectory/unique_tokens_total"]
+    metrics["trajectory/expansion_factor_weighted"] = flat_tokens / unique_tokens if unique_tokens else 0.0
+    return metrics
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
