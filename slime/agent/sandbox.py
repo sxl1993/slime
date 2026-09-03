@@ -602,6 +602,8 @@ class ArcaSandbox:
                 factory = SandboxFactory(config_file=config_path)
             except Exception:
                 raise RuntimeError("Failed to initialize ARCA SandboxFactory") from None
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
         self._factory = factory
         resource_spec = ResourceSpecification(cpu=self.cpu, memory=self.memory, disk=self.disk)

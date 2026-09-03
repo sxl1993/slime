@@ -90,8 +90,12 @@ class FakeFactory:
     instances = []
     provider = FakeProviderSandbox()
     create_error = None
+    reenable_http_logs = False
 
     def __init__(self, *, config_file):
+        if self.__class__.reenable_http_logs:
+            logging.getLogger("httpx").setLevel(logging.INFO)
+            logging.getLogger("httpcore").setLevel(logging.INFO)
         self.closed = False
         self.__class__.instances.append(self)
         path = Path(config_file)
@@ -130,6 +134,7 @@ def _reset_arca(monkeypatch):
     FakeFactory.instances = []
     FakeFactory.provider = FakeProviderSandbox()
     FakeFactory.create_error = None
+    FakeFactory.reenable_http_logs = False
     arca_module = types.ModuleType("arca")
     arca_module.SandboxFactory = FakeFactory
     arca_model_module = types.ModuleType("arca.model")
@@ -187,6 +192,27 @@ def test_arca_factory_uses_0600_short_lived_yaml_without_logging_secret(caplog):
     assert "secret-do-not-log" not in caplog.text
     assert len(FakeFactory.config_observations) == 1
     assert factory.closed is True
+
+
+def test_arca_factory_cannot_reenable_http_request_info_logs(caplog):
+    FakeFactory.reenable_http_logs = True
+    caplog.set_level(logging.DEBUG)
+
+    async def run_case():
+        sb = sandbox_mod.ArcaSandbox("image")
+        await sb.__aenter__()
+        await sb.__aexit__(None, None, None)
+
+    asyncio.run(run_case())
+
+    caplog.clear()
+    logging.getLogger("httpx").info("HTTP request noise")
+    logging.getLogger("httpx").warning("HTTP transport warning")
+    logging.getLogger("httpcore").info("HTTP core noise")
+
+    assert "HTTP request noise" not in caplog.text
+    assert "HTTP core noise" not in caplog.text
+    assert "HTTP transport warning" in caplog.text
 
 
 def test_arca_create_is_async_once_and_returns_ready_sandbox():
