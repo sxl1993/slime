@@ -22,6 +22,7 @@ def configure_logger(prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+    logging.getLogger("arca").propagate = False
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
