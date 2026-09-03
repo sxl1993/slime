@@ -18,6 +18,8 @@ UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-2}"
 ACTOR_LOAD_PATH="${REF_MODEL_PATH:-/mnt/amedelastic-et117-aidc/common/ckpt/AQInfra/Qwen3.8-27B_torch_dist}"
 CRITIC_LOAD="${CRITIC_LOAD:-/mnt/amedelastic-et117-aidc/common/muchen/runs/qwen38-critic-full-64gpu-resume50-hf-final/}"
 SAO_BATCH_SIZE="${SAO_BATCH_SIZE:-32}"
+SAO_CRITIC_UPDATE_RATIO="${SAO_CRITIC_UPDATE_RATIO:-2}"
+SAO_CRITIC_WARMUP_STEPS="${SAO_CRITIC_WARMUP_STEPS:-5}"
 
 SLIME_DIR="${SLIME_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)}"
 export MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
@@ -96,17 +98,23 @@ CKPT_ARGS=(
 )
 echo "Checkpoint path: ${SAVE_PATH} | interval=${SAVE_INTERVAL} steps"
 
-ROLE_CONFIG_TEMPLATE="${SLIME_DIR}/examples/coding_agent_rl/qwen38_27b_sao_roles.yaml"
 ACTOR_SAVE_PATH="${SAVE_PATH}/actor"
 CRITIC_SAVE_PATH="${SAVE_PATH}/critic"
 install -d -m 700 "${ACTOR_SAVE_PATH}" "${CRITIC_SAVE_PATH}"
 ROLE_CONFIG_PATH="${RUN_ROOT}/megatron_roles.yaml"
-sed \
-   -e "s|__ACTOR_LOAD_PATH__|${ACTOR_LOAD_PATH}|g" \
-   -e "s|__CRITIC_LOAD_PATH__|${CRITIC_LOAD}|g" \
-   -e "s|__ACTOR_SAVE_PATH__|${ACTOR_SAVE_PATH}|g" \
-   -e "s|__CRITIC_SAVE_PATH__|${CRITIC_SAVE_PATH}|g" \
-   "${ROLE_CONFIG_TEMPLATE}" > "${ROLE_CONFIG_PATH}"
+cat > "${ROLE_CONFIG_PATH}" <<EOF
+megatron:
+  - name: default
+    role: actor
+    overrides:
+      load: ${ACTOR_LOAD_PATH}
+      save: ${ACTOR_SAVE_PATH}
+  - name: default
+    role: critic
+    overrides:
+      load: ${CRITIC_LOAD}
+      save: ${CRITIC_SAVE_PATH}
+EOF
 chmod 600 "${ROLE_CONFIG_PATH}"
 CKPT_ARGS+=(--megatron-config-path "${ROLE_CONFIG_PATH}")
 echo "Separate critic role: load=${CRITIC_LOAD} | actor load=${ACTOR_LOAD_PATH}"
@@ -138,6 +146,9 @@ ROLLOUT_ARGS=(
    --rollout-stop-token-ids 248046 248044
    --num-steps-per-rollout 1
 )
+if [[ -n "${DEBUG_LOAD_ROLLOUT_PATH:-}" ]]; then
+   ROLLOUT_ARGS+=(--load-debug-rollout-data "${DEBUG_LOAD_ROLLOUT_PATH}")
+fi
 
 # ============ Performance ============
 PERF_ARGS=(
@@ -159,8 +170,8 @@ ALGO_ARGS=(
    --sao-batch-size "${SAO_BATCH_SIZE}"
    --critic-lr 5e-6
    --sao-critic-freeze-attention
-   --sao-critic-update-ratio 2
-   --num-critic-only-steps 5
+   --sao-critic-update-ratio "${SAO_CRITIC_UPDATE_RATIO}"
+   --sao-critic-warmup-steps "${SAO_CRITIC_WARMUP_STEPS}"
    --sao-policy-gae-alpha 1.5
    --sao-dis-clip-low 0.8
    --sao-dis-clip-high 3.0
@@ -202,14 +213,26 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --balance-data
-   --balance-by-flops
    --actor-num-nodes "${ACTOR_NUM_NODES}"
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}"
    --num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}"
    --rollout-num-gpus "${ROLLOUT_NUM_GPUS}"
    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
 )
+case "${BALANCE_MODE:-flops}" in
+   off)
+      ;;
+   data)
+      MISC_ARGS+=(--balance-data)
+      ;;
+   flops)
+      MISC_ARGS+=(--balance-data --balance-by-flops)
+      ;;
+   *)
+      echo "ERROR: BALANCE_MODE must be off, data, or flops" >&2
+      exit 2
+      ;;
+esac
 # ============ Network ============
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
